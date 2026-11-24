@@ -76,17 +76,24 @@ def upgrade() -> None:
     op.create_index(op.f('ix_faculties_university_id'), 'faculties', ['university_id'], unique=False)
     op.add_column('departments', sa.Column('faculty_id', sa.Integer(), nullable=True))
     op.create_index(op.f('ix_departments_faculty_id'), 'departments', ['faculty_id'], unique=False)
-    op.create_foreign_key("fk_departments_faculty_id", "departments", "faculties",
-                          ["faculty_id"], ["id"])
+    if op.get_bind().dialect.name == "sqlite":
+        # SQLite cannot ALTER-add a constraint; batch mode copies the table instead.
+        with op.batch_alter_table("departments") as batch_op:
+            batch_op.create_foreign_key("fk_departments_faculty_id", "faculties",
+                                        ["faculty_id"], ["id"])
+    else:
+        op.create_foreign_key("fk_departments_faculty_id", "departments", "faculties",
+                              ["faculty_id"], ["id"])
 
     # ---- backfill: turn every distinct (university, faculty_school) pair into a real row ----
     # This has to happen while the old column still exists. Dropping first would silently
     # orphan every department from its division.
     bind = op.get_bind()
+    trim_fn = "btrim" if bind.dialect.name == "postgresql" else "trim"
     pairs = bind.execute(sa.text(
         "SELECT DISTINCT d.university_id, d.faculty_school, u.slug "
         "FROM departments d JOIN universities u ON u.id = d.university_id "
-        "WHERE d.faculty_school IS NOT NULL AND btrim(d.faculty_school) <> '' "
+        f"WHERE d.faculty_school IS NOT NULL AND {trim_fn}(d.faculty_school) <> '' "
         "ORDER BY d.university_id, d.faculty_school"
     )).fetchall()
 
@@ -116,11 +123,20 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Put the free-text column back and refill it from the relation before dropping it.
     op.add_column("departments", sa.Column("faculty_school", sa.VARCHAR(length=200), nullable=True))
-    op.execute("UPDATE departments d SET faculty_school = f.name "
-               "FROM faculties f WHERE f.id = d.faculty_id")
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute("UPDATE departments d SET faculty_school = f.name "
+                   "FROM faculties f WHERE f.id = d.faculty_id")
+    else:
+        op.execute("UPDATE departments SET faculty_school = ("
+                   "SELECT f.name FROM faculties f WHERE f.id = departments.faculty_id"
+                   ") WHERE faculty_id IS NOT NULL")
     # Autogenerate emitted drop_constraint(None, ...), which cannot render. The upgrade
     # names this constraint explicitly so the downgrade can address it.
-    op.drop_constraint("fk_departments_faculty_id", "departments", type_="foreignkey")
+    if op.get_bind().dialect.name == "sqlite":
+        with op.batch_alter_table("departments") as batch_op:
+            batch_op.drop_constraint("fk_departments_faculty_id", type_="foreignkey")
+    else:
+        op.drop_constraint("fk_departments_faculty_id", "departments", type_="foreignkey")
     op.drop_index(op.f('ix_departments_faculty_id'), table_name='departments')
     op.drop_column('departments', 'faculty_id')
     op.drop_index(op.f('ix_faculties_university_id'), table_name='faculties')

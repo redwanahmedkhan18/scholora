@@ -2,19 +2,31 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool, text
 
 from app.core.config import settings
+from app.core.connectivity import (
+    assert_safe_database_url,
+    database_connect_args,
+    normalize_database_url,
+)
 from app.core.database import Base
 import app.models  # noqa: F401  (import for side effects: registers every table)
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+database_url = normalize_database_url(settings.database_url)
+assert_safe_database_url(database_url, settings.environment)
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+#: Serialises migrations across Render pre-deploy commands, one-off jobs and a manual
+#: Render Shell run. PostgreSQL session advisory locks are released automatically if the
+#: process dies.
+MIGRATION_LOCK_KEY = 0x53434F4C  # "SCOL"
 
 
 # Objects that exist in the database but deliberately not on the SQLAlchemy models.
@@ -38,10 +50,9 @@ def include_object(object_, name, type_, reflected, compare_to):
     return True
 
 
-
 def run_migrations_offline() -> None:
     context.configure(
-        url=settings.database_url,
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -53,22 +64,35 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        database_url,
+        connect_args=database_connect_args(database_url),
         poolclass=pool.NullPool,
+        pool_pre_ping=True,
     )
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-            include_object=include_object,
-            # SQLite cannot ALTER most things in place; batch mode rewrites the table.
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+    try:
+        with connectable.connect() as connection:
+            is_postgres = connection.dialect.name == "postgresql"
+            if is_postgres:
+                connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": MIGRATION_LOCK_KEY})
+                connection.commit()
+            try:
+                context.configure(
+                    connection=connection,
+                    target_metadata=target_metadata,
+                    compare_type=True,
+                    include_object=include_object,
+                    # SQLite cannot ALTER most things in place; batch mode rewrites the table.
+                    render_as_batch=connection.dialect.name == "sqlite",
+                )
+                with context.begin_transaction():
+                    context.run_migrations()
+            finally:
+                if is_postgres:
+                    connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": MIGRATION_LOCK_KEY})
+                    connection.commit()
+    finally:
+        connectable.dispose()
 
 
 if context.is_offline_mode():

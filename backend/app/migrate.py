@@ -11,6 +11,7 @@ from __future__ import annotations
 from sqlalchemy import inspect, text
 
 import app.models  # noqa: F401  (register all metadata)
+from app.core.config import settings
 from app.core.database import Base, engine
 
 # SQLite ALTER TABLE cannot add a column with a non-constant default, so defaults are
@@ -29,6 +30,11 @@ def _sql_type(column) -> str:
 
 
 def run() -> dict[str, list[str]]:
+    if settings.is_postgres or settings.is_production:
+        raise SystemExit(
+            "app.migrate is for SQLite development only. "
+            "Production schema changes must use: alembic upgrade head"
+        )
     created: list[str] = []
     altered: list[str] = []
 

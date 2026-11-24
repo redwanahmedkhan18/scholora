@@ -21,6 +21,10 @@ os.environ["RATE_LIMIT_ENABLED"] = "false"   # per-test limits are asserted expl
 os.environ["SCHEDULER_ENABLED"] = "false"    # no background thread during tests
 os.environ["ENVIRONMENT"] = "test"
 os.environ["SECRET_KEY"] = "test-secret-key-not-for-production"
+# Never let a developer's real backend/.env make the suite talk to production Upstash.
+os.environ["REDIS_URL"] = ""
+os.environ["CELERY_BROKER_URL"] = ""
+os.environ["CELERY_RESULT_BACKEND"] = ""
 
 from fastapi.testclient import TestClient  # noqa: E402
 

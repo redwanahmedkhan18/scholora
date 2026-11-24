@@ -105,7 +105,10 @@ def _faculty_name(dept_name: str) -> str:
 
 def run(reset: bool = True) -> dict:
     random.seed(42)
-    Base.metadata.create_all(engine)
+    # Production schema is owned by Alembic. Tests and zero-config SQLite development may
+    # still create their throwaway schema, but seeding must never be an implicit migration.
+    if not settings.is_production:
+        Base.metadata.create_all(engine)
     db = SessionLocal()
     if reset:
         wipe(db)

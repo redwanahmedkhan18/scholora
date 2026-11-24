@@ -16,17 +16,32 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
 
     database_url: str = "sqlite:///./data/scholara.db"
+    # Supabase Session Pooler is the production target. These values keep a single
+    # Render web instance, its Celery worker and one-off migration jobs comfortably
+    # inside a small Supabase pool. Override per service if concurrency is raised.
+    db_connect_timeout: int = 10
+    db_pool_size: int = 3
+    db_max_overflow: int = 2
+    db_pool_timeout: int = 30
+    db_pool_recycle: int = 180
+    db_sslmode: str = ""                     # empty => Supabase URLs get "require"
     cors_origins: str = "*"
     public_site_url: str = "http://localhost:3000"
 
     # --- infrastructure ---------------------------------------------------
-    redis_url: str = ""                      # empty => in-process fallback
+    redis_url: str = ""                      # empty => in-process fallback (dev only)
+    redis_socket_connect_timeout: float = 3.0
+    redis_socket_timeout: float = 3.0
+    redis_health_check_interval: int = 30
+    cache_key_prefix: str = "scholara:"
     rate_limit_enabled: bool = True
     # Shared secret the Next.js server sends on server-side rendering calls so a build is
     # not rate-limited by its own backend. Never exposed to the browser.
     internal_api_token: str = "dev-internal-render-token"
     scheduler_enabled: bool = True           # in-process jobs when Celery is absent
+    allow_in_process_scheduler_in_production: bool = False
     celery_broker_url: str = ""              # set => run workers instead
+    celery_result_backend: str = ""          # optional; unset => Celery ignores results
 
     # --- private document storage ----------------------------------------
     storage_backend: str = "local"           # "local" | "s3"
@@ -113,6 +128,10 @@ class Settings(BaseSettings):
     @property
     def is_postgres(self) -> bool:
         return self.database_url.startswith("postgres")
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() in {"production", "prod"}
 
 
 @lru_cache

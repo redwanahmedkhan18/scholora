@@ -1,17 +1,23 @@
 """Cache + distributed primitives.
 
-Uses Redis when REDIS_URL is reachable, otherwise a process-local fallback with the
-same interface. The fallback keeps development and single-node deploys working with
-zero infrastructure; production simply sets REDIS_URL and gets shared state.
+Uses Redis (Upstash over TLS in production) when REDIS_URL is reachable, otherwise a
+process-local fallback with the same interface. The fallback keeps development and
+single-node deploys working with zero infrastructure; production sets REDIS_URL and gets
+shared state. A configured-but-unreachable Redis is surfaced by the readiness endpoint
+instead of being mistaken for healthy shared state.
 """
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Any, Optional
 
 from app.core.config import settings
+from app.core.connectivity import normalize_redis_url, redis_connect_kwargs, summarize_redis_url
+
+log = logging.getLogger(__name__)
 
 try:  # pragma: no cover - import guard
     import redis as _redis  # type: ignore
@@ -81,61 +87,99 @@ class Cache:
         self._memory = _MemoryBackend()
         self._client = None
         self.backend = "memory"
-        url = (settings.redis_url or "").strip()
-        if url and _redis is not None:
+        self._prefix = settings.cache_key_prefix or ""
+        self._raw_url = (settings.redis_url or "").strip()
+        self._last_error: Optional[str] = None
+        self._url_summary = summarize_redis_url(self._raw_url) if self._raw_url else None
+
+        if self._raw_url and _redis is not None:
             try:
-                client = _redis.from_url(url, decode_responses=True, socket_connect_timeout=1)
+                url = normalize_redis_url(self._raw_url)
+                client = _redis.from_url(url, **redis_connect_kwargs(url))
                 client.ping()
                 self._client = client
                 self.backend = "redis"
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - fallback is intentional in dev
+                self._last_error = type(exc).__name__
                 self._client = None
+                log.warning("cache: Redis unavailable (%s); using in-process fallback",
+                            self._last_error)
+        elif self._raw_url and _redis is None:
+            self._last_error = "RedisPackageMissing"
+
+    # ---------------------------------------------------------------- metadata
+    @property
+    def configured(self) -> bool:
+        return bool(self._raw_url)
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._last_error
+
+    @property
+    def url_summary(self) -> Optional[dict[str, Any]]:
+        return dict(self._url_summary) if self._url_summary else None
+
+    def ping(self) -> bool:
+        if self._client is None:
+            return False
+        try:
+            return bool(self._client.ping())
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = type(exc).__name__
+            return False
+
+    # ---------------------------------------------------------------- keys
+    def _k(self, key: str) -> str:
+        return f"{self._prefix}{key}"
 
     # ---------------------------------------------------------------- raw ops
     def get(self, key: str) -> Optional[str]:
         try:
-            return self._client.get(key) if self._client else self._memory.get(key)
+            return self._client.get(self._k(key)) if self._client else self._memory.get(self._k(key))
         except Exception:
-            return self._memory.get(key)
+            return self._memory.get(self._k(key))
 
     def set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
         try:
             if self._client:
-                self._client.set(key, value, ex=ttl)
+                self._client.set(self._k(key), value, ex=ttl)
                 return
         except Exception:
             pass
-        self._memory.set(key, value, ex=ttl)
+        self._memory.set(self._k(key), value, ex=ttl)
 
     def delete(self, *keys: str) -> None:
         if not keys:
             return
+        prefixed = [self._k(key) for key in keys]
         try:
             if self._client:
-                self._client.delete(*keys)
+                self._client.delete(*prefixed)
                 return
         except Exception:
             pass
-        self._memory.delete(*keys)
+        self._memory.delete(*prefixed)
 
     def incr_with_ttl(self, key: str, ttl: int) -> tuple[int, int]:
         """Increment a counter, setting the window TTL on first use. Returns (count, ttl_left)."""
+        prefixed = self._k(key)
         try:
             if self._client:
                 pipe = self._client.pipeline()
-                pipe.incr(key)
-                pipe.ttl(key)
+                pipe.incr(prefixed)
+                pipe.ttl(prefixed)
                 count, remaining = pipe.execute()
                 if remaining is None or remaining < 0:
-                    self._client.expire(key, ttl)
+                    self._client.expire(prefixed, ttl)
                     remaining = ttl
                 return int(count), int(remaining)
         except Exception:
             pass
-        count = self._memory.incr(key)
+        count = self._memory.incr(prefixed)
         if count == 1:
-            self._memory.expire(key, ttl)
-        return count, max(0, self._memory.ttl(key))
+            self._memory.expire(prefixed, ttl)
+        return count, max(0, self._memory.ttl(prefixed))
 
     # ------------------------------------------------------------ json helpers
     def get_json(self, key: str) -> Any:
@@ -155,16 +199,17 @@ class Cache:
 
     def invalidate_prefix(self, prefix: str) -> int:
         """Drop every key under a prefix. Used when admin edits content."""
+        prefixed = self._k(prefix)
         try:
             if self._client:
                 removed = 0
-                for key in self._client.scan_iter(match=f"{prefix}*", count=500):
+                for key in self._client.scan_iter(match=f"{prefixed}*", count=500):
                     self._client.delete(key)
                     removed += 1
                 return removed
         except Exception:
             pass
-        keys = self._memory.scan_prefix(prefix)
+        keys = self._memory.scan_prefix(prefixed)
         self._memory.delete(*keys)
         return len(keys)
 

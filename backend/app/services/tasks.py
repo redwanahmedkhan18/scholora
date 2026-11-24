@@ -220,32 +220,65 @@ SCHEDULE: Dict[str, int] = {
 
 
 # -------------------------------------------------------------- celery wiring
+def build_celery_app(broker_url: str, result_backend: str = "") -> Any:
+    """Build the Celery application without connecting to the broker.
+
+    Upstash TCP URLs are normalised to ``rediss://`` and certificate verification stays
+    on. Results are disabled unless CELERY_RESULT_BACKEND is explicitly configured, so a
+    missing logical database on Upstash cannot break task execution.
+    """
+    from celery import Celery
+    from celery.schedules import crontab
+
+    from app.core.connectivity import normalize_redis_url
+
+    broker = normalize_redis_url(broker_url)
+    backend = normalize_redis_url(result_backend) if result_backend else ""
+
+    app = Celery("scholara", broker=broker, backend=backend or None)
+    for name, fn in JOBS.items():
+        app.task(name=f"scholara.{name}")(fn)
+
+    app.conf.update(
+        task_ignore_result=not bool(backend),
+        task_track_started=bool(backend),
+        broker_connection_retry_on_startup=True,
+        timezone="UTC",
+        enable_utc=True,
+    )
+    app.conf.beat_schedule = {
+        "verification-sweep": {"task": "scholara.verification_sweep", "schedule": crontab(hour=2, minute=0)},
+        "deadline-reminders": {"task": "scholara.deadline_reminders", "schedule": crontab(hour=7, minute=0)},
+        "data-quality-digest": {"task": "scholara.data_quality_digest",
+                                 "schedule": crontab(hour=6, minute=0, day_of_week=1)},
+        "reindex-knowledge": {"task": "scholara.reindex_knowledge", "schedule": crontab(minute=0)},
+        "campaign-metrics": {"task": "scholara.campaign_metrics", "schedule": crontab(minute="*/30")},
+        # Weekly is enough: institutional URLs rot over months, and a polite checker
+        # should not hammer other people's servers.
+        "check-source-links": {"task": "scholara.check_source_links",
+                                "schedule": crontab(hour=3, minute=30, day_of_week=0)},
+    }
+    return app
+
+
 celery_app = None
 if settings.celery_broker_url:  # pragma: no cover - needs a broker
     try:
-        from celery import Celery
-        from celery.schedules import crontab
-
-        celery_app = Celery("scholara", broker=settings.celery_broker_url,
-                            backend=settings.celery_broker_url)
-        for name, fn in JOBS.items():
-            celery_app.task(name=f"scholara.{name}")(fn)
-
-        celery_app.conf.beat_schedule = {
-            "verification-sweep": {"task": "scholara.verification_sweep", "schedule": crontab(hour=2, minute=0)},
-            "deadline-reminders": {"task": "scholara.deadline_reminders", "schedule": crontab(hour=7, minute=0)},
-            "data-quality-digest": {"task": "scholara.data_quality_digest",
-                                     "schedule": crontab(hour=6, minute=0, day_of_week=1)},
-            "reindex-knowledge": {"task": "scholara.reindex_knowledge", "schedule": crontab(minute=0)},
-            "campaign-metrics": {"task": "scholara.campaign_metrics", "schedule": crontab(minute="*/30")},
-            # Weekly is enough: institutional URLs rot over months, and a polite checker
-            # should not hammer other people's servers.
-            "check-source-links": {"task": "scholara.check_source_links",
-                                    "schedule": crontab(hour=3, minute=30, day_of_week=0)},
-        }
+        celery_app = build_celery_app(settings.celery_broker_url, settings.celery_result_backend)
     except Exception as exc:  # broker library missing
         log.warning("Celery unavailable (%s); falling back to the in-process scheduler", exc)
         celery_app = None
+
+
+def scheduler_mode() -> str:
+    """What actually owns the schedule, not merely what was requested."""
+    if celery_app is not None:
+        return "celery"
+    if not settings.scheduler_enabled:
+        return "disabled"
+    if settings.is_production and not settings.allow_in_process_scheduler_in_production:
+        return "disabled"
+    return "in-process"
 
 
 # ---------------------------------------------------- in-process scheduler
@@ -283,7 +316,13 @@ _scheduler: _Scheduler | None = None
 def start_scheduler() -> bool:
     """Called from the app lifespan. No-op when Celery owns the schedule."""
     global _scheduler
-    if celery_app is not None or not settings.scheduler_enabled or _scheduler is not None:
+    if _scheduler is not None or scheduler_mode() != "in-process":
+        if settings.is_production and celery_app is None:
+            log.warning(
+                "in-process scheduler is disabled in production; run the Celery worker "
+                "and beat services, or set ALLOW_IN_PROCESS_SCHEDULER_IN_PRODUCTION=true "
+                "for a deliberately single-instance deployment"
+            )
         return False
     _scheduler = _Scheduler()
     _scheduler.start()

@@ -1,17 +1,22 @@
 """Scholara API - International Education Consultancy Intelligence & Application Platform."""
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.core import connectivity
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.connectivity import summarize_database_url, summarize_redis_url
+from app.core.database import engine
 from app.core.ratelimit import RateLimitMiddleware
 from app.api.v1.routers import (actions, admin, admin_extra, admin_platform,
                                  integrations, public, student)
 
 import app.models  # noqa: F401  (register metadata)
+
+log = logging.getLogger(__name__)
 
 DESCRIPTION = """
 Source-backed education intelligence API powering the public website, the student platform,
@@ -25,7 +30,22 @@ the counselor CRM and the WhatsApp assistant from a single education database.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(engine)
+    db = summarize_database_url(settings.database_url)
+    log.info(
+        "database configured driver=%s host=%s port=%s sslmode=%s pooler=%s",
+        db.get("driver"), db.get("host"), db.get("port"), db.get("sslmode"),
+        db.get("is_supabase_pooler"),
+    )
+    if db.get("is_supabase_direct"):
+        log.warning(
+            "DATABASE_URL uses the Supabase direct host; on Render use the IPv4 Session "
+            "Pooler URL from Supabase Dashboard -> Connect -> Session Pooler."
+        )
+    redis = summarize_redis_url(settings.redis_url) if settings.redis_url else None
+    if redis:
+        log.info("cache configured scheme=%s host=%s port=%s tls=%s",
+                 redis.get("scheme"), redis.get("host"), redis.get("port"), redis.get("tls"))
+
     from app.services import tasks
 
     tasks.start_scheduler()
@@ -33,6 +53,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tasks.stop_scheduler()
+        engine.dispose()
 
 
 app = FastAPI(title=f"{settings.app_name} API", version="1.0.0", description=DESCRIPTION,
@@ -64,8 +85,18 @@ async def security_headers(request: Request, call_next):
 
 
 @app.get("/api/health", tags=["system"])
+@app.get("/api/health/live", tags=["system"])
 def health():
+    """Liveness only: the process is running. Never touches the database or Redis."""
     return {"status": "ok", "app": settings.app_name, "environment": settings.environment}
+
+
+@app.get("/api/health/ready", tags=["system"])
+def readiness(response: Response):
+    """Readiness: required dependencies must answer, or this returns 503."""
+    report = connectivity.readiness_report()
+    response.status_code = 200 if report["ready"] else 503
+    return report
 
 
 app.include_router(public.router, prefix=f"{settings.api_v1_prefix}")

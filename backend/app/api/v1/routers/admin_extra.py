@@ -499,7 +499,7 @@ def audit_log(db: Session = Depends(get_db), user: User = Depends(require_role("
 @router.get("/jobs")
 def list_jobs(user: User = Depends(require_role("DATA_MANAGER"))):
     return {
-        "scheduler": "celery" if tasks.celery_app else ("in-process" if settings.scheduler_enabled else "disabled"),
+        "scheduler": tasks.scheduler_mode(),
         "jobs": [{"name": name, "interval_seconds": tasks.SCHEDULE[name],
                   "description": (tasks.JOBS[name].__doc__ or "").strip().split("\n")[0]}
                  for name in tasks.JOBS],
