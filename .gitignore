@@ -1,0 +1,573 @@
+
+# ============================================================
+# SCHOLARA — PRODUCTION-GRADE GITIGNORE
+# Stack: FastAPI / Python / JavaScript / TypeScript / Node.js
+# ============================================================
+
+
+# ============================================================
+# 1. ENVIRONMENT VARIABLES & SECRETS
+# ============================================================
+
+# Ignore ALL files and directories beginning with .env
+.env*
+**/.env*
+
+# Secret and credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.pub
+*.asc
+*.gpg
+*.kdb
+*.credentials
+*.credentials.json
+credentials.json
+secrets.json
+secret.json
+service-account*.json
+*-service-account*.json
+
+# Cloud credentials
+.aws/
+.azure/
+.gcloud/
+.google/
+.firebase/
+.ssh/
+
+# Private keys
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+known_hosts
+authorized_keys
+
+# Terraform secrets
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+
+# ============================================================
+# 2. PYTHON
+# ============================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python distributions
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+venv.bak/
+env.bak/
+.python-version
+
+# Python packaging
+pip-wheel-metadata/
+poetry.lock.tmp
+.pdm-python
+.pdm-build/
+.pybuilder/
+.pytype/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+.pyright/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Python coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+pytestdebug.log
+test-results.xml
+
+
+# ============================================================
+# 3. FASTAPI / BACKEND RUNTIME
+# ============================================================
+
+*.pid
+*.sock
+*.log
+logs/
+log/
+tmp/
+temp/
+
+# Uvicorn / Gunicorn
+gunicorn.pid
+uvicorn.pid
+
+# Runtime state
+runtime/
+.run/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local application state
+instance/
+local_data/
+storage/
+uploads/
+media/
+generated/
+artifacts/
+
+
+# ============================================================
+# 4. NODE.JS / JAVASCRIPT / TYPESCRIPT
+# ============================================================
+
+node_modules/
+jspm_packages/
+bower_components/
+
+# Package manager caches
+.npm/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+.yarn-integrity
+.parcel-cache/
+
+# Node diagnostic output
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.tsbuildinfo
+
+# Runtime
+*.pid
+*.seed
+pids/
+report.*.json
+
+# Node.js compiled output
+lib-cov/
+.nyc_output/
+coverage/
+
+# Bundlers
+.next/
+.nuxt/
+.output/
+.svelte-kit/
+.vuepress/dist/
+.angular/
+.turbo/
+.vercel/
+.netlify/
+.parcel-cache/
+.webpack/
+.rollup.cache/
+vite.svg
+dist/
+build/
+
+# Framework-generated files
+.next/
+out/
+storybook-static/
+.gridsome/
+.docusaurus/
+gatsby-*.js
+gatsby-*.json
+
+
+# ============================================================
+# 5. FRONTEND FRAMEWORKS / TOOLING
+# ============================================================
+
+# TypeScript
+*.tsbuildinfo
+
+# ESLint
+.eslintcache
+
+# Stylelint
+.stylelintcache
+
+# Prettier
+.prettier-cache/
+
+# Babel
+.babel-cache/
+
+# React Native / Expo
+.expo/
+.expo-shared/
+web-build/
+
+# Electron
+release/
+
+# Cypress
+cypress/videos/
+cypress/screenshots/
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+
+# Vitest
+vitest.config.*.timestamp-*
+
+# Storybook
+storybook-out/
+
+
+# ============================================================
+# 6. DATABASES / DATABASE TOOLS
+# ============================================================
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+*.accdb
+
+# PostgreSQL dumps and backups
+*.dump
+*.backup
+*.bak
+*.sql.gz
+*.dump.gz
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# Database migration temporary files
+*.migration.tmp
+
+
+# ============================================================
+# 7. DOCKER / CONTAINERS
+# ============================================================
+
+# Docker runtime
+.docker/
+docker-data/
+container-data/
+
+# Docker override files (local-only)
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Container logs
+*-json.log
+
+
+# ============================================================
+# 8. TESTING / QUALITY / REPORTS
+# ============================================================
+
+coverage/
+htmlcov/
+.nyc_output/
+test-results/
+playwright-report/
+allure-results/
+allure-report/
+reports/
+test-reports/
+
+# Benchmark results
+benchmark-results/
+benchmarks/output/
+
+# Temporary test data
+test-output/
+test-uploads/
+test-artifacts/
+
+
+# ============================================================
+# 9. IDEs / EDITORS
+# ============================================================
+
+# Visual Studio Code
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*.swn
+*.un~
+
+# Emacs
+*~
+\#*\#
+
+# Zed
+.zed/
+
+# Cursor
+.cursor/
+.cursorignore.local
+
+
+# ============================================================
+# 10. OPERATING SYSTEM FILES
+# ============================================================
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+
+# ============================================================
+# 11. LOGS / TEMPORARY FILES
+# ============================================================
+
+*.log
+*.log.*
+logs/
+log/
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*.cache
+.cache/
+temp/
+tmp/
+
+
+# ============================================================
+# 12. CLOUD / DEPLOYMENT / INFRASTRUCTURE
+# ============================================================
+
+# Vercel
+.vercel/
+
+# Netlify
+.netlify/
+
+# Serverless
+.serverless/
+
+# AWS CDK
+.cdk.out/
+
+# SST
+.sst/
+
+# Terraform
+.terraform/
+crash.log
+crash.*.log
+
+# Pulumi
+.pulumi/
+
+# Kubernetes local credentials
+.kube/
+
+# Helm
+*.tgz
+
+
+# ============================================================
+# 13. GENERATED FILES / ARTIFACTS
+# ============================================================
+
+*.generated.*
+*.min.js
+*.min.css
+*.map
+
+# Generated documentation
+site/
+docs/_build/
+
+# Generated assets
+generated-assets/
+generated-files/
+
+# Local caches
+.cache/
+.cache-loader/
+
+
+# ============================================================
+# 14. AI / ML / DATA SCIENCE
+# ============================================================
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.gguf
+*.ggml
+*.bin
+
+# ML experiment outputs
+wandb/
+mlruns/
+runs/
+lightning_logs/
+checkpoints/
+models/
+model_cache/
+
+# Hugging Face cache
+.cache/huggingface/
+huggingface_cache/
+
+# Dataset and generated data
+data/raw/
+data/processed/
+datasets/raw/
+datasets/processed/
+
+# Vector databases
+chroma/
+chroma_db/
+qdrant_storage/
+weaviate_data/
+milvus_data/
+lancedb/
+
+# Local embeddings
+embeddings_cache/
+
+
+# ============================================================
+# 15. BACKUPS / ARCHIVES
+# ============================================================
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.iso
+*.dmg
+*.img
+
+# Local backup directories
+backups/
+backup/
+*.backup
+
+
+# ============================================================
+# 16. MISCELLANEOUS
+# ============================================================
+
+.DS_Store?
+*.stackdump
+*.core
+core
+npm-shrinkwrap.json.tmp
+
+# Local developer overrides
+local.settings.json
+settings.local.json
+config.local.json
+secrets.local.json
+
+# Temporary patch files
+*.patch.tmp
