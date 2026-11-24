@@ -46,6 +46,16 @@ async def lifespan(app: FastAPI):
         log.info("cache configured scheme=%s host=%s port=%s tls=%s",
                  redis.get("scheme"), redis.get("host"), redis.get("port"), redis.get("tls"))
 
+    if settings.cors_allows_any_origin:
+        if settings.is_production:
+            log.warning(
+                "CORS_ORIGINS is '*' in production: any website may call this API from a "
+                "browser. Set CORS_ORIGINS to the deployed frontend origin "
+                "(https://<site>) plus any preview domains you trust."
+            )
+    else:
+        log.info("cors origins configured: %s", ", ".join(settings.cors_origin_list))
+
     from app.services import tasks
 
     tasks.start_scheduler()
@@ -65,10 +75,16 @@ app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_origin_regex=r"https://.*\.e2b\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Opt-in only. The previous hardcoded r"https://.*\.e2b\.app" let any sandbox on
+    # the internet call the API from a browser, in production as well.
+    allow_origin_regex=(settings.cors_origin_regex or None),
+    # Credentials are disabled whenever every origin is allowed: Starlette would
+    # otherwise echo the caller's Origin and allow credentialed requests from any site.
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Internal-Token"],
+    expose_headers=["Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
+    max_age=600,
 )
 
 

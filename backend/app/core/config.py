@@ -5,6 +5,25 @@ from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_origin(raw: str) -> str:
+    """Turn a CORS entry into ``scheme://host[:port]`` form, or "" when it is unusable.
+
+    Dashboards and copied connection snippets routinely yield bare hostnames. A browser's
+    ``Origin`` header always carries a scheme, so a bare hostname can never match; it is
+    upgraded to https instead of being silently ignored.
+    """
+    entry = (raw or "").strip().strip('"').strip("'").rstrip("/").strip()
+    if not entry:
+        return ""
+    if entry == "*":
+        return "*"
+    if entry.startswith(("http://", "https://")):
+        return entry
+    if "://" in entry:                      # e.g. ws:// - not a browser origin
+        return ""
+    return f"https://{entry}"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -26,6 +45,10 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 180
     db_sslmode: str = ""                     # empty => Supabase URLs get "require"
     cors_origins: str = "*"
+    # A regex for extra allowed origins (sandbox previews). Empty by default: a pattern
+    # like https://.*\.e2b\.app lets *any* sandbox on the internet call the API, so it
+    # must be an explicit, per-environment decision rather than a built-in.
+    cors_origin_regex: str = ""
     public_site_url: str = "http://localhost:3000"
 
     # --- infrastructure ---------------------------------------------------
@@ -117,9 +140,44 @@ class Settings(BaseSettings):
 
     @property
     def cors_origin_list(self) -> List[str]:
+        """Allowed browser origins, normalised to scheme://host form.
+
+        A browser sends ``Origin: https://scholara.example``; a CORS_ORIGINS entry of
+        ``scholara.example`` therefore matches nothing and silently blocks every call
+        from the site - which is exactly what a bare hostname in a dashboard produced.
+        Bare entries are upgraded to https:// rather than ignored, because a value the
+        operator clearly meant as an origin should work. The normalised list is logged
+        at startup so the correction is visible.
+        """
         if self.cors_origins.strip() == "*":
             return ["*"]
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        origins: List[str] = []
+        for raw in self.cors_origins.split(","):
+            entry = normalize_origin(raw)
+            if entry and entry not in origins:
+                origins.append(entry)
+        # The site's own origin is always allowed: it is already published in
+        # PUBLIC_SITE_URL, and leaving it out of CORS_ORIGINS breaks every browser call
+        # from the deployed frontend - which is exactly the failure this fixes.
+        site = normalize_origin(self.public_site_url)
+        if site and site not in origins:
+            origins.append(site)
+        return origins
+
+    @property
+    def cors_allows_any_origin(self) -> bool:
+        return self.cors_origin_list == ["*"]
+
+    @property
+    def cors_allow_credentials(self) -> bool:
+        """Never pair a wildcard origin with credentials.
+
+        Starlette echoes the caller's Origin and sets Allow-Credentials when the list is
+        ``["*"]``, which lets *any* website drive an authenticated session. This API
+        authenticates with a bearer header, not cookies, so credentialed CORS is not
+        needed and is disabled whenever every origin is allowed.
+        """
+        return not self.cors_allows_any_origin
 
     @property
     def mfa_required_role_list(self) -> List[str]:

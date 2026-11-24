@@ -1,12 +1,65 @@
-/** Server-side data access. Browser code must use relative "/api/..." instead. */
-const BASE = process.env.INTERNAL_API_URL ?? "http://127.0.0.1:8000";
+/**
+ * Server-side data access. Browser code must use relative "/api/..." instead.
+ *
+ * `BASE` is validated by `./api-base`: in a production build a missing or loopback
+ * INTERNAL_API_URL throws here, at import time, instead of quietly fetching the build
+ * container's own port and publishing empty pages.
+ */
+import { isServer, resolveApiBase, resolveSiteUrl } from "./api-base";
 
-export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+const BASE = resolveApiBase();
+
+/** Canonical public origin (sitemap, robots, Open Graph). Never localhost in production. */
+export const SITE_URL = resolveSiteUrl();
 
 export type Dict = Record<string, any>;
 
+/** Guard so a client component that imports this module fails loudly rather than silently. */
+function backendUrl(path: string): string {
+  if (!BASE) {
+    throw new Error(
+      `Cannot request ${path} from the browser: API access is server-side only. ` +
+        `Use the relative "/api/v1${path}" path, which Next proxies to the backend.`,
+    );
+  }
+  return `${BASE}/api/v1${path}`;
+}
+
+/**
+ * A Render web service is stopped after a period of inactivity and takes tens of seconds to
+ * accept connections again. A Vercel build that happens to run first would otherwise fail
+ * on an error that is purely a cold start - and the fail-loud rule below correctly refuses
+ * to treat it as "no data", so the whole deploy would be rejected for the wrong reason.
+ *
+ * Only transport failures and gateway statuses are retried, twice, with a short backoff.
+ * A genuine 4xx/5xx answer from the application is never retried, because repeating it
+ * cannot help and would triple the build time on a real outage.
+ */
+const RETRY_STATUSES = new Set([502, 503, 504]);
+const RETRY_DELAYS_MS = [1_500, 4_000];
+
+async function fetchWithColdStartRetry(
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const res = await fetch(url, init);
+      if (!RETRY_STATUSES.has(res.status) || attempt === RETRY_DELAYS_MS.length) return res;
+    } catch (cause) {
+      lastError = cause;
+      if (attempt === RETRY_DELAYS_MS.length) break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("The API did not respond after retries");
+}
+
 export async function api<T = Dict>(path: string, revalidate = 60): Promise<T> {
-  const res = await fetch(`${BASE}/api/v1${path}`, {
+  const res = await fetchWithColdStartRetry(backendUrl(path), {
     next: { revalidate },
     headers: { Accept: "application/json" },
   });
@@ -25,17 +78,17 @@ export async function api<T = Dict>(path: string, revalidate = 60): Promise<T> {
  * not a clean 404 therefore throws, so the build fails loudly instead of lying quietly.
  */
 export async function apiOrNull<T = Dict>(path: string, revalidate = 60): Promise<T | null> {
-  const url = `${BASE}/api/v1${path}`;
+  const url = backendUrl(path);
   const headers: Record<string, string> = { Accept: "application/json" };
   // Server-side only: exempts first-party rendering from the public rate limit. `window`
   // is undefined during SSR/SSG; in the browser this header is never attached.
-  if (typeof window === "undefined" && process.env.INTERNAL_API_TOKEN) {
+  if (isServer() && process.env.INTERNAL_API_TOKEN) {
     headers["X-Internal-Token"] = process.env.INTERNAL_API_TOKEN;
   }
 
   let res: Response;
   try {
-    res = await fetch(url, { next: { revalidate }, headers });
+    res = await fetchWithColdStartRetry(url, { next: { revalidate }, headers });
   } catch (cause) {
     throw new Error(`Cannot reach the API for ${path}`, { cause });
   }

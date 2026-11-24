@@ -1,11 +1,16 @@
 import type { NextConfig } from "next";
+import { resolveApiBase } from "./src/lib/api-base";
 
 /**
  * The browser NEVER talks to the FastAPI port directly (it is not reachable from the
  * user's machine in a sandboxed preview). Every browser call uses a relative /api/... URL
  * and Next proxies it to the backend. Server components use INTERNAL_API_URL directly.
+ *
+ * Both paths resolve through `src/lib/api-base`, which fails the build when a production
+ * deployment has not set INTERNAL_API_URL (or set it to a loopback address) rather than
+ * silently proxying to the build container's own port.
  */
-const BACKEND = process.env.INTERNAL_API_URL ?? "http://127.0.0.1:8000";
+const BACKEND = resolveApiBase();
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,

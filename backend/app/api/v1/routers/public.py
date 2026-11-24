@@ -1,11 +1,13 @@
 """Public, cacheable, SEO-facing read endpoints."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api import serializers as S
@@ -21,6 +23,8 @@ from app.models.crm import SearchQueryLog
 from app.models.education import (Country, Department, Faculty, Professor, Program, ProgramIntake,
                                   Scholarship, University)
 from app.services import rotation
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["public"])
 
@@ -728,25 +732,45 @@ def global_search(q: str, limit: int = 8, db: Session = Depends(get_db)):
 
 @router.get("/sitemap-data")
 def sitemap_data(db: Session = Depends(get_db)):
-    """Feeds the Next.js sitemap generator (§71)."""
-    return {
-        "countries": [{"slug": c.slug, "updated": S._dt(c.updated_at)} for c in db.execute(select(Country)).scalars().all()],
-        "universities": [{"slug": u.slug, "country": u.country.slug if u.country else None, "updated": S._dt(u.updated_at)}
-                         for u in db.execute(select(University).options(selectinload(University.country))
-                                             .where(University.is_published.is_(True))).scalars().unique().all()],
-        "programs": [{"slug": p.slug, "updated": S._dt(p.updated_at)}
-                     for p in db.execute(select(Program).where(Program.is_published.is_(True))).scalars().all()],
-        "scholarships": [{"slug": s.slug, "updated": S._dt(s.updated_at)}
-                         for s in db.execute(select(Scholarship).where(Scholarship.is_published.is_(True))).scalars().all()],
-        # "faculty" = professors (/faculty/{slug}); "faculties" = academic divisions
-        # (/faculties/{slug}). The specification overloads the word; the routes do not.
-        "faculty": [{"slug": p.slug, "updated": S._dt(p.updated_at)} for p in db.execute(select(Professor)).scalars().all()],
-        "faculties": [{"slug": f.slug, "updated": S._dt(f.updated_at)}
-                      for f in db.execute(select(Faculty)).scalars().all()],
-        "services": [{"slug": s.slug, "updated": S._dt(s.updated_at)} for s in db.execute(select(Service)).scalars().all()],
-        "success_stories": [{"slug": s.slug, "updated": S._dt(s.updated_at)}
-                            for s in db.execute(select(SuccessStory).where(SuccessStory.is_published.is_(True))).scalars().all()],
-        "events": [{"slug": e.slug, "updated": S._dt(e.updated_at)} for e in db.execute(select(Event)).scalars().all()],
-        "posts": [{"slug": b.slug, "updated": S._dt(b.updated_at)}
-                  for b in db.execute(select(BlogPost).where(BlogPost.is_published.is_(True))).scalars().all()],
-    }
+    """Feeds the Next.js sitemap generator (§71).
+
+    Ordered by slug so a rebuild produces byte-stable output and the sitemap does not
+    churn. A dependency outage is reported as 503 (retryable) rather than a generic 500,
+    and never as an empty sitemap: a build that cannot see the database must fail loudly,
+    not publish a site that claims to have no pages.
+    """
+    try:
+        return {
+            "countries": [{"slug": c.slug, "updated": S._dt(c.updated_at)}
+                          for c in db.execute(select(Country).order_by(Country.slug)).scalars().all()],
+            "universities": [{"slug": u.slug, "country": u.country.slug if u.country else None, "updated": S._dt(u.updated_at)}
+                             for u in db.execute(select(University).options(selectinload(University.country))
+                                                 .where(University.is_published.is_(True))
+                                                 .order_by(University.slug)).scalars().unique().all()],
+            "programs": [{"slug": p.slug, "updated": S._dt(p.updated_at)}
+                         for p in db.execute(select(Program).where(Program.is_published.is_(True))
+                                             .order_by(Program.slug)).scalars().all()],
+            "scholarships": [{"slug": s.slug, "updated": S._dt(s.updated_at)}
+                             for s in db.execute(select(Scholarship).where(Scholarship.is_published.is_(True))
+                                                 .order_by(Scholarship.slug)).scalars().all()],
+            # "faculty" = professors (/faculty/{slug}); "faculties" = academic divisions
+            # (/faculties/{slug}). The specification overloads the word; the routes do not.
+            "faculty": [{"slug": p.slug, "updated": S._dt(p.updated_at)}
+                        for p in db.execute(select(Professor).order_by(Professor.slug)).scalars().all()],
+            "faculties": [{"slug": f.slug, "updated": S._dt(f.updated_at)}
+                          for f in db.execute(select(Faculty).order_by(Faculty.slug)).scalars().all()],
+            "services": [{"slug": s.slug, "updated": S._dt(s.updated_at)}
+                         for s in db.execute(select(Service).order_by(Service.slug)).scalars().all()],
+            "success_stories": [{"slug": s.slug, "updated": S._dt(s.updated_at)}
+                                for s in db.execute(select(SuccessStory).where(SuccessStory.is_published.is_(True))
+                                                   .order_by(SuccessStory.slug)).scalars().all()],
+            "events": [{"slug": e.slug, "updated": S._dt(e.updated_at)}
+                       for e in db.execute(select(Event).order_by(Event.slug)).scalars().all()],
+            "posts": [{"slug": b.slug, "updated": S._dt(b.updated_at)}
+                      for b in db.execute(select(BlogPost).where(BlogPost.is_published.is_(True))
+                                          .order_by(BlogPost.slug)).scalars().all()],
+        }
+    except SQLAlchemyError as exc:
+        log.warning("sitemap_data database failure: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Sitemap data temporarily unavailable",
+                            headers={"Retry-After": "30"}) from exc

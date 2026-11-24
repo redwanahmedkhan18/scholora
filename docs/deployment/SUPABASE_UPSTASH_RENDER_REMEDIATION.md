@@ -1,7 +1,23 @@
 # Supabase + Upstash + Render remediation
 
-Status: **code and local verification complete; the module was missing from Git, and
-live Render verification is blocked.**
+Status: **code verified against the real Supabase and Upstash services and a throwaway
+PostgreSQL 17 instance; live Render verification is blocked because the Render service has
+no running instance.**
+
+Two independent production blockers are now confirmed by direct measurement rather than
+inference:
+
+1. The Supabase **direct** host is IPv6-only, so Render cannot reach it
+   (`Network is unreachable` -> `psycopg.OperationalError: connection is bad`). The
+   IPv4-reachable **Session Pooler** answers on `aws-1-ap-south-1` and accepts the
+   project's existing password (`SELECT 1` succeeds).
+2. The production database has **zero tables in `public`** and no `alembic_version`.
+   Even with connectivity fixed, every endpoint would fail with `UndefinedTable` until
+   `alembic upgrade head` runs. This is not a connectivity problem and would not have
+   been fixed by a URL change.
+
+See `docs/deployment/ENVIRONMENT_MATRIX.md` for the per-service variable matrix and the
+owner runbook. The findings from this session are in §14.
 
 This document records the permanent fix for the production startup failure:
 
@@ -575,3 +591,121 @@ Owner actions still required:
 7. Keep exactly one Celery beat instance. Scale workers, not beat.
 
 Once §11.1 passes from Render, the original IPv6 startup failure is permanently closed.
+
+---
+
+## 14. Second remediation pass: what was actually measured
+
+Everything below was verified from this workstation against the real Supabase project,
+the real Upstash databases and a throwaway PostgreSQL 17 instance. No secret value is
+reproduced here.
+
+### 14.1 Supabase connectivity, resolved by measurement
+
+The direct host resolves to **AAAA only** (`2406:da1a:1cb4:bf00:...`), which is
+`ap-south-1`. Both pooler clusters for that region resolve to IPv4, so the cluster was
+determined by connecting, not by guessing:
+
+| Candidate | Result |
+| --- | --- |
+| `aws-0-ap-south-1.pooler.supabase.com:5432` | `FATAL: (ENOTFOUND) tenant/user postgres.<ref>` - project is not on this cluster |
+| `aws-1-ap-south-1.pooler.supabase.com:5432` | **connect + `SELECT 1` OK**, `PostgreSQL 17.12` |
+
+The project's configured password authenticates over the Session Pooler unchanged, so no
+credential rotation is required for this fix. `current_user` is `postgres` and the
+Session Pooler user is `postgres.<project-ref>`; `sslmode=require` is accepted.
+
+The application's own code path was then exercised end to end with
+`ENVIRONMENT=production` and the pooler URL: `normalize_database_url` produced
+`postgresql+psycopg://`, `summarize_database_url` reported `is_supabase_pooler: true` and
+`pooler_username_ok: true`, and `check_database()` returned `ok: true`.
+
+### 14.2 The production schema is empty
+
+`information_schema.tables` for `public` returns **0 rows**; `alembic_version` does not
+exist. The `vector` extension is already enabled, which is what migration
+`a1b2c3d4e5f6` needs. Until `alembic upgrade head` runs, `/api/v1/sitemap-data` cannot
+succeed for any connection string.
+
+The migration chain was therefore verified against a **real PostgreSQL 17** instance
+(`pgvector/pgvector:pg17`, throwaway container, not production):
+
+```text
+alembic upgrade head      -> 3228d79ec167 (head), 48 tables in public
+                           61 jsonb columns, 0 json columns, vector extension created
+alembic check             -> No new upgrade operations detected
+alembic downgrade base    -> clean
+alembic upgrade head      -> 3228d79ec167 (head), idempotent
+```
+
+With the app served against that PostgreSQL instance and **no rows**:
+`/api/health/live` 200, `/api/health/ready` 200 `ready: true`, `/api/v1/sitemap-data`
+200 with every list empty (the legitimate empty state), `/api/v1/vocabularies` 200, and
+`/api/v1/settings` 404 `Site settings not initialised` until seeding runs.
+
+### 14.3 Upstash and Celery
+
+Both configured Upstash endpoints answer over TLS (`rediss`, certificate verification
+required): `PING`, `SET`/`GET`, and Redis 8.4.0. The application's `Cache` facade reported
+`backend: redis`, `get_json`, `incr_with_ttl` and the `SCAN`-based
+`invalidate_prefix` all worked. `build_celery_app()` registered the six `scholara.*`
+tasks and completed a broker handshake.
+
+The stored `CELERY_BROKER_URL` still carries a trailing `"`; the URL cleaner strips it,
+but the Render value should be corrected.
+
+### 14.4 Render has no running service
+
+`https://scholora-cfch.onrender.com` answers every path with a plain-text `404` and the
+header `x-render-routing: no-server`. This is not the FastAPI app (which answers
+`{"detail":"Not Found"}`) and not a crashed process: there is no instance behind the
+hostname. Fixing the environment variables is necessary but not sufficient - the service
+must be deployed again.
+
+### 14.5 Defects found and fixed in this pass
+
+| File | Defect | Fix |
+| --- | --- | --- |
+| `frontend/src/lib/api-base.ts` | `INTERNAL_API_URL ?? "http://127.0.0.1:8000"` silently pointed a production build at the build container. Also `NEXT_PUBLIC_SITE_URL` fell back to `localhost` in canonical/OG/sitemap output. | New resolver: the variable is required in production, must be an absolute http(s) URL, must be `https` unless loopback, and loopback is refused unless `ALLOW_LOCAL_API=true`. Site URL falls back to the Vercel deployment domain instead of localhost. |
+| `frontend/next.config.ts` | The `/api/:path*` rewrite used the same unvalidated fallback. | Imports the same resolver, so the rewrite and the server-side client cannot disagree. |
+| `frontend/src/lib/api.ts` | A Render cold start failed the whole Vercel build. | Two bounded retries (1.5 s, 4 s) for transport errors and 502/503/504 only. Application errors are never retried, so a real outage still fails loudly. |
+| `backend/app/api/v1/routers/public.py` | The new 503 handler called `log.warning` but the module had **no logger** - a database outage would have raised `NameError` and returned 500 instead of 503. | Added the module logger. |
+| `backend/app/core/config.py` | `CORS_ORIGINS` was used verbatim, so a bare hostname (as configured in production: `CORS_ORIGINS=scholara.onrender.com`) can never match a browser `Origin` header. | Entries are normalised to `scheme://host`; `PUBLIC_SITE_URL` is always allowed; the effective list is logged at startup. |
+| `backend/app/main.py` | `allow_origins=["*"]` was combined with `allow_credentials=True`, so any website could make credentialed requests; a hardcoded `https://.*\.e2b\.app` regex was active in production. | Credentials are disabled whenever every origin is allowed; the regex moved to the `CORS_ORIGIN_REGEX` setting (empty by default); `Retry-After` and the rate-limit headers are exposed. |
+| `backend/tests/conftest.py` | The suite inherited the developer's `.env`: the seeded admin was not `admin@scholara.com.bd` (every admin test 401'd) and real Meta/LLM keys made a "no credentials configured" test exercise the wrong branch. | Pins `ADMIN_EMAIL`/`ADMIN_PASSWORD` and blanks every third-party credential, matching the existing REDIS/CELERY isolation. |
+| `backend/tests/test_sitemap_and_cors.py` | No coverage for the sitemap failure contract or the CORS policy. | 13 tests: normal, empty and database-failure states, no-leak assertions, draft exclusion, slug ordering, and the CORS rules. |
+
+### 14.6 Verification results
+
+| Check | Result |
+| --- | --- |
+| Backend suite (Python 3.13.1) | **286 passed, 1 failed** - the pre-existing LSA retrieval-quality failure, unchanged from the previous pass (273 + 13 new tests) |
+| `pip check` | No broken requirements found (59 packages) |
+| `import app.main`, routers, `build_celery_app` | PASS |
+| Alembic on PostgreSQL 17 | PASS - upgrade/downgrade/check/idempotency (§14.2) |
+| `/api/health/ready` against real PostgreSQL | PASS - 200, `ready: true` |
+| `/api/v1/sitemap-data` against real PostgreSQL, empty schema tables | PASS - 200, empty lists, not a 503 and not a fabricated record |
+| `/api/v1/sitemap-data` with the database down | PASS - 503 + `Retry-After`, no driver message, no hostname |
+| Supabase Session Pooler from this host | PASS - `SELECT 1`, pooler identity confirmed |
+| Upstash cache + broker over TLS | PASS - PING, SET/GET, pipeline, SCAN |
+| Celery app + broker handshake | PASS - 6 tasks registered |
+| Frontend `tsc --noEmit` | PASS |
+| Frontend production build | PASS - 45 routes, `/sitemap.xml` generated with 209 URLs from the API |
+| Frontend build with `INTERNAL_API_URL` unset | PASS - build refused, message names the variable |
+| Frontend build with a loopback API URL | PASS - build refused, message explains the fix |
+| Live Render endpoints | **FAIL** - `x-render-routing: no-server`, no instance deployed |
+| Production Supabase schema | **FAIL** - 0 tables, migrations never applied |
+
+### 14.7 Remaining owner actions
+
+1. Redeploy the Render service (it is currently not running at all).
+2. Point `DATABASE_URL` at `aws-1-ap-south-1.pooler.supabase.com` with the
+   `postgres.<project-ref>` username (§6 in the matrix document).
+3. Run `alembic upgrade head`, then `python -m app.seed`.
+4. Set `CORS_ORIGINS` to the real Vercel origin, remove the trailing quote from
+   `CELERY_BROKER_URL`, and set `ENVIRONMENT=production` where it is missing.
+5. Set `INTERNAL_API_URL`, `INTERNAL_API_TOKEN` and `NEXT_PUBLIC_SITE_URL` on Vercel,
+   then redeploy.
+6. Rerun §11.1 from a Render Shell. Do not consider the deployment production-ready until
+   `/api/health/ready` returns `ready: true` **from Render**, not from here.
+

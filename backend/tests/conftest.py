@@ -21,10 +21,27 @@ os.environ["RATE_LIMIT_ENABLED"] = "false"   # per-test limits are asserted expl
 os.environ["SCHEDULER_ENABLED"] = "false"    # no background thread during tests
 os.environ["ENVIRONMENT"] = "test"
 os.environ["SECRET_KEY"] = "test-secret-key-not-for-production"
+# The suite authenticates as the seeded admin with a fixed password. A developer's real
+# backend/.env overrides ADMIN_EMAIL/ADMIN_PASSWORD (it holds their production admin), so
+# seeding and the login helper disagreed and every admin test failed with a 401. Pin both
+# here so the suite is hermetic and never depends on, or touches, a real account.
+os.environ["ADMIN_EMAIL"] = "admin@scholara.com.bd"
+os.environ["ADMIN_PASSWORD"] = "Admin@12345"
 # Never let a developer's real backend/.env make the suite talk to production Upstash.
 os.environ["REDIS_URL"] = ""
 os.environ["CELERY_BROKER_URL"] = ""
 os.environ["CELERY_RESULT_BACKEND"] = ""
+# Third-party credentials too: a developer's .env holds real Meta/Meta-pixel/LLM keys, and
+# tests that assert "no credentials configured" (e.g. CAPI degrading to LOGGED_LOCALLY)
+# silently stopped testing that behaviour. Every test that needs a provider patches
+# settings directly, so nothing is lost by starting from an empty external config.
+for _external_credential in (
+    "META_PIXEL_ID", "META_CAPI_ACCESS_TOKEN", "FACEBOOK_PAGE_ID",
+    "FACEBOOK_PAGE_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_APP_SECRET", "XAI_API_KEY", "MISTRAL_API_KEY", "GEMINI_API_KEY",
+    "GA4_MEASUREMENT_ID", "GOOGLE_ADS_CONVERSION_ID", "S3_ACCESS_KEY", "S3_SECRET_KEY",
+):
+    os.environ[_external_credential] = ""
 
 from fastapi.testclient import TestClient  # noqa: E402
 

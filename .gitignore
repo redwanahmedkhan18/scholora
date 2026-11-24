@@ -13,6 +13,11 @@
 .env*
 **/.env*
 .env.example
+# ...except the committed templates. backend/.env.example was added before the rule and is
+# tracked; without this negation a new template (frontend/.env.example) silently cannot be
+# committed, which is how documentation goes missing.
+!/backend/.env.example
+!/frontend/.env.example
 
 # Secret and credential files
 *.pem
@@ -71,6 +76,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# Cached models written at runtime by app/core/local_semantic.py (1.3 MB binary, rebuilt
+# automatically when absent - regenerating it is cheaper than storing it).
+*.pkl
+backend/app/data/local_semantic_model.pkl
 
 # Python distributions
 build/
