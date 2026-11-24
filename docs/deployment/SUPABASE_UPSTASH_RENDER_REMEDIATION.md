@@ -1,6 +1,7 @@
 # Supabase + Upstash + Render remediation
 
-Status: **code and local verification complete; live Render verification blocked.**
+Status: **code and local verification complete; the module was missing from Git, and
+live Render verification is blocked.**
 
 This document records the permanent fix for the production startup failure:
 
@@ -11,6 +12,124 @@ psycopg.OperationalError: connection to server at
 
 The failure was not a password problem and not a SQLAlchemy problem. It was the
 Supabase **direct** database host resolving to IPv6 on Render.
+
+A second deployment failure, `ImportError: cannot import name 'connectivity' from
+'app.core'`, was caused by a `.gitignore` rule that silently excluded the new module from
+the commit. That is documented in §0.
+
+---
+
+## 0. Render import failure audit
+
+### 0.1 Symptom
+
+The latest Render build succeeded, but the process crashed before serving:
+
+```text
+File "/opt/render/project/src/backend/app/main.py", line 9, in <module>
+    from app.core import connectivity
+ImportError: cannot import name 'connectivity' from 'app.core'
+```
+
+### 0.2 Findings
+
+| Question | Finding |
+| --- | --- |
+| Was `connectivity.py` never created? | No. It exists at `backend/app/core/connectivity.py` (13,020 bytes, non-empty, valid Python). |
+| Was it created in the wrong directory? | No. The path matches the import `app.core.connectivity`. |
+| Was it omitted from Git? | **Yes.** `git ls-files backend/app/core` did not list it. |
+| Did the filename or import path differ? | No. The filename and import are consistent. |
+| Is a circular import responsible? | No. The working tree imports `app.main` successfully. |
+| Does the deployed commit contain it? | **No.** `git cat-file -e 9701eb7:backend/app/core/connectivity.py` fails. |
+
+The cause was `.gitignore` line 564:
+
+```gitignore
+core
+```
+
+A bare `core` pattern matches **any file or directory named `core` at any depth**. It
+therefore ignored the new file inside `backend/app/core/`. The other files in that
+directory are tracked because they were added before the pattern existed; a new file is
+subject to it. `git check-ignore -v backend/app/core/connectivity.py` confirmed:
+
+```text
+.gitignore:564:core    backend/app/core/connectivity.py
+```
+
+Commit `9701eb7` (`fixing dependency errors`) contains every other remediation file —
+`main.py`, `database.py`, `cache.py`, `config.py`, `tasks.py`, `alembic/env.py`, the
+migration, tests, the diagnostic script and this document — but not
+`connectivity.py`. Branch `main` and `origin/main` both pointed at `9701eb7`, so Render
+deployed exactly that incomplete commit.
+
+### 0.3 Reproduction
+
+The commit was exported to a temporary directory and imported with a clean environment:
+
+```bash
+git archive 9701eb7 | tar -x -C "$TMP"
+cd "$TMP/backend"
+ENVIRONMENT=test DATABASE_URL="sqlite:///$TMP/import.db" \
+  REDIS_URL="" CELERY_BROKER_URL="" CELERY_RESULT_BACKEND="" \
+  python -c "import app.main"
+```
+
+Result: the exact Render error, `ImportError: cannot import name 'connectivity' from
+'app.core'`. The same command against the working tree succeeds.
+
+### 0.4 Fix applied
+
+`.gitignore` no longer contains a bare `core` pattern. It now ignores only core-dump
+shapes and a root-level `core` path:
+
+```gitignore
+*.core
+core.[0-9]*
+/core
+```
+
+`git check-ignore -v backend/app/core/connectivity.py` now reports that the file is not
+ignored. The file itself was not modified or recreated; it was already correct.
+
+**The file is still untracked because no commit was made.** It must be added and pushed
+before Render can see it:
+
+```bash
+git add .gitignore backend/app/core/connectivity.py
+git commit -m "fix: track connectivity module required by app.main"
+git push origin main
+```
+
+No commit or push was performed here: the task requires explicit approval for that.
+
+### 0.5 Import and startup audit
+
+| Check | Result |
+| --- | --- |
+| `import app.main` from working tree | PASS |
+| `import app.services.tasks` / Celery app build | PASS (`scholara`, scheduler mode `celery`) |
+| Production-like lifespan + `/api/health/live` with no live DB/Redis | PASS (HTTP 200) |
+| Production-like import/lifespan with `backend/.env` moved aside | PASS; no local-only `.env` dependency |
+| AST audit of `app/main.py` module imports | PASS; every module path exists in the working tree |
+| `Base.metadata.create_all()` in FastAPI startup | PASS; none (only tests and guarded seed call it) |
+| `pip check` (Python 3.13.1 venv) | PASS; all 73 installed packages compatible |
+| Backend test suite | 273 passed, 1 pre-existing LSA-quality failure |
+| Ruff | No project configuration; default run reports style-only findings, no undefined names |
+| Mypy | Not configured; no project config and the global entry point is unusable |
+
+The import audit covered every module path referenced by `app/main.py`:
+`app.core`, `app.core.config`, `app.core.connectivity`, `app.core.database`,
+`app.core.ratelimit`, `app.api.v1.routers.*`, `app.models` and the dynamic
+`app.services.tasks` import in the lifespan. Imported symbols were checked by actually
+importing `app.main`, not only by filename.
+
+### 0.6 Remaining blockers
+
+1. `connectivity.py` is unignored but still untracked; it must be committed and pushed.
+2. Render must redeploy the commit that contains it.
+3. Live Supabase and Upstash verification remains blocked until it can be run from
+   Render with the production environment variables.
 
 ---
 
@@ -28,8 +147,9 @@ Supabase **direct** database host resolving to IPv6 on Render.
 | Scheduler | In-process scheduler could run in production | Disabled in production unless explicitly overridden; Celery beat owns the schedule |
 | Diagnostics | Driver error leaked into logs | Redacted summaries and a Render-safe connectivity script |
 
-The only remaining work is to set the Render environment variables to the Supabase
-Session Pooler and Upstash TLS URLs, then deploy and run the checks in §11.
+The remaining work is to commit and push `connectivity.py` (see §0.4), set the Render
+environment variables to the Supabase Session Pooler and Upstash TLS URLs, then deploy
+and run the checks in §11.
 
 ---
 
@@ -214,6 +334,7 @@ DATABASE_URL=postgresql+psycopg://postgres.<project-ref>:<url-encoded-password>@
 | `backend/tests/conftest.py` | Clears `REDIS_URL`, `CELERY_BROKER_URL` and `CELERY_RESULT_BACKEND` so tests never touch real infrastructure. |
 | `backend/tests/test_connectivity.py` | 21 focused tests for URL handling, TLS, redaction, readiness, lifespan and Celery. |
 | `backend/.env.example` | Documents the Session Pooler and Upstash TLS forms. |
+| `.gitignore` | Removed the bare `core` rule that silently ignored `backend/app/core/connectivity.py`; core dumps are still covered by `*.core`, `core.[0-9]*` and `/core`. |
 
 No new database revision was added. The Alembic head remains `3228d79ec167`.
 
@@ -299,6 +420,17 @@ They never contain passwords, full hosts or project references.
 | Dependencies install on Python 3.13.1 | PASS | Clean `uv` venv from `requirements-dev.txt` |
 | Full backend test suite | PASS | 273 passed; 1 pre-existing LSA-quality failure unrelated to dependencies |
 | New connectivity tests | PASS | 21 passed |
+| `connectivity.py` present and non-empty in working tree | PASS | 13,020 bytes; import succeeds |
+| `connectivity.py` tracked by Git | FAIL | Untracked; was hidden by the bare `core` ignore rule |
+| Latest commit contains `connectivity.py` | FAIL | Missing from `9701eb7` |
+| Import `app.main` from latest commit | FAIL | Reproduced the exact Render `ImportError` |
+| Import `app.main` from working tree | PASS | `app.main import OK` |
+| Celery import from working tree | PASS | App name `scholara`; scheduler mode `celery` |
+| Production-like lifespan/liveness without live DB/Redis | PASS | HTTP 200; no startup schema creation |
+| Production-like import/lifespan with `.env` absent | PASS | Explicit environment variables only |
+| `pip check` | PASS | 73 packages, all compatible |
+| Ruff / mypy | NOT CONFIGURED | No project config; default Ruff run has style-only findings, mypy unavailable |
+| Git push of the fix | BLOCKED | Commit/push requires explicit owner approval |
 | Database URL normalisation (`postgres` → `postgresql+psycopg`) | PASS | Unit tests |
 | Supabase SSL default (`sslmode=require`) | PASS | Unit tests |
 | Production refuses SQLite | PASS | Unit test |
@@ -432,13 +564,14 @@ Security properties:
 
 Owner actions still required:
 
-1. Update Render environment variables to the Session Pooler and Upstash TLS URLs.
-2. Remove the stray quote from the Render `CELERY_BROKER_URL` value.
-3. Run the migration job and the Render-side connectivity check.
-4. Rotate any credential that was copied into a shared `.env` or chat.
-5. If Supabase's pool is small, lower `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` on the worker and
+1. Commit and push `.gitignore` and `backend/app/core/connectivity.py`; redeploy Render.
+2. Update Render environment variables to the Session Pooler and Upstash TLS URLs.
+3. Remove the stray quote from the Render `CELERY_BROKER_URL` value.
+4. Run the migration job and the Render-side connectivity check.
+5. Rotate any credential that was copied into a shared `.env` or chat.
+6. If Supabase's pool is small, lower `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` on the worker and
    keep worker concurrency at 1–2. The defaults are sized for one web instance, one
    worker and a migration job.
-6. Keep exactly one Celery beat instance. Scale workers, not beat.
+7. Keep exactly one Celery beat instance. Scale workers, not beat.
 
 Once §11.1 passes from Render, the original IPv6 startup failure is permanently closed.

@@ -561,7 +561,9 @@ backup/
 .DS_Store?
 *.stackdump
 *.core
-core
+# Core dumps. Do not use a bare `core` pattern: it also ignores backend/app/core.
+core.[0-9]*
+/core
 npm-shrinkwrap.json.tmp
 
 # Local developer overrides
