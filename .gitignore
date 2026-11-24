@@ -12,6 +12,7 @@
 # Ignore ALL files and directories beginning with .env
 .env*
 **/.env*
+.env.example
 
 # Secret and credential files
 *.pem
@@ -96,7 +97,7 @@ env/
 ENV/
 venv.bak/
 env.bak/
-.python-version
+# .python-version is intentionally committed: Render reads it to pin the runtime.
 
 # Python packaging
 pip-wheel-metadata/

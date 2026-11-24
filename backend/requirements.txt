@@ -25,3 +25,14 @@ alembic>=1.13
 redis>=5.0
 celery>=5.4
 pgvector>=0.3
+
+# ------------------------------------------------- direct imports not covered above
+# These are imported by the application but were missing from this file (numpy and
+# scikit-learn made `import app.main` fail outright; boto3 broke the S3 storage backend;
+# starlette was only present transitively through FastAPI). Lower bounds are the first
+# releases with wheels for the pinned Python 3.13 runtime; the resolver still picks the
+# newest compatible release, so Python 3.14 installs resolve to current wheels.
+numpy>=2.1
+scikit-learn>=1.6
+boto3>=1.34
+starlette>=0.37

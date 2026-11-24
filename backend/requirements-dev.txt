@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test-only tooling. Kept out of the production image so the runtime stays lean.
+pytest>=8.0
