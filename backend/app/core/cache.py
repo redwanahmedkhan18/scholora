@@ -15,7 +15,7 @@ import time
 from typing import Any, Optional
 
 from app.core.config import settings
-from app.core.connectivity import normalize_redis_url, redis_connect_kwargs, summarize_redis_url
+from app.core.connectivity import normalize_redis_url, redis_connect_kwargs, redis_summary
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class Cache:
         self._prefix = settings.cache_key_prefix or ""
         self._raw_url = (settings.redis_url or "").strip()
         self._last_error: Optional[str] = None
-        self._url_summary = summarize_redis_url(self._raw_url) if self._raw_url else None
+        self._url_summary = redis_summary(self._raw_url) if self._raw_url else None
 
         if self._raw_url and _redis is not None:
             try:

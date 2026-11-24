@@ -210,6 +210,24 @@ def summarize_redis_url(raw: str) -> Dict[str, Any]:
     }
 
 
+def redis_summary(raw: str) -> Dict[str, Any]:
+    """Redacted summary of a Redis URL *as it will actually be used*.
+
+    ``summarize_redis_url`` on the raw value reports ``scheme: redis, tls: false`` for an
+    Upstash ``redis://`` URL, because it describes what was configured rather than what
+    the client will dial. The client upgrades Upstash to ``rediss://``, so a diagnostic
+    built on the raw value tells an operator that TLS is off while every byte is in fact
+    encrypted - the opposite of what they need to know. Normalise first.
+    """
+    clean = _clean(raw)
+    if not clean:
+        return summarize_redis_url("")
+    try:
+        return summarize_redis_url(normalize_redis_url(clean))
+    except Exception:  # noqa: BLE001 - an unusable URL is reported, not raised
+        return summarize_redis_url(clean)
+
+
 def redis_connect_kwargs(raw: str, timeout: Optional[float] = None) -> Dict[str, Any]:
     """redis-py keyword arguments with explicit timeouts and TLS verification."""
     url = normalize_redis_url(raw)
@@ -298,7 +316,7 @@ def check_redis_url(raw: str, label: str, required: bool = False,
             "latency_ms": 0.0,
         }
 
-    summary = summarize_redis_url(raw)
+    summary = redis_summary(raw)
     key = _probe_key(label, _clean(raw))
 
     def probe() -> Dict[str, Any]:

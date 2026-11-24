@@ -8,13 +8,23 @@ from fastapi.responses import JSONResponse
 
 from app.core import connectivity
 from app.core.config import settings
-from app.core.connectivity import summarize_database_url, summarize_redis_url
+from app.core.connectivity import redis_summary, summarize_database_url
 from app.core.database import engine
 from app.core.ratelimit import RateLimitMiddleware
 from app.api.v1.routers import (actions, admin, admin_extra, admin_platform,
                                  integrations, public, student)
 
 import app.models  # noqa: F401  (register metadata)
+
+# Uvicorn configures only its own loggers. Everything under `app.*` propagates to a root
+# logger with no handler, so `log.info(...)` fell through to logging.lastResort and was
+# dropped at WARNING level - the redacted startup summary that is supposed to confirm
+# `pooler=True` never appeared in Render's logs at all. Install a handler only when
+# nothing has configured logging yet, so an embedding process (a Celery worker, a test
+# harness) keeps its own setup.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s:     %(name)s - %(message)s")
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +51,7 @@ async def lifespan(app: FastAPI):
             "DATABASE_URL uses the Supabase direct host; on Render use the IPv4 Session "
             "Pooler URL from Supabase Dashboard -> Connect -> Session Pooler."
         )
-    redis = summarize_redis_url(settings.redis_url) if settings.redis_url else None
+    redis = redis_summary(settings.redis_url) if settings.redis_url else None
     if redis:
         log.info("cache configured scheme=%s host=%s port=%s tls=%s",
                  redis.get("scheme"), redis.get("host"), redis.get("port"), redis.get("tls"))

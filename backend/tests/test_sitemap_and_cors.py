@@ -217,3 +217,48 @@ def test_cors_exposes_retry_after_so_a_503_can_be_retried(client):
 
 
 from app.models.content import BlogPost  # noqa: E402  (used by the drafts test)
+
+
+# ------------------------------------------------------- Redis reporting accuracy
+def test_redis_summary_reports_the_tls_the_client_will_actually_use():
+    """An Upstash `redis://` URL is dialled over TLS; the summary must say so."""
+    from app.core.connectivity import redis_summary
+
+    summary = redis_summary("redis://default:secret@example.upstash.io:6379/0")
+    assert summary["scheme"] == "rediss"
+    assert summary["tls"] is True
+    assert "secret" not in str(summary)
+
+
+def test_redis_summary_marks_a_rest_url_as_unusable():
+    """The Upstash REST endpoint is not a Redis protocol URL."""
+    from app.core.connectivity import redis_summary
+
+    summary = redis_summary("https://example.upstash.io")
+    assert summary["tls"] is False
+    assert summary["scheme"] != "rediss"
+
+
+def test_readiness_reports_redis_tls_for_a_plain_upstash_url(monkeypatch):
+    """The readiness payload is what an operator reads during an incident."""
+    from app.core import connectivity
+
+    monkeypatch.setattr("app.core.config.get_settings",
+                        lambda: _SettingsWithRedis("redis://default:secret@example.upstash.io:6379/0"))
+    monkeypatch.setattr(connectivity, "check_database", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(connectivity, "check_redis_url",
+                        lambda raw, label, **k: {**redis_shape(raw), "ok": True, "label": label})
+    report = connectivity.readiness_report()
+    assert report["checks"]["cache"]["tls"] is True
+
+
+def redis_shape(raw: str):
+    from app.core.connectivity import redis_summary
+
+    return redis_summary(raw)
+
+
+def _SettingsWithRedis(url: str):
+    from app.core.config import Settings
+
+    return Settings(redis_url=url, celery_broker_url=url, environment="development")
