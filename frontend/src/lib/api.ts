@@ -1,11 +1,14 @@
 /**
  * Server-side data access. Browser code must use relative "/api/..." instead.
  *
- * `BASE` is validated by `./api-base`: in a production build a missing or loopback
- * INTERNAL_API_URL throws here, at import time, instead of quietly fetching the build
- * container's own port and publishing empty pages.
+ * `BASE` is validated by `../../config/api-base` — a plain CommonJS module shared with
+ * `next.config.ts` (which needs the same origin for its `/api/:path*` rewrite). It is not
+ * TypeScript because Next `require()`s the compiled config at build time and Node will not
+ * resolve an extensionless `.ts` import from it; see that file's header. In a production
+ * build a missing or loopback INTERNAL_API_URL therefore throws here, at import time,
+ * instead of quietly fetching the build container's own port and publishing empty pages.
  */
-import { isServer, resolveApiBase, resolveSiteUrl } from "./api-base";
+import { isServer, resolveApiBase, resolveSiteUrl } from "../../config/api-base";
 
 const BASE = resolveApiBase();
 
