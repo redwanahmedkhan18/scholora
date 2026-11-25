@@ -96,7 +96,19 @@ export async function apiOrNull<T = Dict>(path: string, revalidate = 60): Promis
     throw new Error(`Cannot reach the API for ${path}`, { cause });
   }
 
-  if (res.status === 404) return null;
+  if (res.status === 404) {
+    // Only a *clean* 404 counts as "does not exist". The FastAPI app answers JSON
+    // (`{"detail":"Not Found"}`); a hosting edge in front of a sleeping or suspended
+    // instance answers plain text. Treating the second as a missing resource would freeze
+    // a permanent not-found page for content that exists, so it is raised instead.
+    const type = res.headers.get("content-type") ?? "";
+    if (type.includes("application/json")) return null;
+    throw new Error(
+      `The API host answered ${res.status} without a JSON body for ${path}. ` +
+        `That is an edge/proxy response, not a "not found" from the API itself, so it is ` +
+        `treated as an outage rather than as missing content.`,
+    );
+  }
   if (!res.ok) {
     throw new Error(
       `API returned ${res.status} for ${path}` +
