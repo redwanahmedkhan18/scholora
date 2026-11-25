@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, cast
 
 from sqlalchemy import func, select
 
@@ -25,12 +25,17 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.content import AdCampaign
 from app.models.crm import AnalyticsEvent, DataVerification, Lead
-from app.models.education import Program, ProgramIntake, Professor, Scholarship, University
+from app.models.education import Professor, Program, ProgramIntake, Scholarship, University
 from app.services import notifications, retrieval
 
 log = logging.getLogger("scholara.tasks")
 
-VERIFIED_MODELS = [University, Program, Scholarship, Professor, ProgramIntake]
+# Heterogeneous registry of tables that carry the verification mixin. The union (rather than a
+# bare list of distinct classes, which mypy collapses to ``type[Base]``) keeps the mixin fields
+# visible at every use site without resorting to Any.
+VerificationModel = type[University] | type[Program] | type[Scholarship] | type[Professor] | type[ProgramIntake]
+VerificationInstance = University | Program | Scholarship | Professor | ProgramIntake
+VERIFIED_MODELS: list[VerificationModel] = [University, Program, Scholarship, Professor, ProgramIntake]
 
 
 # ------------------------------------------------------------------- jobs
@@ -41,13 +46,17 @@ def verification_sweep() -> Dict[str, Any]:
         today = datetime.utcnow()
         flipped = 0
         for model in VERIFIED_MODELS:
-            rows = db.execute(
+            # `model` is a heterogeneous registry entry; the verification mixin fields live on
+            # each concrete class, not on the declarative Base, so read them explicitly.
+            review_due_at = model.review_due_at
+            confidence = model.confidence
+            rows = cast(list[VerificationInstance], db.execute(
                 select(model).where(
-                    model.review_due_at.is_not(None),
-                    model.review_due_at < today,
-                    model.confidence == "VERIFIED",
+                    review_due_at.is_not(None),
+                    review_due_at < today,
+                    confidence == "VERIFIED",
                 )
-            ).scalars().all()
+            ).scalars().all())
             for row in rows:
                 row.confidence = "NEEDS_REVIEW"
                 db.add(DataVerification(
@@ -87,6 +96,8 @@ def deadline_reminders(windows: tuple[int, ...] = (30, 14, 7, 3)) -> Dict[str, A
         ).scalars().all()
 
         for intake in intakes:
+            if intake.application_deadline is None:  # filtered in SQL; guard for the type checker
+                continue
             days = (intake.application_deadline - today).days
             if days not in windows:
                 continue
@@ -108,6 +119,8 @@ def deadline_reminders(windows: tuple[int, ...] = (30, 14, 7, 3)) -> Dict[str, A
             )
         ).scalars().all()
         for sch in scholarships:
+            if sch.deadline is None:  # filtered in SQL; guard for the type checker
+                continue
             days = (sch.deadline - today).days
             if days not in (60, 30, 14):
                 continue
@@ -130,8 +143,9 @@ def data_quality_digest() -> Dict[str, Any]:
     try:
         summary: Dict[str, Any] = {}
         for model in VERIFIED_MODELS:
+            confidence = model.confidence
             rows = db.execute(
-                select(model.confidence, func.count(model.id)).group_by(model.confidence)
+                select(confidence, func.count(model.id)).group_by(confidence)
             ).all()
             summary[model.__tablename__] = {(c or "UNVERIFIED"): n for c, n in rows}
 
@@ -266,7 +280,10 @@ if settings.celery_broker_url:  # pragma: no cover - needs a broker
     try:
         celery_app = build_celery_app(settings.celery_broker_url, settings.celery_result_backend)
     except Exception as exc:  # broker library missing
-        log.warning("Celery unavailable (%s); falling back to the in-process scheduler", exc)
+        # Log the type only: a broker exception can echo the rediss:// URL, which carries
+        # the Upstash password. The scheduler falls back regardless.
+        log.warning("Celery unavailable (%s); falling back to the in-process scheduler",
+                    type(exc).__name__)
         celery_app = None
 
 

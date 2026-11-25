@@ -36,7 +36,8 @@ import logging
 import re
 import time
 import urllib.robotparser
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
@@ -199,7 +200,7 @@ def resolve(db: Session, *, name: str, country: str,
     exact = [u for u in rows if _norm(u.name) == target or u.slug == name.strip().lower()]
     partial = [u for u in rows
                if target and (target in _norm(u.name) or _norm(u.name) in target)]
-    match = (exact or partial or [None])[0]
+    match = exact[0] if exact else (partial[0] if partial else None)
 
     if match is not None:
         site = (website or match.website or "").strip()

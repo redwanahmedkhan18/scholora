@@ -4,7 +4,6 @@ from __future__ import annotations
 import time
 
 import pytest
-
 from app.core import mfa, storage, webhooks
 
 
@@ -373,7 +372,6 @@ def test_autogenerate_cannot_propose_dropping_the_pgvector_index():
     every run. One careless `alembic upgrade head` would have destroyed the retrieval index.
     env.py now filters both out; this asserts the filter still covers them.
     """
-    import importlib.util
     from pathlib import Path
 
     src = Path(__file__).resolve().parents[1] / "alembic" / "env.py"
@@ -464,8 +462,8 @@ def test_an_override_changes_behaviour_without_a_restart(client, api, auth):
 
 
 def test_clearing_an_override_falls_back_to_the_environment(client, api, auth):
-    from app.core.config import get_settings, settings
     from app.core import runtime
+    from app.core.config import get_settings, settings
     env_value = get_settings().retrieval_min_score
     client.put(f"{api}/admin/config", json={"values": {"retrieval_min_score": "0.42"}}, headers=auth)
     runtime.invalidate()

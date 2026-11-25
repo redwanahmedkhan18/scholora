@@ -11,11 +11,11 @@ Two contracts are pinned here:
 """
 from __future__ import annotations
 
-import pytest
-from sqlalchemy.exc import OperationalError
+import logging
 
+from app.models.content import BlogPost  # used by the drafts test
 from app.models.education import Country, Program, University
-
+from sqlalchemy.exc import OperationalError
 
 API_PREFIX = "/api/v1"
 
@@ -89,7 +89,7 @@ def test_sitemap_handles_empty_tables_as_success(client, monkeypatch):
     """No rows is a legitimate state (a fresh install) and must be a 200 with empty lists."""
     from sqlalchemy.orm import Session
 
-    for model in (Country, University, Program):
+    for _model in (Country, University, Program):
         monkeypatch.setattr(
             Session, "execute",
             lambda self, statement, *a, **k: _EmptyResult(),
@@ -142,6 +142,31 @@ def test_sitemap_failure_is_not_cached_as_a_404(client, monkeypatch):
 
     monkeypatch.setattr(Session, "execute", boom, raising=False)
     assert client.get(f"{API_PREFIX}/sitemap-data").status_code != 404
+
+
+def test_sitemap_database_failure_is_logged_with_sanitized_detail(client, monkeypatch, caplog):
+    """The log must identify the driver failure without exposing the DSN or password."""
+    from sqlalchemy.orm import Session
+
+    def boom(self, statement, *a, **k):
+        raise OperationalError(
+            "SELECT 1", {},
+            Exception("connection is bad password=leaky-secret "
+                      "url=postgresql://user:leaky-secret@db.invalid:5432/postgres"),
+        )
+
+    monkeypatch.setattr(Session, "execute", boom, raising=False)
+    logger = logging.getLogger("app.api.v1.routers.public")
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        res = client.get(f"{API_PREFIX}/sitemap-data")
+
+    assert res.status_code == 503
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "sitemap_data database failure" in logs
+    assert "OperationalError" in logs
+    assert "connection" in logs
+    assert "leaky-secret" not in logs
+    assert "postgresql://" not in logs
 
 
 # ------------------------------------------------------------------------- CORS policy
@@ -214,9 +239,6 @@ def test_cors_exposes_retry_after_so_a_503_can_be_retried(client):
     res = client.get(f"{API_PREFIX}/settings", headers={"Origin": origin})
     exposed = (res.headers.get("access-control-expose-headers") or "").lower()
     assert "retry-after" in exposed
-
-
-from app.models.content import BlogPost  # noqa: E402  (used by the drafts test)
 
 
 # ------------------------------------------------------- Redis reporting accuracy

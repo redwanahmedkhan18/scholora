@@ -7,8 +7,6 @@ quality is not a theoretical concern - it is the quality of search on the live s
 from __future__ import annotations
 
 import numpy as np
-import pytest
-
 from app.core import local_semantic
 
 CORPUS = [
@@ -88,6 +86,77 @@ def test_it_links_words_that_co_occur_rather_than_matching_literally(tmp_path, m
 
     best = candidates[int((docs @ query).argmax())]
     assert best == target, f"'bursary' did not reach the scholarship document, got: {best}"
+
+
+def test_synonyms_land_near_each_other_and_away_from_unrelated_terms(tmp_path, monkeypatch):
+    """LSA should place a synonym pair closer than an unrelated term, not merely rank documents."""
+    bridge = [
+        "Scholarship and bursary awards for international applicants",
+        "The bursary scheme and the scholarship scheme are administered together",
+        "Applicants may hold a bursary, a scholarship or an external grant",
+    ]
+    target = "A full scholarship covering tuition and a monthly living allowance"
+    distractors = [
+        "MSc Water Resources Engineering covering hydrology and flood management",
+        "Bachelor of Medicine admission requirements and entrance examination",
+        "Semester contribution and transport pass for enrolled students",
+        "Machine learning and artificial intelligence research laboratory",
+    ]
+    corpus = (bridge * 8) + ([target] * 8) + (distractors * 8)
+
+    monkeypatch.setattr(local_semantic, "MODEL_PATH", tmp_path / "m.pkl")
+    local_semantic.invalidate()
+    local_semantic.fit(corpus, 256)
+
+    vectors = np.array(local_semantic.transform(["bursary", "scholarship", "hydrology"], 256))
+    synonyms = float(vectors[0] @ vectors[1])
+    unrelated = float(vectors[0] @ vectors[2])
+    assert synonyms > 0.5, f"synonyms are not neighbours: cosine={synonyms:.3f}"
+    assert unrelated < 0.2, f"unrelated term is too close: cosine={unrelated:.3f}"
+
+
+def test_out_of_vocabulary_queries_are_zero_vectors(tmp_path, monkeypatch):
+    """Unknown words carry no signal; returning a zero vector lets the caller rank nothing."""
+    monkeypatch.setattr(local_semantic, "MODEL_PATH", tmp_path / "m.pkl")
+    local_semantic.invalidate()
+    local_semantic.fit(CORPUS, 256)
+
+    query = np.array(local_semantic.transform(["photosynthesis"], 256)[0])
+    assert np.allclose(query, 0.0)
+
+
+def test_empty_batches_and_blank_texts_are_handled_without_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(local_semantic, "MODEL_PATH", tmp_path / "m.pkl")
+    local_semantic.invalidate()
+    local_semantic.fit(CORPUS, 256)
+
+    assert local_semantic.transform([], 256) == []
+
+    blank = np.array(local_semantic.transform([""], 256))
+    assert blank.shape == (1, 256)
+    assert np.allclose(blank, 0.0)
+
+
+def test_fitting_on_too_little_data_keeps_the_hashing_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(local_semantic, "MODEL_PATH", tmp_path / "m.pkl")
+    local_semantic.invalidate()
+
+    assert local_semantic.fit(["one", "two", "three"], 256) is None
+    assert local_semantic.is_fitted() is False
+
+
+def test_fitting_the_same_corpus_twice_is_deterministic(tmp_path, monkeypatch):
+    monkeypatch.setattr(local_semantic, "MODEL_PATH", tmp_path / "m.pkl")
+    local_semantic.invalidate()
+    first_fingerprint = local_semantic.fit(CORPUS, 256)
+    first = np.array(local_semantic.transform(["bursary", "scholarship"], 256))
+
+    local_semantic.invalidate()
+    second_fingerprint = local_semantic.fit(CORPUS, 256)
+    second = np.array(local_semantic.transform(["bursary", "scholarship"], 256))
+
+    assert first_fingerprint == second_fingerprint
+    assert np.allclose(first, second)
 
 
 def test_an_unfitted_model_returns_none_so_the_caller_falls_back(tmp_path, monkeypatch):

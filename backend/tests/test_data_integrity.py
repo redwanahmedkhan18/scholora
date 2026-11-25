@@ -8,7 +8,6 @@ from __future__ import annotations
 import re
 
 import pytest
-
 from app.models.base import CONFIDENCE_STATES, ELIGIBILITY_STATES, SOURCE_TIERS
 
 PROBABILITY_PATTERNS = [
@@ -191,11 +190,10 @@ def test_partnership_data_is_never_public(client, api):
 # --------------------------------------------------------------------------
 
 def test_every_json_column_compiles_to_jsonb_on_postgresql():
+    import app.models  # noqa: F401  (registers every table on Base.metadata)
+    from app.core.database import Base
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.schema import CreateTable
-
-    from app.core.database import Base
-    import app.models  # noqa: F401  (registers every table on Base.metadata)
 
     dialect = postgresql.dialect()
     offenders: list[str] = []
@@ -223,10 +221,9 @@ def test_every_json_column_compiles_to_jsonb_on_postgresql():
 
 def test_distinct_search_queries_are_dialect_safe():
     """The two endpoints that use DISTINCT must compile for PostgreSQL without error."""
+    from app.models.education import Program, University
     from sqlalchemy import select
     from sqlalchemy.dialects import postgresql
-
-    from app.models.education import Program, University
 
     for model in (Program, University):
         stmt = select(model).distinct()

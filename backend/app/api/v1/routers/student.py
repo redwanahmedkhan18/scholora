@@ -7,23 +7,39 @@ another student's rows, and documents are only ever served through short-lived s
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
 from app.api import serializers as S
 from app.core import storage
 from app.core.database import get_db
 from app.models.base import APPLICATION_STATUSES
-from app.models.crm import (Application, ApplicationStatusHistory, Brochure, Document,
-                            Notification, ShortlistItem, StudentProfile)
+from app.models.crm import (
+    Application,
+    ApplicationStatusHistory,
+    Brochure,
+    Document,
+    Notification,
+    ShortlistItem,
+    StudentProfile,
+)
 from app.models.education import Program, Scholarship, University
 from app.services import notifications
 
 router = APIRouter(tags=["student"])
+
+# Shortlist entries may point at three different tables. Keeping the registry typed as a union
+# of model classes is what lets the slug/id attributes resolve without a blanket Any.
+ShortlistModel = type[Program] | type[University] | type[Scholarship]
+_SHORTLIST_MODELS: dict[str, ShortlistModel] = {
+    "program": Program,
+    "university": University,
+    "scholarship": Scholarship,
+}
 
 # Canonical pipeline from app.models.base (§53). The last three are terminal/off-track.
 APPLICATION_STAGES = list(APPLICATION_STATUSES)
@@ -226,7 +242,7 @@ def create_application(token: str, body: ApplicationIn, db: Session = Depends(ge
     notifications.broadcast_to_role(
         db, "COUNSELOR", "APPLICATION_STATUS", reference=row.reference, status="PLANNING",
         program=program.name, previous="—", entity_type="application", entity_id=row.id,
-        action_url=f"/admin/applications",
+        action_url="/admin/applications",
     )
     return {"ok": True, "application": _application_out(db, row)}
 
@@ -263,7 +279,7 @@ async def upload_document(
             content=content, declared_mime=file.content_type,
         )
     except storage.StorageError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
 
     row = Document(
         student_profile_id=profile.id, doc_type=doc_type, storage_key=stored.key,
@@ -302,7 +318,7 @@ def download_document(signed_token: str, db: Session = Depends(get_db)):
     try:
         key = storage.verify_signature(signed_token)
     except storage.StorageError as exc:
-        raise HTTPException(403, str(exc))
+        raise HTTPException(403, str(exc)) from exc
 
     doc = db.execute(select(Document).where(Document.storage_key == key)).scalars().first()
     if not doc:
@@ -310,7 +326,7 @@ def download_document(signed_token: str, db: Session = Depends(get_db)):
     try:
         data = storage.read(key)
     except storage.StorageError as exc:
-        raise HTTPException(404, str(exc))
+        raise HTTPException(404, str(exc)) from exc
 
     return Response(
         content=data,
@@ -347,8 +363,9 @@ def list_shortlist(token: str, db: Session = Depends(get_db)):
 def add_shortlist(token: str, body: ShortlistIn, db: Session = Depends(get_db)):
     profile = _profile(db, token)
 
-    model = {"program": Program, "university": University, "scholarship": Scholarship}[body.entity_type]
-    entity = db.execute(select(model).where(model.slug == body.slug)).scalars().first()
+    model = _SHORTLIST_MODELS[body.entity_type]
+    entity = cast("Program | University | Scholarship | None",
+                   db.execute(select(model).where(model.slug == body.slug)).scalars().first())
     if not entity:
         raise HTTPException(404, "That record is not in our database.")
 
@@ -381,8 +398,9 @@ def sync_shortlist(token: str, items: List[ShortlistIn], db: Session = Depends(g
     profile = _profile(db, token)
     added = 0
     for item in items[:100]:
-        model = {"program": Program, "university": University, "scholarship": Scholarship}[item.entity_type]
-        entity = db.execute(select(model).where(model.slug == item.slug)).scalars().first()
+        model = _SHORTLIST_MODELS[item.entity_type]
+        entity = cast("Program | University | Scholarship | None",
+                       db.execute(select(model).where(model.slug == item.slug)).scalars().first())
         if not entity:
             continue
         exists = db.execute(

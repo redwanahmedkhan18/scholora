@@ -18,7 +18,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-
 from app.core import llm
 from app.core.config import settings
 from app.services import assistant_engine as engine

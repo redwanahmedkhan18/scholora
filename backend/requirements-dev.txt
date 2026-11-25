@@ -1,4 +1,6 @@
 -r requirements.txt
 
-# Test-only tooling. Kept out of the production image so the runtime stays lean.
+# Test and static-analysis tooling. Kept out of the production image so the runtime stays lean.
 pytest>=8.0
+ruff>=0.16
+mypy>=1.10

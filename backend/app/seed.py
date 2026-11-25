@@ -10,17 +10,38 @@ from datetime import date, datetime, timedelta, timezone
 from slugify import slugify
 from sqlalchemy import select
 
+from app import seed_data as D
+from app.core import mfa
 from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
-from app.core import mfa
 from app.core.security import hash_password
-from app.models.content import (AdCampaign, BlogPost, Event, Faq, HomepageSection, HomepageSlide,
-                                Service, SiteSetting, SuccessStory)
+from app.models.content import (
+    AdCampaign,
+    BlogPost,
+    Event,
+    Faq,
+    HomepageSection,
+    HomepageSlide,
+    Service,
+    SiteSetting,
+    SuccessStory,
+)
 from app.models.crm import Appointment, DataVerification, Lead, StudentProfile, User
-from app.models.education import (Faculty,Country, Department, Professor, Program, ProgramIntake,
-                                  ProgramRequirement, Publication, ResearchArea, Scholarship,
-                                  University, UniversityPartnership, UniversityRanking)
-from app import seed_data as D
+from app.models.education import (
+    Country,
+    Department,
+    Faculty,
+    Professor,
+    Program,
+    ProgramIntake,
+    ProgramRequirement,
+    Publication,
+    ResearchArea,
+    Scholarship,
+    University,
+    UniversityPartnership,
+    UniversityRanking,
+)
 
 NOW = datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc).replace(tzinfo=None)
 REVIEW_DUE = NOW + timedelta(days=90)
@@ -174,12 +195,12 @@ def run(reset: bool = True) -> dict:
 
     # ------------------------------------------------------------------ countries
     countries = {}
-    for i, (name, iso2, flag, region, status, featured, tuition, living, currency, tagline) in enumerate(D.COUNTRIES):
+    for i, (name, iso2, flag, region, status, featured, tuition_range, living_range, currency, tagline) in enumerate(D.COUNTRIES):
         c = Country(
             name=name, slug=slugify(name), iso2=iso2, flag_emoji=flag, region=region, status=status,
             is_featured=featured, priority=(i + 1) * 10, tagline=tagline, currency=currency,
-            tuition_min=tuition[0], tuition_max=tuition[1],
-            living_cost_min=living[0], living_cost_max=living[1],
+            tuition_min=tuition_range[0], tuition_max=tuition_range[1],
+            living_cost_min=living_range[0], living_cost_max=living_range[1],
             why_study=D.WHY.get(name, []), popular_subjects=D.SUBJECTS.get(name, []),
             intakes=D.INTAKE_MONTHS.get(name, []), accent_color="#1d4ed8",
             summary=(f"{name} hosts a wide range of institutions that accept Bangladeshi students. This page lists the "
@@ -194,8 +215,8 @@ def run(reset: bool = True) -> dict:
             post_study_work="Post-study work options are recorded per destination and confirmed before application.",
             student_life=f"Bangladeshi student communities are active in most major {name} university cities.",
             faqs=[{"q": f"What is the average annual cost of studying in {name}?",
-                   "a": (f"Tuition typically ranges from {currency} {tuition[0]:,} to {currency} {tuition[1]:,} per year, "
-                         f"with living costs of roughly {currency} {living[0]:,}-{living[1]:,}. Every programme page "
+                   "a": (f"Tuition typically ranges from {currency} {tuition_range[0]:,} to {currency} {tuition_range[1]:,} per year, "
+                         f"with living costs of roughly {currency} {living_range[0]:,}-{living_range[1]:,}. Every programme page "
                          f"shows a precise estimate for that programme.")},
                   {"q": f"Which intakes are available in {name}?",
                    "a": "Intakes are stored per programme, not per university. See each programme page for its own intake calendar."}],
@@ -281,7 +302,8 @@ def run(reset: bool = True) -> dict:
                 db.add(dept)
                 db.flush()
             currency = CURRENCY_BY_COUNTRY.get(cname, "USD")
-            living = int((countries[cname].living_cost_min + countries[cname].living_cost_max) / 2)
+            living_mid = int(((countries[cname].living_cost_min or 0)
+                              + (countries[cname].living_cost_max or 0)) / 2)
             p = Program(
                 university_id=u.id, department_id=dept.id, name=pname, slug=slugify(f"{u.name}-{pname}"),
                 degree_level=level, award=award, discipline=discipline, subject_tags=tags, specializations=specs,
@@ -295,7 +317,7 @@ def run(reset: bool = True) -> dict:
                 deposit=float(random.choice([0, 1000, 2000])),
                 insurance_annual=float(random.choice([400, 900, 1500])),
                 other_fees=[{"label": "Student services fee", "amount": 350}],
-                living_cost_annual=float(living), scholarship_available=True,
+                living_cost_annual=float(living_mid), scholarship_available=True,
                 career_outcomes=("Graduates move into industry roles or further research. Career services and alumni "
                                  "networks are listed on the official programme page."),
                 application_procedure=["Create an account on the university application portal",
@@ -355,10 +377,10 @@ def run(reset: bool = True) -> dict:
 
     # ------------------------------------------------------------------ scholarships
     for name, uni_name, cname, levels, amount_type, amount, pct, currency, min_cgpa, min_ielts, summary in D.SCHOLARSHIPS:
-        u = unis.get(uni_name) if uni_name else None
+        sch_uni = unis.get(uni_name) if uni_name else None
         db.add(Scholarship(
             name=name, slug=slugify(f"{name}-{cname}"), provider=(uni_name or f"Government of {cname}"),
-            university_id=(u.id if u else None), country_id=countries[cname].id, degree_levels=levels,
+            university_id=(sch_uni.id if sch_uni else None), country_id=countries[cname].id, degree_levels=levels,
             amount_type=amount_type, amount_value=amount, percentage=pct, currency=currency,
             covers_tuition=(amount_type in ("FULL", "PERCENTAGE")), covers_living=(amount_type == "FULL"),
             stipend=("Monthly stipend included" if amount_type == "FULL" else None),
@@ -369,8 +391,9 @@ def run(reset: bool = True) -> dict:
             deadline=date(2027, random.choice([1, 2, 3, 4, 5]), random.choice([10, 15, 28])),
             application_method="Apply through the official scholarship page after receiving an offer.",
             is_featured=(amount_type == "FULL" or (pct is not None and pct >= 25)),
-            source_url=((u.website + "/scholarships") if u else "https://stipendiumhungaricum.hu"),
-            source_type=("TIER_1_OFFICIAL_UNIVERSITY" if u else "TIER_4_OFFICIAL_SCHOLARSHIP_PROVIDER"),
+            source_url=((sch_uni.website or "") + "/scholarships" if sch_uni and sch_uni.website
+                        else "https://stipendiumhungaricum.hu"),
+            source_type=("TIER_1_OFFICIAL_UNIVERSITY" if sch_uni else "TIER_4_OFFICIAL_SCHOLARSHIP_PROVIDER"),
             retrieved_at=NOW, verified_at=NOW, verified_by=SAMPLE, review_due_at=REVIEW_DUE,
             confidence="NEEDS_REVIEW",
             seo_title=f"{name} - eligibility, amount and deadline",
@@ -386,7 +409,7 @@ def run(reset: bool = True) -> dict:
         u = unis[uni_name]
         dept = db.execute(select(Department).where(Department.university_id == u.id,
                                                    Department.name.ilike(f"%{dept_kw}%"))).scalars().first()
-        domain = u.website.replace("https://", "").replace("www.", "")
+        domain = (u.website or "").replace("https://", "").replace("www.", "")
         email = None
         if email_status in ("OFFICIAL_UNIVERSITY_EMAIL", "PUBLIC_PROFESSIONAL_EMAIL"):
             email = slugify(fname.replace("Dr. ", "")).replace("-", ".") + "@" + domain
@@ -435,11 +458,11 @@ def run(reset: bool = True) -> dict:
 
     # ------------------------------------------------------------------ success stories
     for i, (sname, cname, uni_name, prog, level, intake, year, schol, visa, quote) in enumerate(D.STORIES):
-        u = unis.get(uni_name)
+        story_uni = unis.get(uni_name)
         db.add(SuccessStory(
             student_name=sname, slug=slugify(f"{sname}-{uni_name}-{year}"),
             headline=f"How {sname.split()[0]} started {prog} in {cname}",
-            country_id=countries[cname].id, university_id=(u.id if u else None), university_name=uni_name,
+            country_id=countries[cname].id, university_id=(story_uni.id if story_uni else None), university_name=uni_name,
             program_name=prog, degree_level=level, intake=intake, year=year, admission_result="Offer received",
             scholarship=schol, visa_result=visa, testimonial=quote,
             journey=["Profile assessment", "University shortlist", "Application", "Offer", "Visa", "Departure"],
@@ -503,14 +526,14 @@ def run(reset: bool = True) -> dict:
 
     # ------------------------------------------------------------------ homepage slides and sections
     for key, title, subtitle, desc, cname, highlights, focus, priority in D.SLIDES:
-        c = countries.get(cname) if cname else None
+        slide_country = countries.get(cname) if cname else None
         db.add(HomepageSlide(
             key=key,
             eyebrow=("Destination focus" if focus == "COUNTRY" else
                      {"PHD": "Research pathway", "SCHOLARSHIP": "Funding", "STORY": "Proof"}.get(focus, "Scholara")),
             title=title, subtitle=subtitle, description=desc, highlights=highlights, media_type="GRADIENT",
             gradient=D.GRADIENTS.get(cname, "linear-gradient(135deg,#0b1736 0%,#13306e 50%,#f59e0b 100%)"),
-            theme_color="#f59e0b", country_id=(c.id if c else None), focus=focus,
+            theme_color="#f59e0b", country_id=(slide_country.id if slide_country else None), focus=focus,
             cta_label=(f"Explore {cname}" if cname else {"PHD": "Explore PhD & research",
                                                          "SCHOLARSHIP": "Browse scholarships",
                                                          "STORY": "Read success stories"}.get(focus, "Explore")),
@@ -552,9 +575,12 @@ def run(reset: bool = True) -> dict:
     uta = unis["University of Texas at Arlington"]
     sample_program = db.execute(select(Program).where(Program.university_id == uta.id,
                                                       Program.degree_level == "MASTER")).scalars().first()
+    if sample_program is None:  # the demo dataset always seeds one; fail loudly, never deref None
+        raise RuntimeError("seed: expected a seeded MASTER programme for University of Texas at Arlington")
+    uta_site = uta.website or ""
     db.add_all([
         DataVerification(entity_type="program_requirement", entity_id=sample_program.id, field_name="ielts_overall",
-                         field_value="6.5", source_url=f"{uta.website}/admissions",
+                         field_value="6.5", source_url=f"{uta_site}/admissions",
                          source_type="TIER_1_OFFICIAL_UNIVERSITY", retrieved_at=NOW, verified_at=NOW,
                          verified_by="Rumana Sultana", review_due_at=REVIEW_DUE, status="VERIFIED"),
         DataVerification(entity_type="program_requirement", entity_id=sample_program.id, field_name="ielts_overall",
@@ -563,7 +589,7 @@ def run(reset: bool = True) -> dict:
                          conflict_with=("Official university source states 6.5; a third-party aggregator states 6.0. "
                                         "The official source takes precedence until re-verified.")),
         DataVerification(entity_type="university", entity_id=uta.id, field_name="tuition_annual", field_value="28000",
-                         source_url=f"{uta.website}/tuition", source_type="TIER_1_OFFICIAL_UNIVERSITY",
+                         source_url=f"{uta_site}/tuition", source_type="TIER_1_OFFICIAL_UNIVERSITY",
                          retrieved_at=NOW - timedelta(days=400), verified_at=NOW - timedelta(days=400),
                          verified_by="Rumana Sultana", review_due_at=NOW - timedelta(days=35), status="OUTDATED"),
     ])

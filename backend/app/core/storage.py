@@ -19,7 +19,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import Optional
 
 from app.core.config import settings
 
@@ -71,8 +71,8 @@ def verify_signature(token: str) -> str:
         body, mac = token.split(".", 1)
         payload = _unb64u(body)
         expected = hmac.new(settings.secret_key.encode(), payload, hashlib.sha256).digest()[:24]
-    except Exception:
-        raise StorageError("Malformed download token")
+    except Exception as exc:
+        raise StorageError("Malformed download token") from exc
 
     if not hmac.compare_digest(_unb64u(mac), expected):
         raise StorageError("Invalid download token")

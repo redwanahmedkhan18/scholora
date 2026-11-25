@@ -6,15 +6,14 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api import serializers as S
 from app.core.database import get_db
 from app.models.content import AdCampaign, Event, EventRegistration, SiteSetting
-from app.models.crm import (AnalyticsEvent, Appointment, Brochure, Lead, Notification,
-                            SearchQueryLog, StudentProfile)
+from app.models.crm import AnalyticsEvent, Appointment, Brochure, Lead, Notification, SearchQueryLog, StudentProfile
 from app.models.education import Country, Program, University
 from app.services import brochure as brochure_service
 from app.services import costing, matching, whatsapp
@@ -259,8 +258,8 @@ def match_faculty(body: FacultyMatchIn, db: Session = Depends(get_db)):
         country_id = row.id if row else None
     uni_id = None
     if body.university_slug:
-        row = db.execute(select(University).where(University.slug == body.university_slug)).scalars().first()
-        uni_id = row.id if row else None
+        uni_row = db.execute(select(University).where(University.slug == body.university_slug)).scalars().first()
+        uni_id = uni_row.id if uni_row else None
     rows = matching.match_faculty(db, body.interests, country_id=country_id, university_id=uni_id,
                                   field=body.field, limit=body.limit)
     db.add(SearchQueryLog(query=", ".join(body.interests), country=body.country_slug, degree_level="PHD",
@@ -324,7 +323,10 @@ def create_lead(body: LeadIn, request: Request, db: Session = Depends(get_db)):
 def _booking_options(db: Session) -> Dict[str, Any]:
     """The appointment options currently on offer, straight from admin settings."""
     row = db.get(SiteSetting, 1)
-    pick = lambda vals: [str(v.get("value")) if isinstance(v, dict) else str(v) for v in (vals or [])]
+
+    def pick(vals):
+        return [str(v.get("value")) if isinstance(v, dict) else str(v) for v in (vals or [])]
+
     return {
         "service_types": pick(getattr(row, "appointment_service_types", None)),
         "modes": pick(getattr(row, "appointment_modes", None)),

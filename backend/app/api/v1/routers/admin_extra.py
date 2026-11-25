@@ -8,7 +8,7 @@ audit-log viewer (§91), scheduled-job control and assistant reindexing (§64).
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -17,18 +17,26 @@ from sqlalchemy.orm import Session
 
 from app.api import serializers as S
 from app.core import llm, mfa, storage
-from app.services import extraction
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import enrolling_user, current_user, require_role, require_staff
+from app.core.deps import current_user, enrolling_user, require_role, require_staff
 from app.core.security import create_access_token, verify_password
 from app.models.base import APPLICATION_STATUSES
-from app.models.crm import (Application, ApplicationStatusHistory, Appointment,
-                            AssistantConversation, AuditLog, Document, Lead, Notification,
-                            StudentProfile, User)
+from app.models.crm import (
+    Application,
+    ApplicationStatusHistory,
+    Appointment,
+    AssistantConversation,
+    AuditLog,
+    Document,
+    Lead,
+    Notification,
+    StudentProfile,
+    User,
+)
 from app.models.education import Program, University
+from app.services import extraction, retrieval, tasks
 from app.services import notifications as notify
-from app.services import retrieval, tasks
 
 router = APIRouter(tags=["admin"])
 
@@ -224,12 +232,13 @@ def counselor_dashboard(db: Session = Depends(get_db), user: User = Depends(requ
             "needs_follow_up": len(stale),
             "unread_notifications": len(inbox),
         },
-        "leads": [{"id": l.id, "reference": l.reference, "full_name": l.full_name, "phone": l.phone,
-                   "stage": l.stage, "source": l.source, "priority": l.priority,
-                   "interest": " / ".join(x for x in [l.interest_subject, l.interest_degree,
-                                                      l.interest_country] if x) or None,
-                   "intake": l.intake, "next_action_at": S._dt(l.next_action_at),
-                   "updated_at": S._dt(l.updated_at)} for l in my_leads],
+        "leads": [{"id": lead_row.id, "reference": lead_row.reference, "full_name": lead_row.full_name,
+                   "phone": lead_row.phone,
+                   "stage": lead_row.stage, "source": lead_row.source, "priority": lead_row.priority,
+                   "interest": " / ".join(x for x in [lead_row.interest_subject, lead_row.interest_degree,
+                                                      lead_row.interest_country] if x) or None,
+                   "intake": lead_row.intake, "next_action_at": S._dt(lead_row.next_action_at),
+                   "updated_at": S._dt(lead_row.updated_at)} for lead_row in my_leads],
         "applications": [_app_brief(a) for a in my_apps],
         "pipeline": {
             status: sum(1 for a in my_apps if a.status == status)
@@ -242,8 +251,9 @@ def counselor_dashboard(db: Session = Depends(get_db), user: User = Depends(requ
         "documents_pending": [{"id": d.id, "doc_type": d.doc_type, "filename": d.original_filename,
                                "student_profile_id": d.student_profile_id,
                                "uploaded_at": S._dt(d.created_at)} for d in pending_docs],
-        "follow_ups": [{"id": l.id, "full_name": l.full_name, "phone": l.phone, "stage": l.stage,
-                        "days_idle": (now - l.updated_at).days} for l in stale],
+        "follow_ups": [{"id": lead_row.id, "full_name": lead_row.full_name, "phone": lead_row.phone,
+                        "stage": lead_row.stage,
+                        "days_idle": (now - lead_row.updated_at).days} for lead_row in stale],
         "notifications": [{"id": n.id, "title": n.title, "body": n.body, "severity": n.severity,
                            "action_url": n.action_url, "at": S._dt(n.created_at)} for n in inbox],
     }
@@ -285,9 +295,9 @@ def applications_board(
             "updated_at": S._dt(a.updated_at),
         })
     counts = {s: 0 for s in APPLICATION_STATUSES}
-    for a in db.execute(select(Application.status, func.count(Application.id))
-                        .group_by(Application.status)).all():
-        counts[a[0]] = a[1]
+    for status_row in db.execute(select(Application.status, func.count(Application.id))
+                                 .group_by(Application.status)).all():
+        counts[status_row[0]] = status_row[1]
     return {"stages": APPLICATION_STATUSES, "counts": counts, "total": len(items), "items": items}
 
 
@@ -395,7 +405,7 @@ def review_document(document_id: int, body: DocReviewIn, db: Session = Depends(g
 
     profile = db.get(StudentProfile, doc.student_profile_id)
     notify.create(
-        db, "DOCUMENT_REVIEWED", recipient=(profile.email if profile else "student"),
+        db, "DOCUMENT_REVIEWED", recipient=(profile.email if profile and profile.email else "student"),
         student_profile_id=doc.student_profile_id, doc_type=doc.doc_type, status=body.status,
         note=body.review_note or f"Your {doc.doc_type.replace('_', ' ').lower()} is now {body.status.lower()}.",
         entity_type="document", entity_id=doc.id, severity="WARNING" if body.status == "REJECTED" else "INFO",
@@ -511,8 +521,8 @@ def run_job(name: str, db: Session = Depends(get_db),
             user: User = Depends(require_role("DATA_MANAGER"))):
     try:
         result = tasks.run_job(name)
-    except KeyError:
-        raise HTTPException(404, f"Unknown job '{name}'")
+    except KeyError as exc:
+        raise HTTPException(404, f"Unknown job '{name}'") from exc
     _audit(db, user, "JOB_RUN", "jobs", None, {"job": name, "result": str(result)[:400]})
     db.commit()
     return {"ok": True, "result": result}

@@ -5,16 +5,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 
+# Register every model on the shared metadata before the app is created. Imported under a
+# private alias so `app` here is unambiguously the FastAPI instance below, not the package
+# (the module/instance name collision broke both mypy's view and reader intuition).
+import app.models as _models  # noqa: F401
+from app.api.v1.routers import actions, admin, admin_extra, admin_platform, integrations, public, student
 from app.core import connectivity
 from app.core.config import settings
-from app.core.connectivity import redis_summary, summarize_database_url
+from app.core.connectivity import log_database_error, redis_summary, summarize_database_url
 from app.core.database import engine
 from app.core.ratelimit import RateLimitMiddleware
-from app.api.v1.routers import (actions, admin, admin_extra, admin_platform,
-                                 integrations, public, student)
-
-import app.models  # noqa: F401  (register metadata)
 
 # Uvicorn configures only its own loggers. Everything under `app.*` propagates to a root
 # logger with no handler, so `log.info(...)` fell through to logging.lastResort and was
@@ -42,14 +45,21 @@ the counselor CRM and the WhatsApp assistant from a single education database.
 async def lifespan(app: FastAPI):
     db = summarize_database_url(settings.database_url)
     log.info(
-        "database configured driver=%s host=%s port=%s sslmode=%s pooler=%s",
+        "database configured driver=%s host=%s port=%s sslmode=%s pooler=%s "
+        "connect_timeout=%ss pool_size=%s max_overflow=%s",
         db.get("driver"), db.get("host"), db.get("port"), db.get("sslmode"),
-        db.get("is_supabase_pooler"),
+        db.get("is_supabase_pooler"), settings.db_connect_timeout,
+        settings.db_pool_size, settings.db_max_overflow,
     )
     if db.get("is_supabase_direct"):
         log.warning(
             "DATABASE_URL uses the Supabase direct host; on Render use the IPv4 Session "
             "Pooler URL from Supabase Dashboard -> Connect -> Session Pooler."
+        )
+    if db.get("is_supabase_pooler") and db.get("pooler_username_ok") is False:
+        log.error(
+            "DATABASE_URL uses the Supabase Session Pooler but the username is missing "
+            "the project suffix. Use postgres.<project-ref>, not bare postgres."
         )
     redis = redis_summary(settings.redis_url) if settings.redis_url else None
     if redis:
@@ -134,6 +144,26 @@ app.include_router(integrations.router, prefix=f"{settings.api_v1_prefix}")
 app.include_router(admin_extra.router, prefix=f"{settings.api_v1_prefix}/admin")
 app.include_router(admin_platform.router, prefix=f"{settings.api_v1_prefix}/admin")
 app.include_router(admin.router, prefix=f"{settings.api_v1_prefix}/admin")
+
+
+@app.exception_handler(OperationalError)
+@app.exception_handler(InterfaceError)
+@app.exception_handler(SATimeoutError)
+async def database_unavailable(request: Request,
+                               exc: OperationalError | InterfaceError | SATimeoutError):
+    """A connection-class database outage is retryable (503).
+
+    Only connection failures (a refused/unreachable database, a dropped connection, or a
+    pool-checkout timeout) are translated here. Data errors such as ``IntegrityError`` or
+    ``ProgrammingError`` are bugs or bad input, not a temporary outage, and must reach the
+    generic 500 handler rather than telling a client to retry.
+    """
+    log_database_error(log, f"database failure on {request.url.path}", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable", "path": str(request.url.path)},
+        headers={"Retry-After": "30"},
+    )
 
 
 @app.exception_handler(Exception)

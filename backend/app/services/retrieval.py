@@ -14,24 +14,23 @@ configured, which is how this build runs out of the box.
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections import Counter
 from datetime import datetime
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, cast
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-import logging
-
 from app.core import embeddings as E
 from app.core import local_semantic
-
-log = logging.getLogger(__name__)
 from app.core.config import settings
 from app.models.crm import KnowledgeChunk
 from app.models.education import Country, Professor, Program, Scholarship, University
+
+log = logging.getLogger(__name__)
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
@@ -69,7 +68,7 @@ def _bm25(query_terms: list[str], chunk: KnowledgeChunk, idf: dict[str, float], 
 def _cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(y * y for y in b)) or 1.0
     return dot / (na * nb)
@@ -334,7 +333,9 @@ def _chunk_for(entity_type: str, obj: Any) -> Optional[dict[str, Any]]:
     return None
 
 
-SOURCES = [
+# Typed registry. The instance union keeps ``obj.id`` resolvable without an Any escape hatch.
+SourceInstance = Program | University | Scholarship | Country | Professor
+SOURCES: list[tuple[str, type[SourceInstance]]] = [
     ("program", Program),
     ("university", University),
     ("scholarship", Scholarship),
@@ -346,10 +347,10 @@ SOURCES = [
 def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
     """Drop and rebuild the retrieval corpus. Safe to run repeatedly."""
     db.query(KnowledgeChunk).delete()
-    counts: dict[str, int] = {}
+    counts: dict[str, Any] = {}
 
     for entity_type, model in SOURCES:
-        rows = list(db.scalars(select(model)))
+        rows = cast(list[SourceInstance], list(db.scalars(select(model))))
         made = 0
         for obj in rows:
             if entity_type == "program" and not getattr(obj, "is_published", True):
@@ -403,10 +404,10 @@ def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
             vectors = E.embed_texts([f"{c.title}\n{c.content}" for c in batch])
             model_name = E.active_model_name()
             vector_width = E.dim()
-            for chunk_row, vector in zip(batch, vectors):
-                if not vector:
+            for chunk_row, embedding in zip(batch, vectors, strict=False):
+                if not embedding:
                     continue
-                chunk_row.embedding = vector
+                chunk_row.embedding = embedding
                 # Stamp what produced it, so a later provider change is visible as drift
                 # rather than silently mixing incomparable vectors in one index.
                 chunk_row.embedding_model = model_name

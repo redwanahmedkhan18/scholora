@@ -46,6 +46,15 @@ MIN_DOCUMENTS = 25
 # Share of variance to retain. Chosen empirically on this corpus - see _build().
 VARIANCE_TARGET = 0.90
 
+# A variance target alone can retain the full effective rank when a corpus contains many
+# repeated documents. At full rank SVD reproduces TF-IDF exactly: terms that never share a
+# document (for example "bursary" and "scholarship") remain orthogonal, so no semantic
+# bridge is learned. Keeping at most half the effective rank forces the factorisation to
+# generalise from co-occurrence instead of copying the term matrix. Half is the standard
+# LSA low-rank heuristic; a higher share still passes some probes but leaves the bridge to
+# floating-point noise (measured: at 6/8 components the target won by 0.06, at 4/8 by 0.19).
+MAX_RANK_SHARE = 0.5
+
 
 class _Model:
     def __init__(self, vectorizer, svd, components: int, documents: int) -> None:
@@ -93,9 +102,20 @@ def _build(texts: Sequence[str], width: int) -> Optional[_Model]:
     svd = TruncatedSVD(n_components=ceiling, random_state=0, algorithm="randomized")
     svd.fit(matrix)
 
-    cumulative = np.cumsum(svd.explained_variance_ratio_)
+    ratios = np.asarray(svd.explained_variance_ratio_)
+    effective_rank = max(
+        1,
+        int(np.count_nonzero(ratios > max(1e-12, float(ratios.max()) * 1e-6))),
+    )
+    cumulative = np.cumsum(ratios)
     keep = int(np.searchsorted(cumulative, VARIANCE_TARGET) + 1)
     keep = max(2, min(keep, ceiling))
+    if effective_rank >= 3:
+        rank_cap = max(
+            2,
+            min(effective_rank - 1, int(np.ceil(effective_rank * MAX_RANK_SHARE))),
+        )
+        keep = min(keep, rank_cap)
     # TruncatedSVD.transform is X @ components_.T, so trimming the rows trims the output
     # dimensionality without refitting.
     svd.components_ = svd.components_[:keep]
@@ -166,11 +186,15 @@ def invalidate() -> None:
 
 def transform(texts: Sequence[str], width: int) -> Optional[List[List[float]]]:
     """Embed with the fitted model, L2-normalised and zero-padded to `width`."""
+    texts = list(texts)
+    if not texts:
+        # TfidfTransformer rejects an empty batch; an empty result is the honest answer.
+        return []
     model = _load()
     if model is None:
         return None
     try:
-        reduced = model.svd.transform(model.vectorizer.transform(list(texts)))
+        reduced = model.svd.transform(model.vectorizer.transform(texts))
     except Exception as exc:                                        # noqa: BLE001
         log.warning("local semantic: transform failed (%s), using hashing", exc)
         return None

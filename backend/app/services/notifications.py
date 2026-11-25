@@ -6,14 +6,19 @@ the row stays QUEUED and is visible in the admin so nothing disappears silently.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.crm import Notification, User
+
+log = logging.getLogger(__name__)
 
 TEMPLATES: dict[str, dict[str, str]] = {
     "LEAD_CREATED": {
@@ -92,7 +97,7 @@ def create(
     if commit:
         db.commit()
         db.refresh(note)
-    _deliver(db, note)
+    _deliver(db, note, commit=commit)
     return note
 
 
@@ -105,24 +110,54 @@ def broadcast_to_role(db: Session, role: str, trigger: str, **kwargs: Any) -> in
     return len(users)
 
 
-def _deliver(db: Session, note: Notification) -> None:
+def _run_async(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
+    """Run an async delivery call from synchronous code in any calling context.
+
+    FastAPI serves ``async def`` endpoints on the event-loop thread and sync endpoints (and
+    Celery tasks) on a worker thread. ``asyncio.run`` is correct on the latter but raises
+    ``RuntimeError`` on the former, which would turn real sends into silent FAILED rows. When
+    a loop is already running, the coroutine is executed on a private loop in a helper thread
+    and its result returned, so delivery happens in both contexts.
+
+    ``coro_factory`` is called inside the target context so a coroutine is never constructed
+    in one thread and awaited in another.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="scholara-whatsapp") as pool:
+        return pool.submit(lambda: asyncio.run(coro_factory())).result()
+
+
+def _deliver(db: Session, note: Notification, commit: bool = True) -> None:
     """Attempt outbound delivery. Website notifications are delivered by being readable."""
     if note.channel == "WEBSITE":
         note.status = "SENT"
         note.sent_at = datetime.utcnow()
-        db.commit()
+        if commit:
+            db.commit()
         return
 
     if note.channel == "WHATSAPP" and settings.whatsapp_access_token:
         try:
             from app.services import whatsapp
 
-            whatsapp.send_text(note.recipient, f"{note.title}\n\n{note.body}")
-            note.status = "SENT"
-            note.sent_at = datetime.utcnow()
-        except Exception:
+            # `send_message` reports HTTP rejections as a status code instead of raising, so
+            # the result must be inspected: marking every attempt SENT hid real failures.
+            result = _run_async(lambda: whatsapp.send_message(note.recipient, f"{note.title}\n\n{note.body}"))
+            status = result.get("status") if isinstance(result, dict) else None
+            if isinstance(status, int) and 200 <= status < 300:
+                note.status = "SENT"
+                note.sent_at = datetime.utcnow()
+            else:
+                log.warning("notifications: WhatsApp delivery rejected with status %r", status)
+                note.status = "FAILED"
+        except Exception as exc:  # noqa: BLE001 - the row records the failure, not the process
+            log.warning("notifications: WhatsApp delivery failed (%s)", type(exc).__name__)
             note.status = "FAILED"
-        db.commit()
+        if commit:
+            db.commit()
         return
 
     # No transport configured: leave QUEUED so it is visible and retryable in the admin.

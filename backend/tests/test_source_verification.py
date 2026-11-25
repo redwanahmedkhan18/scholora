@@ -8,7 +8,6 @@ system that lets a machine sign off defeats the entire provenance model.
 from __future__ import annotations
 
 import pytest
-
 from app.services import source_verification as sv
 
 

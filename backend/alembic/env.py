@@ -1,9 +1,8 @@
 """Alembic environment wired to the application's own settings and metadata."""
 from logging.config import fileConfig
 
+import app.models  # noqa: F401  (import for side effects: registers every table)
 from alembic import context
-from sqlalchemy import create_engine, pool, text
-
 from app.core.config import settings
 from app.core.connectivity import (
     assert_safe_database_url,
@@ -11,7 +10,7 @@ from app.core.connectivity import (
     normalize_database_url,
 )
 from app.core.database import Base
-import app.models  # noqa: F401  (import for side effects: registers every table)
+from sqlalchemy import create_engine, pool, text
 
 config = context.config
 database_url = normalize_database_url(settings.database_url)

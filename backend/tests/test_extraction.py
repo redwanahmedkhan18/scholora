@@ -9,7 +9,6 @@ rather than inferred from a happy path.
 from __future__ import annotations
 
 import pytest
-
 from app.services import extraction as X
 
 FAKE_FEES_HTML = """

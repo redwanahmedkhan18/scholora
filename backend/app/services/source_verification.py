@@ -158,6 +158,10 @@ def source_queue(db: Session, state: Optional[str] = None,
 
     out: List[Dict[str, Any]] = []
     for url, claims, pending, oldest in rows:
+        if not url:
+            # The query filters source_url IS NOT NULL, but the column is nullable and
+            # a None here would collapse every null row onto one "check" key.
+            continue
         check = checks.get(url)
         if state and (check.state if check else UNCHECKED) != state:
             continue

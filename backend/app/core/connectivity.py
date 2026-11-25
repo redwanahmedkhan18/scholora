@@ -9,10 +9,13 @@ The production target is Supabase behind its IPv4 Session Pooler and Upstash ove
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
+import socket
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy.engine import make_url
@@ -57,6 +60,185 @@ def is_supabase_direct_host(host: str) -> bool:
 
 def is_supabase_pooler_host(host: str) -> bool:
     return (host or "").lower().endswith(".pooler.supabase.com")
+
+
+# ------------------------------------------------------------------- redaction
+# Driver messages are useful, but psycopg can echo the DSN, a password-bearing URL or the
+# keyword conninfo that produced the failure. These patterns remove those values before a
+# message is logged. Only the connection shape (host, port, database, driver, SSL mode) is
+# reported by the diagnostics below.
+_URL_RE = re.compile(
+    r"(?i)\b(?:postgresql(?:\+[a-z0-9_]+)?|postgres|redis|rediss)://[^\s\"']+"
+)
+_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@:]+:[^\s/@]+@")
+_KEY_VALUE_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|"
+    r"authorization)\b\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;)]+)"
+)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_QUERY_VALUE_RE = re.compile(r"(?i)\b(password|passwd|pwd)=([^&\s]+)")
+
+
+def sanitize_error_text(value: Any, limit: int = 1200) -> str:
+    """Return a driver message with credentials and complete URLs removed.
+
+    The function is deliberately conservative: an unrecognised token is better truncated
+    than published. Connection URLs are replaced entirely, userinfo is stripped from any
+    other URL, and key/value password forms are redacted.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    text = str(value)
+    text = _URL_RE.sub("<database-url redacted>", text)
+    text = _USERINFO_RE.sub(r"\1<redacted>@", text)
+    text = _QUERY_VALUE_RE.sub(r"\1=<redacted>", text)
+    text = _KEY_VALUE_RE.sub(r"\1=<redacted>", text)
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
+    if len(text) > limit:
+        return f"{text[:limit]}…"
+    return text
+
+
+def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Walk ``__cause__``, ``__context__`` and SQLAlchemy's ``orig`` without looping."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        nxt = current.__cause__ or current.__context__
+        if nxt is None:
+            candidate = getattr(current, "orig", None)
+            if isinstance(candidate, BaseException):
+                nxt = candidate
+        current = nxt if isinstance(nxt, BaseException) else None
+
+
+def _describe_exception(exc: BaseException) -> Dict[str, Any]:
+    detail: Dict[str, Any] = {
+        "type": type(exc).__name__,
+        "module": type(exc).__module__,
+    }
+    message = sanitize_error_text(exc)
+    if message:
+        detail["message"] = message
+
+    # SQLAlchemy OperationalError carries a DB-API ``code`` and, for PostgreSQL, a
+    # ``statement``/``params`` pair. Parameters are never safe to log.
+    code = getattr(exc, "code", None)
+    if code is not None:
+        detail["sqlalchemy_code"] = sanitize_error_text(code, 200)
+    statement = getattr(exc, "statement", None)
+    if statement:
+        detail["statement"] = sanitize_error_text(statement, 600)
+    params = getattr(exc, "params", None)
+    if params not in (None, (), [], {}):
+        detail["parameters"] = "<redacted>"
+
+    # psycopg 3 exposes SQLSTATE directly and richer fields on ``diag``.
+    sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    try:
+        diag = getattr(exc, "diag", None)
+    except Exception:  # noqa: BLE001 - some wrapped errors expose no diagnostics
+        diag = None
+    if not sqlstate and diag is not None:
+        sqlstate = getattr(diag, "sqlstate", None)
+    if sqlstate:
+        detail["sqlstate"] = str(sqlstate)
+    if diag is not None:
+        for attr, key in (("severity", "severity"),
+                          ("message_primary", "db_message"),
+                          ("message_detail", "db_detail"),
+                          ("message_hint", "db_hint")):
+            raw = getattr(diag, attr, None)
+            if raw:
+                detail[key] = sanitize_error_text(raw, 600)
+    return detail
+
+
+def describe_database_error(exc: BaseException, raw: Optional[str] = None) -> Dict[str, Any]:
+    """A complete, credential-free description of a database failure.
+
+    It includes the exception chain (SQLAlchemy wrapper, psycopg cause), SQLSTATE when the
+    driver provides it, and the connection shape taken from the URL that was actually used.
+    It never includes a password, a full URL or bound query parameters.
+    """
+    summary = summarize_database_url(raw or settings.database_url)
+    causes = [_describe_exception(item) for item in _iter_exception_chain(exc)]
+    sqlstate = next((c["sqlstate"] for c in causes if c.get("sqlstate")), None)
+    return {
+        "error_type": type(exc).__name__,
+        "error": sanitize_error_text(exc),
+        "sqlstate": sqlstate,
+        "connection": {
+            "driver": summary.get("driver", ""),
+            "host": summary.get("host", ""),
+            "port": summary.get("port"),
+            "database": summary.get("database", ""),
+            "sslmode": summary.get("sslmode", ""),
+            "is_supabase_direct": summary.get("is_supabase_direct", False),
+            "is_supabase_pooler": summary.get("is_supabase_pooler", False),
+            "pooler_username_ok": summary.get("pooler_username_ok"),
+            "connect_timeout": int(settings.db_connect_timeout),
+        },
+        "causes": causes,
+    }
+
+
+def log_database_error(logger: logging.Logger, message: str,
+                       exc: BaseException, raw: Optional[str] = None) -> Dict[str, Any]:
+    """Log structured diagnostics at ERROR level and return the sanitized payload."""
+    detail = describe_database_error(exc, raw)
+    logger.error("%s %s", message, json.dumps(detail, default=str, sort_keys=True))
+    return detail
+
+
+def _endpoint(raw: Optional[str] = None) -> tuple[str, int]:
+    url = make_url(normalize_database_url(raw or settings.database_url))
+    return (url.host or "", int(url.port or 5432))
+
+
+def _families(infos) -> list[str]:
+    names: list[str] = []
+    for info in infos:
+        name = ("IPv6" if info[0] == socket.AF_INET6
+                else "IPv4" if info[0] == socket.AF_INET else str(info[0]))
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def probe_database_endpoint(raw: Optional[str] = None,
+                            timeout: Optional[float] = None) -> Dict[str, Any]:
+    """DNS and TCP probe of the configured database endpoint (no authentication).
+
+    Authentication is intentionally separate: a TCP success does not prove the pooler
+    username or password is right, and an auth failure does not mean the network is down.
+    """
+    summary = summarize_database_url(raw or settings.database_url)
+    if not summary.get("driver", "").startswith("postgresql"):
+        return {"probed": False, "reason": "not-postgresql"}
+
+    timeout_s = float(timeout or settings.db_connect_timeout)
+    report: Dict[str, Any] = {"probed": True, "timeout_s": timeout_s}
+    try:
+        host, port = _endpoint(raw)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        report["dns"] = {"ok": True, "families": _families(infos), "addresses": len(infos)}
+    except Exception as exc:  # noqa: BLE001 - report the category, not the resolver text
+        report["dns"] = {"ok": False, "error": type(exc).__name__}
+        return report
+
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            report["tcp"] = {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        report["tcp"] = {"ok": False, "error": type(exc).__name__}
+    report["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+    return report
 
 
 # --------------------------------------------------------------------------- PostgreSQL
@@ -267,12 +449,20 @@ def _probe_key(label: str, url: str) -> str:
     return f"{label}:{hashlib.sha256(url.encode('utf-8')).hexdigest()}"
 
 
-def check_database(engine_obj=None) -> Dict[str, Any]:
-    """Run a harmless ``SELECT 1`` and return a redacted status report."""
+def check_database(engine_obj=None, log_failure: bool = True,
+                   include_diagnostics: bool = False) -> Dict[str, Any]:
+    """Run a harmless ``SELECT 1`` and return a redacted status report.
+
+    On failure the same sanitized exception chain that production logs receive is written
+    to the log. ``include_diagnostics`` adds it to the return value for the CLI diagnostic
+    only; the public readiness payload deliberately omits driver addresses and messages.
+    A password or complete URL never reaches either.
+    """
     from sqlalchemy import text
 
     summary = summarize_database_url(settings.database_url)
     started = time.monotonic()
+    diagnostics: Optional[Dict[str, Any]] = None
     try:
         if engine_obj is None:
             from app.core.database import engine as engine_obj
@@ -280,10 +470,14 @@ def check_database(engine_obj=None) -> Dict[str, Any]:
             connection.execute(text("SELECT 1"))
         ok = True
         error = None
-    except Exception as exc:  # noqa: BLE001 - category only, never the driver message
+    except Exception as exc:  # noqa: BLE001 - the sanitized detail is reported instead
         ok = False
         error = type(exc).__name__
-    return {
+        diagnostics = describe_database_error(exc)
+        if log_failure:
+            log.error("database check failed: %s",
+                      json.dumps(diagnostics, default=str, sort_keys=True))
+    result: Dict[str, Any] = {
         "ok": ok,
         "configured": summary.get("configured", False),
         "driver": summary.get("driver", ""),
@@ -297,6 +491,9 @@ def check_database(engine_obj=None) -> Dict[str, Any]:
         "error": error,
         "latency_ms": round((time.monotonic() - started) * 1000, 1),
     }
+    if include_diagnostics and diagnostics is not None:
+        result["diagnostics"] = diagnostics
+    return result
 
 
 def check_redis_url(raw: str, label: str, required: bool = False,

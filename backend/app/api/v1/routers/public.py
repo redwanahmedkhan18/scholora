@@ -11,18 +11,44 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api import serializers as S
+from app.core.connectivity import log_database_error
 from app.core.database import get_db
-from app.services import fx
-from app.models.base import (APPLICATION_STATUSES, CONFIDENCE_STATES, COUNTRY_STATUSES,
-                             CGPA_SCALES, DEGREE_LEVELS, EDUCATION_LEVELS, ELIGIBILITY_STATES,
-                             ENGLISH_TESTS, FUNDING_SOURCES, LEAD_STAGES,
-                             PARTNER_STATUSES, SOURCE_TIERS)
-from app.models.content import (AdCampaign, BlogPost, Event, Faq, HomepageSection, HomepageSlide,
-                                Service, SiteSetting, SuccessStory)
+from app.models.base import (
+    APPLICATION_STATUSES,
+    CGPA_SCALES,
+    CONFIDENCE_STATES,
+    COUNTRY_STATUSES,
+    DEGREE_LEVELS,
+    EDUCATION_LEVELS,
+    ELIGIBILITY_STATES,
+    ENGLISH_TESTS,
+    FUNDING_SOURCES,
+    LEAD_STAGES,
+    PARTNER_STATUSES,
+    SOURCE_TIERS,
+)
+from app.models.content import (
+    AdCampaign,
+    BlogPost,
+    Event,
+    Faq,
+    HomepageSection,
+    Service,
+    SiteSetting,
+    SuccessStory,
+)
 from app.models.crm import SearchQueryLog
-from app.models.education import (Country, Department, Faculty, Professor, Program, ProgramIntake,
-                                  Scholarship, University)
-from app.services import rotation
+from app.models.education import (
+    Country,
+    Department,
+    Faculty,
+    Professor,
+    Program,
+    ProgramIntake,
+    Scholarship,
+    University,
+)
+from app.services import fx, rotation
 
 log = logging.getLogger(__name__)
 
@@ -279,7 +305,7 @@ def list_universities(q: Optional[str] = None, country: Optional[str] = None, ci
                 stmt = stmt.where(or_(PR.min_cgpa <= max_cgpa, PR.min_cgpa.is_(None)))
         stmt = stmt.distinct()
 
-    rows = db.execute(stmt).scalars().unique().all()
+    rows = list(db.execute(stmt).scalars().unique().all())
     if sort == "name":
         rows.sort(key=lambda u: u.name)
     elif sort == "ranking":
@@ -535,8 +561,8 @@ def list_faculty(q: Optional[str] = None, country: Optional[str] = None, univers
         country_id = row.id if row else None
     uni_id = None
     if university:
-        row = db.execute(select(University).where(University.slug == university)).scalars().first()
-        uni_id = row.id if row else None
+        uni_row = db.execute(select(University).where(University.slug == university)).scalars().first()
+        uni_id = uni_row.id if uni_row else None
     terms = [t.strip() for t in (interests or "").split(",") if t.strip()]
     matches = matching.match_faculty(db, terms, country_id=country_id, university_id=uni_id,
                                      field=field, limit=500)
@@ -553,7 +579,7 @@ def list_faculty(q: Optional[str] = None, country: Optional[str] = None, univers
 
 
 @router.get("/faculty/{slug}")
-def faculty_detail(slug: str, db: Session = Depends(get_db)):
+def professor_detail(slug: str, db: Session = Depends(get_db)):
     p = db.execute(select(Professor).options(selectinload(Professor.university).selectinload(University.country),
                                              selectinload(Professor.department), selectinload(Professor.publications))
                    .where(Professor.slug == slug)).scalars().first()
@@ -771,6 +797,10 @@ def sitemap_data(db: Session = Depends(get_db)):
                                           .order_by(BlogPost.slug)).scalars().all()],
         }
     except SQLAlchemyError as exc:
-        log.warning("sitemap_data database failure: %s", type(exc).__name__)
+        # The public response stays generic, but the server log must be actionable: the
+        # exception chain, SQLSTATE and connection shape are sanitized, never the URL,
+        # password or bound parameters. Previously only the class name was logged, so an
+        # IPv6-only direct host, an auth failure and a missing table looked identical.
+        log_database_error(log, "sitemap_data database failure", exc)
         raise HTTPException(status_code=503, detail="Sitemap data temporarily unavailable",
                             headers={"Retry-After": "30"}) from exc

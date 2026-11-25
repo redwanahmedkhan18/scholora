@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlencode
+from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -15,9 +14,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import require_staff
+from app.core.webhooks import require_meta_signature
 from app.models.content import AdCampaign, SiteSetting
 from app.models.crm import AnalyticsEvent, User
-from app.core.webhooks import require_meta_signature
 from app.services import assistant, assistant_engine, whatsapp
 
 router = APIRouter(tags=["integrations"])
@@ -127,6 +126,8 @@ async def send(body: SendIn, user: User = Depends(require_staff)):
 def marketing_links(campaign: Optional[str] = None, db: Session = Depends(get_db)):
     """Everything the marketing team needs to point an ad at this site."""
     s = db.get(SiteSetting, 1)
+    if s is None:  # created by migration/seed; absence is a real outage, not empty links
+        raise HTTPException(status_code=503, detail="Site settings are not initialised")
     base = (s.site_url or "").rstrip("/")
     camp = None
     if campaign:
@@ -180,7 +181,7 @@ async def server_conversion(body: ConversionIn, db: Session = Depends(get_db)):
                           meta={"value": body.value, "currency": body.currency}))
     db.commit()
     s = db.get(SiteSetting, 1)
-    pixel_id = s.meta_pixel_id or settings.meta_pixel_id
+    pixel_id = (s.meta_pixel_id if s else None) or settings.meta_pixel_id
     token = settings.meta_capi_access_token
     if not (pixel_id and token):
         return {"status": "LOGGED_LOCALLY", "note": "Set META_CAPI_ACCESS_TOKEN and a pixel id to forward to Meta."}

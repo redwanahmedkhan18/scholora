@@ -55,7 +55,9 @@ RATES_NOTE = (
 
 
 def supported(currency: Optional[str]) -> bool:
-    return bool(currency) and currency.upper() in RATES
+    if not currency:
+        return False
+    return currency.upper() in RATES
 
 
 def convert(amount: float, source: str, target: str) -> Optional[float]:

@@ -1,14 +1,12 @@
 """University / program / scholarship / faculty matching (§28/§35/§26)."""
 from __future__ import annotations
 
-from datetime import date
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models.education import (Country, Professor, Program, ProgramIntake, ProgramRequirement,
-                                  Scholarship, University)
+from app.models.education import Country, Professor, Program, Scholarship, University
 from app.services import costing
 from app.services.eligibility import DOES_NOT_MEET, MEETS, PARTIALLY, REVIEW, UNAVAILABLE, evaluate
 
@@ -192,7 +190,7 @@ def match_scholarships(db: Session, student: Dict[str, Any], limit: int = 25) ->
     ).where(Scholarship.is_published.is_(True))).scalars().all()
     nationality = (student.get("nationality") or "Bangladesh").lower()
     level = (student.get("target_degree_level") or "").upper()
-    out = []
+    out: List[Dict[str, Any]] = []
     for s in rows:
         checks = []
         if s.degree_levels:
@@ -248,7 +246,7 @@ def match_faculty(db: Session, interests: List[str], country_id: Optional[int] =
     rows = list(db.execute(stmt).scalars().unique())
     terms = [t.strip().lower() for t in interests if t and t.strip()]
     field_l = (field or "").lower()
-    out = []
+    out: List[Dict[str, Any]] = []
     for prof in rows:
         pool = " ".join((prof.research_interests or []) + (prof.research_keywords or []) +
                         [prof.bio or "", prof.lab_name or "", (prof.department.name if prof.department else "")]).lower()

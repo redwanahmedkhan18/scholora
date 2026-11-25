@@ -28,8 +28,9 @@ def _authenticate(authorization: Optional[str], db: Session) -> tuple[User, dict
     token = authorization.split(" ", 1)[1]
     try:
         payload = decode_token(token)
-    except Exception:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+    except Exception as exc:
+        # Chain the cause for the log, but never echo the driver/token message to the caller.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token") from exc
     user = db.get(User, int(payload.get("sub", 0)))
     if not user or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or inactive")

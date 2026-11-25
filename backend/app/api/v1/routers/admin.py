@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from slugify import slugify
-from sqlalchemy import text, func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.api import serializers as S
@@ -15,15 +15,51 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import MFA_ENROLMENT_SCOPE, current_user, require_role, require_staff
 from app.core.security import create_access_token, verify_password
-from app.models.content import (AdCampaign, BlogPost, Event, EventRegistration, Faq,
-                                HomepageSection, HomepageSlide, Service, SiteSetting, SuccessStory)
-from app.models.crm import (AnalyticsEvent, Application, ApplicationStatusHistory, Appointment,
-                            AssistantConversation, AuditLog, Brochure, DataVerification, Document,
-                            Lead, Notification, SearchQueryLog, ShortlistItem, StudentProfile,
-                            User, WhatsAppConversation)
-from app.models.education import (Country, Department, Faculty, Professor, Program, ProgramIntake,
-                                  ProgramRequirement, Publication, ResearchArea, Scholarship,
-                                  University, UniversityPartnership, UniversityRanking)
+from app.models.content import (
+    AdCampaign,
+    BlogPost,
+    Event,
+    EventRegistration,
+    Faq,
+    HomepageSection,
+    HomepageSlide,
+    Service,
+    SiteSetting,
+    SuccessStory,
+)
+from app.models.crm import (
+    AnalyticsEvent,
+    Application,
+    ApplicationStatusHistory,
+    Appointment,
+    AssistantConversation,
+    AuditLog,
+    Brochure,
+    DataVerification,
+    Document,
+    Lead,
+    Notification,
+    SearchQueryLog,
+    ShortlistItem,
+    StudentProfile,
+    User,
+    WhatsAppConversation,
+)
+from app.models.education import (
+    Country,
+    Department,
+    Faculty,
+    Professor,
+    Program,
+    ProgramIntake,
+    ProgramRequirement,
+    Publication,
+    ResearchArea,
+    Scholarship,
+    University,
+    UniversityPartnership,
+    UniversityRanking,
+)
 
 router = APIRouter(tags=["admin"])
 
@@ -187,7 +223,7 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_staff)
         "top_searches": [{"subject": s, "country": c, "degree_level": d, "count": n} for s, c, d, n in top_searches],
         "upcoming_deadlines": [{"label": i.label, "deadline": S._dt(i.application_deadline),
                                 "program_id": i.program_id} for i in deadlines],
-        "recent_leads": [S.lead(l) for l in recent_leads],
+        "recent_leads": [S.lead(lead_row) for lead_row in recent_leads],
         "campaigns": [{**S.campaign(c, internal=True), "leads": lead_by_campaign.get(c.id, 0)} for c in campaigns],
     }
 
@@ -211,18 +247,20 @@ def analytics(days: int = 30, db: Session = Depends(get_db), user: User = Depend
             by_degree[s.degree_level] = by_degree.get(s.degree_level, 0) + 1
     return {"events": [{"name": n, "count": c} for n, c in events],
             "search_total": len(searches),
-            "top_countries": sorted([{"key": k, "count": v} for k, v in by_country.items()],
-                                    key=lambda x: -x["count"])[:10],
-            "top_subjects": sorted([{"key": k, "count": v} for k, v in by_subject.items()],
-                                   key=lambda x: -x["count"])[:10],
-            "top_degrees": sorted([{"key": k, "count": v} for k, v in by_degree.items()],
-                                  key=lambda x: -x["count"])[:10]}
+            "top_countries": [{"key": k, "count": v}
+                              for k, v in sorted(by_country.items(), key=lambda kv: -kv[1])[:10]],
+            "top_subjects": [{"key": k, "count": v}
+                             for k, v in sorted(by_subject.items(), key=lambda kv: -kv[1])[:10]],
+            "top_degrees": [{"key": k, "count": v}
+                            for k, v in sorted(by_degree.items(), key=lambda kv: -kv[1])[:10]]}
 
 
 # ------------------------------------------------------------------ settings
 @router.get("/settings")
 def admin_settings(db: Session = Depends(get_db), user: User = Depends(require_role("ADMIN"))):
     row = db.get(SiteSetting, 1)
+    if row is None:  # the settings row is created by the migration/seed; absence is a 404
+        raise HTTPException(status_code=404, detail="Site settings are not initialised")
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
 
@@ -357,8 +395,11 @@ def _detach_user_references(db: Session, user_id: int) -> dict[str, int]:
         result = db.execute(
             text(f"UPDATE {table} SET {column} = NULL WHERE {column} = :uid"), {"uid": user_id}
         )
-        if result.rowcount:
-            detached[table] = int(result.rowcount)
+        # ``execute`` returns CursorResult for DML; getattr keeps this honest across drivers
+        # (and across SQLAlchemy versions where the static return type is the base Result).
+        rowcount = getattr(result, "rowcount", 0)
+        if rowcount:
+            detached[table] = int(rowcount)
     return detached
 
 

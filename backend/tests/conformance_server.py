@@ -17,7 +17,6 @@ Run standalone for manual poking:
 """
 from __future__ import annotations
 
-import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request

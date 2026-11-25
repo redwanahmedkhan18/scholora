@@ -331,12 +331,15 @@ def campaign(c, internal: bool = False) -> Dict[str, Any]:
     return data
 
 
-def lead(l) -> Dict[str, Any]:
-    return {"id": l.id, "reference": l.reference, "full_name": l.full_name, "phone": l.phone, "email": l.email,
-            "message": l.message, "interest_country": l.interest_country, "interest_degree": l.interest_degree,
-            "interest_subject": l.interest_subject, "intake": l.intake, "source": l.source,
-            "campaign_id": l.campaign_id, "utm": l.utm, "stage": l.stage, "priority": l.priority,
-            "assigned_to": l.assigned_to, "notes": l.notes, "created_at": _dt(l.created_at)}
+def lead(record) -> Dict[str, Any]:
+    return {"id": record.id, "reference": record.reference, "full_name": record.full_name,
+            "phone": record.phone, "email": record.email,
+            "message": record.message, "interest_country": record.interest_country,
+            "interest_degree": record.interest_degree,
+            "interest_subject": record.interest_subject, "intake": record.intake, "source": record.source,
+            "campaign_id": record.campaign_id, "utm": record.utm, "stage": record.stage,
+            "priority": record.priority,
+            "assigned_to": record.assigned_to, "notes": record.notes, "created_at": _dt(record.created_at)}
 
 
 def appointment(a) -> Dict[str, Any]:

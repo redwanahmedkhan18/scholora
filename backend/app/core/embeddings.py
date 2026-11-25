@@ -202,9 +202,9 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     # Prefer the fitted local semantic model over hashing. Hashing has no concept of
     # meaning - "fees" and "tuition" are unrelated buckets to it - so it is the last
     # resort, not the default.
-    vectors = local_semantic.transform(texts, dim())
-    if vectors is not None:
-        return vectors
+    local_vectors = local_semantic.transform(texts, dim())
+    if local_vectors is not None:
+        return local_vectors
     return [_local_embed(t) for t in texts]
 
 

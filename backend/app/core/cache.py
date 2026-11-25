@@ -19,9 +19,15 @@ from app.core.connectivity import normalize_redis_url, redis_connect_kwargs, red
 
 log = logging.getLogger(__name__)
 
+# Optional dependency. The fallback is a process-local backend, so an install without
+# redis must still import cleanly. Annotating the module handle as `Any` is deliberate:
+# redis-py is optional and ships its own types, but the name is also `None` here.
+_redis: Any = None
 try:  # pragma: no cover - import guard
-    import redis as _redis  # type: ignore
-except Exception:  # pragma: no cover
+    import redis as _redis_module
+
+    _redis = _redis_module
+except Exception:  # pragma: no cover - optional dependency
     _redis = None
 
 
@@ -135,10 +141,17 @@ class Cache:
 
     # ---------------------------------------------------------------- raw ops
     def get(self, key: str) -> Optional[str]:
+        if self._client is None:
+            return self._memory.get(self._k(key))
         try:
-            return self._client.get(self._k(key)) if self._client else self._memory.get(self._k(key))
+            value = self._client.get(self._k(key))
         except Exception:
             return self._memory.get(self._k(key))
+        if value is None:
+            return None
+        # decode_responses=True normally yields str; a bytes value is still honoured so
+        # a misconfigured client degrades to a correct string instead of a broken cache.
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
     def set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
         try:

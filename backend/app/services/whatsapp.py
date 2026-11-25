@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from sqlalchemy import select
@@ -71,7 +71,8 @@ def handle_text(db: Session, wa_id: str, profile_name: str, text: str) -> Dict[s
         db.refresh(convo)
 
     db.add(WhatsAppMessage(conversation_id=convo.id, direction="IN", body=text))
-    brand = (db.get(SiteSetting, 1).brand_name if db.get(SiteSetting, 1) else "our consultancy")
+    site_settings = db.get(SiteSetting, 1)
+    brand = site_settings.brand_name if site_settings else "our consultancy"
 
     stripped = text.strip()
     intent = MENU_MAP.get(stripped) or assistant.detect_intent(stripped)

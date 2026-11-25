@@ -1,0 +1,57 @@
+# Tooling configuration for the Scholara backend.
+#
+# This file deliberately has NO [project] table: the backend is installed from
+# requirements.txt (pip install -r requirements.txt) and is not a distributable
+# package. It exists so that Ruff and mypy resolve one reproducible configuration
+# from the backend root in local development, CI and on Render.
+#
+# Canonical interpreter: see .python-version (3.13.1). Ruff's target-version and
+# mypy's python_version below must stay in step with it.
+
+[tool.ruff]
+target-version = "py313"
+# Long descriptive comments and docstrings are a deliberate house style here; 120 is
+# the column budget for code. E501 is disabled because the formatter/reviewer owns
+# line breaks and a hard failure on prose length adds noise without finding defects.
+line-length = 120
+src = ["app", "scripts", "tests"]
+# Alembic revision files are generated history, not hand-maintained source. They are
+# type-checked out of mypy for the same reason; linting them would rewrite past migrations
+# without any behavioural benefit.
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+# Core correctness (E/F/W), import hygiene (I) and bugbear maintainability checks (B).
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",  # line length is a formatting concern; see [tool.ruff] above
+    "B008",  # FastAPI's Depends()/Query() in argument defaults is idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules import fixtures after environment setup and assert inside helpers.
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["app", "scripts"]
+# Alembic revision files are generated history; they are type-checked by hand, not CI.
+exclude = ["^alembic/versions/"]
+show_error_codes = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# Optional third-party signature packages that ship no typing information.
+module = [
+    "celery.*",
+    "kombu.*",
+    "passlib.*",
+    "sklearn.*",
+    "boto3.*",
+    "botocore.*",
+]
+ignore_missing_imports = true

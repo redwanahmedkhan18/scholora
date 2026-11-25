@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import or_, select
@@ -14,11 +14,21 @@ from app.services import costing
 from app.services.eligibility import evaluate
 
 
+def _verified_at(obj) -> Optional[str]:
+    """ISO-8601 verification timestamp, or None when the record has no date.
+
+    Read once into a local so the None check and the ``.isoformat()`` call operate on the
+    same value (two separate ``getattr`` calls defeat narrowing for a static analyser).
+    """
+    value = getattr(obj, "verified_at", None)
+    return value.isoformat() if value is not None else None
+
+
 def _source(obj) -> Dict[str, Any]:
     return {
         "source_url": getattr(obj, "source_url", None),
         "source_type": getattr(obj, "source_type", None),
-        "verified_at": getattr(obj, "verified_at", None).isoformat() if getattr(obj, "verified_at", None) else None,
+        "verified_at": _verified_at(obj),
         "confidence": getattr(obj, "confidence", "UNVERIFIED"),
     }
 
@@ -178,7 +188,7 @@ def _collect_sources(program, req, uni, scholarships, intakes) -> List[Dict[str,
         url = getattr(obj, "source_url", None)
         if url:
             items.append({"label": label, "url": url, "source_type": getattr(obj, "source_type", None),
-                          "verified_at": getattr(obj, "verified_at", None).isoformat() if getattr(obj, "verified_at", None) else None,
+                          "verified_at": _verified_at(obj),
                           "confidence": getattr(obj, "confidence", "UNVERIFIED")})
     add(f"{uni.name} - institution record", uni)
     add(f"{program.name} - programme page", program)

@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.core import llm
-from app.core.config import settings
 from app.models.crm import AssistantConversation
 from app.services import assistant as tools_mod
 from app.services import retrieval
@@ -63,14 +62,14 @@ PROHIBITED_CLAIMS: list[tuple[str, re.Pattern[str]]] = [
     ("admission_probability",
      re.compile(rf"\d{{1,3}}\s*(%|percent)\b(?=[^.!?]*\b(chance|probabilit|likelihood|odds|success\s*rate|{_OUTCOME})\b)", re.I)),
     ("admission_probability",
-     re.compile(rf"\b(chance|probabilit|likelihood|odds|success\s*rate)\b(?=[^.!?]*\d{{1,3}}\s*(%|percent))", re.I)),
+     re.compile(r"\b(chance|probabilit|likelihood|odds|success\s*rate)\b(?=[^.!?]*\d{1,3}\s*(%|percent))", re.I)),
     # Qualitative likelihood of an outcome.
     ("admission_probability",
      re.compile(rf"\b(chances?|odds|probability|likelihood)\s+(of|for|at|to)\b[^.!?]*\b{_OUTCOME}", re.I)),
     ("admission_probability",
      re.compile(rf"\b{_OUTCOME}\s+(chances?|odds|probability|likelihood|success\s*rate)\b", re.I)),
     ("admission_probability",
-     re.compile(rf"\b(high|good|strong|excellent|low|poor|slim|decent|fair)\s+(chances?|odds|likelihood|probability)\b", re.I)),
+     re.compile(r"\b(high|good|strong|excellent|low|poor|slim|decent|fair)\s+(chances?|odds|likelihood|probability)\b", re.I)),
     ("admission_probability",
      re.compile(r"\b(visa|admission|acceptance)\s+success\s*rate\b", re.I)),
     # Predictions and promises.

@@ -82,7 +82,6 @@ class Settings(BaseSettings):
 
     # --- retrieval / embeddings -------------------------------------------
     embedding_model: str = "text-embedding-3-small"
-    embedding_dim: int = 256
 
     admin_email: str = "admin@scholara.com.bd"
     admin_password: str = "Admin@12345"

@@ -46,7 +46,9 @@ def playlist(db: Session, local_hour: Optional[int] = None) -> Dict[str, Any]:
     default_seconds = settings_row.hero_rotation_seconds if settings_row else 30
     slides = active_slides(db, local_hour=local_hour)
     if not slides:  # never show an empty hero
-        slides = db.execute(select(HomepageSlide).order_by(HomepageSlide.priority.desc()).limit(3)).scalars().all()
+        slides = list(db.execute(
+            select(HomepageSlide).order_by(HomepageSlide.priority.desc()).limit(3)
+        ).scalars().all())
     return {
         "rotation_enabled": bool(settings_row.hero_rotation_enabled) if settings_row else True,
         "default_duration_seconds": default_seconds,

@@ -38,7 +38,6 @@ from typing import Any, Dict, List, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import httpx  # noqa: E402
-
 from app.core.database import SessionLocal  # noqa: E402
 from app.models.crm import DataVerification  # noqa: E402
 
@@ -168,7 +167,8 @@ def main() -> int:
     rows = db.query(DataVerification).filter(DataVerification.source_url != "").all()
     by_url: Dict[str, List[DataVerification]] = defaultdict(list)
     for r in rows:
-        by_url[r.source_url].append(r)
+        if r.source_url:  # the column is nullable; a None key would merge unrelated rows
+            by_url[r.source_url].append(r)
     urls = sorted(by_url)
     if args.limit:
         urls = urls[:args.limit]

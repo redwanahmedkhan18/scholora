@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +175,7 @@ def _load_locked() -> None:
     global _cache_loaded_at, _available
     try:
         from sqlalchemy import select
+
         from app.core.database import SessionLocal
         from app.models.content import RuntimeSetting
 
@@ -234,6 +235,7 @@ def mask(value: str) -> str:
 def describe(db) -> List[Dict[str, Any]]:
     """Everything the admin UI needs: value or mask, origin, and the spec metadata."""
     from sqlalchemy import select
+
     from app.core.config import get_settings
     from app.models.content import RuntimeSetting
 
@@ -276,6 +278,7 @@ def apply(db, values: Dict[str, Any], actor: str = "system",
     transaction - the admin endpoint does, so a credential can never change unlogged.
     """
     from sqlalchemy import select
+
     from app.models.content import RuntimeSetting
 
     changed, cleared, reindex = [], [], False

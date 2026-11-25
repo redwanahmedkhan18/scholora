@@ -37,17 +37,34 @@ if database_url.startswith("sqlite"):
         database_url,
         connect_args={"check_same_thread": False},
         pool_pre_ping=True,
+        pool_reset_on_return="rollback",
         hide_parameters=True,
     )
 else:
+    # Supabase's Session Pooler has a small per-project client allowance shared by the web
+    # service, the worker and one-off jobs. Keep the per-process pool deliberately small;
+    # a generous SQLAlchemy pool multiplies into too many server sessions and surfaces as
+    # an OperationalError ("too many clients") only under load.
+    pool_size = max(1, int(settings.db_pool_size))
+    max_overflow = max(0, int(settings.db_max_overflow))
+    pool_recycle = max(0, int(settings.db_pool_recycle))
+    pool_timeout = max(1, int(settings.db_pool_timeout))
+    if pool_size + max_overflow > 10:
+        log.warning(
+            "database pool is sized for %d concurrent connections per process; the "
+            "Supabase Session Pooler shares a small allowance across every Render "
+            "service. Reduce DB_POOL_SIZE/DB_MAX_OVERFLOW if connections are refused.",
+            pool_size + max_overflow,
+        )
     engine = create_engine(
         database_url,
         connect_args=database_connect_args(database_url),
         pool_pre_ping=True,
-        pool_recycle=int(settings.db_pool_recycle),
-        pool_size=int(settings.db_pool_size),
-        max_overflow=int(settings.db_max_overflow),
-        pool_timeout=int(settings.db_pool_timeout),
+        pool_reset_on_return="rollback",
+        pool_recycle=pool_recycle,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
         pool_use_lifo=True,
         hide_parameters=True,
     )

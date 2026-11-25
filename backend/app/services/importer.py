@@ -33,9 +33,16 @@ from sqlalchemy.orm import Session
 
 from app.models.base import CONFIDENCE_STATES, SOURCE_TIERS
 from app.models.crm import DataVerification, ImportBatch, ImportRow
-from app.models.education import (Country, Professor, Program, ProgramIntake,
-                                  ProgramRequirement, Scholarship,
-                                  University, UniversityRanking)
+from app.models.education import (
+    Country,
+    Professor,
+    Program,
+    ProgramIntake,
+    ProgramRequirement,
+    Scholarship,
+    University,
+    UniversityRanking,
+)
 
 # How a faculty address came to be known. "UNAVAILABLE" is a first-class answer and the
 # correct one whenever a university does not publish the address - far better than a
@@ -590,11 +597,9 @@ def commit_batch(db: Session, batch: ImportBatch, actor: str = "system") -> Dict
             # created, 0 errors" when two of the four no longer existed. A failing row
             # must cost exactly itself.
             with db.begin_nested():
-                target = None
-                if row.target_id:
-                    target = db.get(model, row.target_id)
+                target = db.get(model, row.target_id) if row.target_id else None
                 is_new = target is None
-                if is_new:
+                if target is None:
                     target = model()
                     db.add(target)
 

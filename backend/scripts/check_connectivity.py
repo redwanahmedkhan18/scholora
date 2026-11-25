@@ -23,10 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy.engine import make_url  # noqa: E402
-
 from app.core import connectivity  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
 
 
 def _families(infos) -> list[str]:
@@ -84,7 +83,7 @@ def main() -> int:
         host, port = _database_host_port()
         report["database"]["dns"] = _dns(host, port)
         report["database"]["tcp"] = _tcp(host, port, args.timeout)
-    report["database"]["check"] = connectivity.check_database()
+    report["database"]["check"] = connectivity.check_database(include_diagnostics=True)
 
     for label, raw in (
         ("cache", settings.redis_url),

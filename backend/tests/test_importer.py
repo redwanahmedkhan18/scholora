@@ -6,9 +6,8 @@ applied without a human saying so.
 """
 import json
 
-from app.models.education import Country, Program, Scholarship, University
 import pytest
-
+from app.models.education import Country, Scholarship, University
 from app.services import importer
 
 
@@ -225,9 +224,8 @@ def test_coercion_buckets_match_the_real_column_types():
     cells carry "320 (Q160)". When those were listed as numeric the importer stripped the
     non-digits and produced 320160: a score nobody ever published.
     """
-    from sqlalchemy import Boolean, Float, Integer, Numeric
     from app.models.base import JSONType
-    from sqlalchemy import JSON
+    from sqlalchemy import JSON, Boolean, Float, Integer, Numeric
 
     problems = []
     for name, spec in importer.SCHEMAS.items():

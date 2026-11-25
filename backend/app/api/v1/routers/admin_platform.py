@@ -26,9 +26,8 @@ from sqlalchemy.orm import Session
 from app.api import serializers as S
 from app.core import embeddings as E
 from app.core import llm, runtime
-from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.deps import current_user, require_role
+from app.core.deps import require_role
 from app.models.crm import AuditLog, DataVerification, ImportBatch, ImportRow, User
 from app.services import importer, readiness, retrieval, source_verification
 
@@ -74,7 +73,7 @@ def write_config(body: ConfigIn, db: Session = Depends(get_db),
         result = runtime.apply(db, body.values, actor=user.email, commit=False)
     except ValueError as exc:
         db.rollback()
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
     # Log the keys touched, never the values.
     _audit(db, user, "UPDATE_RUNTIME_CONFIG",
            changed=result["changed"], cleared=result["cleared"])
@@ -101,7 +100,7 @@ def test_integration(target: str, db: Session = Depends(get_db),
     as a silently undelivered message. Each test performs the cheapest real call the vendor
     offers and reports the verbatim error on failure.
     """
-    from app.core.config import settings                       # dynamic view, DB overlay on
+    from app.core.config import settings  # dynamic view, DB overlay on
     target = target.lower()
     _audit(db, user, "TEST_INTEGRATION", target=target)
     db.commit()
@@ -193,7 +192,7 @@ def test_integration(target: str, db: Session = Depends(get_db),
                              providers=results)
             return _ok("Assistant model",
                        f"{len(working)} of {len(results)} configured providers responded "
-                       f"({', '.join(r['label'] for r in working)}).",
+                       f"({', '.join(str(r['label']) for r in working)}).",
                        providers=results)
 
         raise HTTPException(404, f"unknown test target '{target}'")
@@ -234,6 +233,8 @@ def embeddings_reindex(background: bool = Query(default=True),
     if background:
         try:
             from app.services.tasks import celery_app
+            if celery_app is None:
+                raise RuntimeError("Celery broker is not configured")
             async_result = celery_app.send_task("scholara.reindex_knowledge")
             return {"queued": True, "task_id": str(async_result.id),
                     "detail": "Reindex queued. Progress appears in Operations > Jobs."}
@@ -357,7 +358,7 @@ def import_template(entity_type: str, user: User = Depends(require_role("DATA_MA
     try:
         return {"entity_type": entity_type, "csv": importer.template_csv(entity_type)}
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
 
 
 class StageIn(BaseModel):
@@ -376,7 +377,7 @@ def import_stage(body: StageIn, db: Session = Depends(get_db),
     try:
         rows = importer.parse_payload(body.content, body.filename)
     except (ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(400, f"could not parse the file: {exc}")
+        raise HTTPException(400, f"could not parse the file: {exc}") from exc
     if not rows:
         raise HTTPException(400, "the file contained no rows")
     if len(rows) > 2000:
@@ -388,7 +389,7 @@ def import_stage(body: StageIn, db: Session = Depends(get_db),
                                source_type=body.source_type, notes=body.notes,
                                actor=user.email)
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
 
     _audit(db, user, "STAGE_IMPORT", entity_type="import_batch", entity_id=batch.id,
            reference=batch.reference, rows=batch.row_count)
@@ -456,7 +457,7 @@ def import_commit(batch_id: int, db: Session = Depends(get_db),
     try:
         result = importer.commit_batch(db, batch, actor=user.email)
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
     _audit(db, user, "COMMIT_IMPORT", entity_type="import_batch", entity_id=batch.id,
            reference=batch.reference, created=result["created"], updated=result["updated"])
     db.commit()

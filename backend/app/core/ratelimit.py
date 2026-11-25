@@ -7,14 +7,13 @@ appointment booking, the assistant, and admin login.
 from __future__ import annotations
 
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-
-import secrets
 
 from app.core.cache import cache
 from app.core.config import settings

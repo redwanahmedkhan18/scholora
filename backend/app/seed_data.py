@@ -5,6 +5,12 @@ record through the verification workflow, but every figure below (tuition, CGPA,
 intake date, faculty record) is SAMPLE data used to demonstrate the platform. Each seeded row is
 written with confidence = NEEDS_REVIEW so the verification queue reflects real outstanding work.
 """
+from typing import Any
+
+# Rows are heterogeneous tuples with a documented column order above each list. The precise
+# per-row shape (nullable rank columns, mixed str/int fields) is only meaningful to the loader
+# in app.seed, so the row type is `tuple[Any, ...]` rather than a union of near-identical
+# tuple aliases that mypy would collapse and then mis-infer at every unpack site.
 
 COUNTRIES = [
     # name, iso2, flag, region, status, featured, tuition range, living range, currency, tagline
@@ -119,7 +125,7 @@ GRADIENTS = {
     "Finland": "linear-gradient(135deg,#071a33 0%,#13467a 55%,#6fb3e0 100%)",
 }
 
-UNIVERSITIES = [
+UNIVERSITIES: list[tuple[Any, ...]] = [
     # name, country, city, type, founded, website, partner status, featured, rankings
     ("University of Texas at Arlington", "United States", "Arlington, Texas", "PUBLIC", 1895, "https://www.uta.edu",
      "PARTNER", True, [("QS World University Rankings", 2027, "801-850", "#160")]),
@@ -171,7 +177,7 @@ UNIVERSITIES = [
 ]
 
 # university -> [(programme, level, award, discipline, months, tuition, min cgpa, ielts, tags, specialisations)]
-PROGRAMS = {
+PROGRAMS: dict[str, list[tuple[Any, ...]]] = {
     "University of Texas at Arlington": [
         ("MSc Computer Science", "MASTER", "MS", "Computer Science", 24, 28000, 3.0, 6.5,
          ["artificial intelligence", "software engineering", "data science"], ["Intelligent Systems", "Software Engineering", "Databases"]),
@@ -330,7 +336,7 @@ PROGRAMS = {
     ],
 }
 
-SCHOLARSHIPS = [
+SCHOLARSHIPS: list[tuple[Any, ...]] = [
     # name, university, country, levels, amount type, amount, pct, currency, min cgpa, min ielts, summary
     ("Global Excellence Scholarship", "University of Glasgow", "United Kingdom", ["MASTER"], "FIXED", 7500, None, "GBP", 3.4, 6.5,
      "Academic merit based award for international students holding an offer."),
@@ -444,7 +450,7 @@ SERVICES = [
     ("PhD and Research Advisory", "microscope", "Supervisor discovery, research-fit analysis and funded-position guidance.", "Research"),
 ]
 
-STORIES = [
+STORIES: list[tuple[Any, ...]] = [
     ("Rahim Ahmed", "United States", "University of Texas at Arlington", "MSc Computer Science", "MASTER", "Fall 2026", 2026,
      "30% Dean's Scholarship", "Visa granted (F-1)",
      "I came in with a 3.2 CGPA and no idea where to start. The eligibility report showed exactly which programmes I could realistically target."),
@@ -489,7 +495,7 @@ STORIES = [
      "I needed to stay close to family. Dubai turned out to be the right balance of cost and career."),
 ]
 
-SLIDES = [
+SLIDES: list[tuple[Any, ...]] = [
     # key, title, subtitle, description, country, highlights, focus, priority
     ("usa", "Study in the United States", "Research universities, assistantships and OPT",
      "Search verified US institutions with programme-level requirements, tuition and Fall 2027 deadlines.",
@@ -612,7 +618,7 @@ CAMPAIGNS = [
      "Search faculty by research area and see the publications behind each match.", "Lead", 60000.0),
 ]
 
-EVENTS = [
+EVENTS: list[tuple[Any, ...]] = [
     ("UK University Admission Day - Uttara", "United Kingdom", "University of Glasgow", 6, "OFFLINE",
      "Scholara Office, Sector 4, Uttara, Dhaka"),
     ("USA Spring 2027 Application Workshop", "United States", "University of Texas at Arlington", 13, "HYBRID",

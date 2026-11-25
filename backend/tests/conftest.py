@@ -43,11 +43,10 @@ for _external_credential in (
 ):
     os.environ[_external_credential] = ""
 
-from fastapi.testclient import TestClient  # noqa: E402
-
 import app.models  # noqa: E402,F401  (register metadata first)
 from app.core.database import Base, SessionLocal, engine  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402  (aliased: `app` is also the package name)
+from fastapi.testclient import TestClient  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)

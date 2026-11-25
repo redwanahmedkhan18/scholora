@@ -13,12 +13,12 @@ response parsing, the failover order and the error handling.
 """
 from __future__ import annotations
 
-import pytest
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
-
-from tests.conformance_server import RECEIVED, VALID_TOKEN, app as harness_app
+from tests.conformance_server import RECEIVED, VALID_TOKEN
+from tests.conformance_server import app as harness_app
 
 
 @pytest.fixture
