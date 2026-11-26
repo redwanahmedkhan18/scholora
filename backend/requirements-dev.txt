@@ -1,6 +1,9 @@
--r requirements.txt
-
-# Test and static-analysis tooling. Kept out of the production image so the runtime stays lean.
-pytest>=8.0
-ruff>=0.16
-mypy>=1.10
+# Tooling needed to run the checks in this repository, kept out of requirements.txt because it is
+# not part of the application: nothing in app/ imports these, and a deployment should not install
+# a type checker. A clean clone needs both files to reproduce what CI runs.
+#
+#   python -m pip install -r requirements.txt -r requirements-dev.txt
+#   python -m ruff check . && python -m mypy app scripts && python -m pytest
+ruff>=0.6
+mypy>=1.11
+pytest>=8.3
