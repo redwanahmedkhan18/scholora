@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { track, whatsappHref } from "@/lib/track";
+import { track } from "@/lib/track";
+import { contactFromSettings } from "@/lib/contact";
 
 type Dict = Record<string, any>;
 
@@ -44,6 +45,9 @@ export default function SiteHeader({ settings, countries }: { settings: Dict; co
   };
 
   const active = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
+  // One read of the contact channels for the whole header: the top bar prints the phone and
+  // email as text, and every link needs the normalised form (`tel:+880...`, `mailto:`).
+  const contact = contactFromSettings(settings);
 
   return (
     <header className="sticky top-0 z-50 border-b border-slate-200 bg-white/95 backdrop-blur">
@@ -52,10 +56,14 @@ export default function SiteHeader({ settings, countries }: { settings: Dict; co
           <p>{settings.office_address}</p>
           <div className="flex items-center gap-4">
             <span>{settings.office_hours}</span>
-            {settings.phones?.[0] && <a href={`tel:${settings.phones[0]}`} className="font-semibold hover:text-accent-400">{settings.phones[0]}</a>}
-            {settings.emails?.[0] && <a href={`mailto:${settings.emails[0]}`} className="font-semibold hover:text-accent-400">{settings.emails[0]}</a>}
-            {settings.facebook_page_url && (
-              <a href={settings.facebook_page_url} target="_blank" rel="noopener noreferrer"
+            {contact.telHref && (
+              <a href={contact.telHref} className="font-semibold hover:text-accent-400">{contact.phoneDisplay}</a>
+            )}
+            {contact.mailtoHref && (
+              <a href={contact.mailtoHref} className="font-semibold hover:text-accent-400">{contact.email}</a>
+            )}
+            {contact.facebookHref && (
+              <a href={contact.facebookHref} target="_blank" rel="noopener noreferrer"
                  onClick={() => track("facebook_page_click", { placement: "topbar" })}
                  className="font-semibold hover:text-accent-400">Facebook</a>
             )}
@@ -132,8 +140,8 @@ export default function SiteHeader({ settings, countries }: { settings: Dict; co
             className="hidden rounded-xl bg-brand-800 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-brand-700 sm:block">
             Free assessment
           </Link>
-          {settings.whatsapp_enabled !== false && settings.whatsapp_number && (
-            <a href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message)}
+          {contact.whatsappHref && (
+            <a href={contact.whatsappHref}
               target="_blank" rel="noopener noreferrer"
               onClick={() => track("whatsapp_click", { placement: "header" }, "Contact")}
               className="hidden rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-emerald-500 sm:block">

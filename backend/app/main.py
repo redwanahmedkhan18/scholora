@@ -76,6 +76,18 @@ async def lifespan(app: FastAPI):
     else:
         log.info("cors origins configured: %s", ", ".join(settings.cors_origin_list))
 
+    # Outbound email: say once, at startup, whether mail can be delivered and why not. Secrets
+    # never appear here - the username is masked and the password is not read.
+    from app.services import email as email_service
+
+    mail = email_service.status()
+    if mail["configured"]:
+        log.info("email configured host=%s port=%s security=%s from=%s",
+                 mail["host"], mail["port"], mail["security"], mail["from_address"])
+    else:
+        log.warning("email disabled: %s Notifications stay in the inbox until it is set.",
+                    mail["reason"])
+
     from app.services import tasks
 
     tasks.start_scheduler()

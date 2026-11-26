@@ -1,19 +1,27 @@
 """Admin / counselor API: auth, dashboards, generic CMS CRUD, verification queue, analytics."""
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slugify import slugify
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.api import serializers as S
+from app.core import validation
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import MFA_ENROLMENT_SCOPE, current_user, require_role, require_staff
+from app.core.deps import (
+    MFA_CHALLENGE_SCOPE,
+    MFA_ENROLMENT_SCOPE,
+    current_user,
+    require_role,
+    require_staff,
+)
 from app.core.security import create_access_token, verify_password
 from app.models.content import (
     AdCampaign,
@@ -128,11 +136,34 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     if user.locked_until and user.locked_until > now:
         raise HTTPException(423, "Account temporarily locked. Try again shortly.")
 
+    # A password published in the repository (in the seed data and, until now, on the login
+    # screen) is not a credential. In production it is refused outright instead of quietly
+    # opening the back office; the operator rotates it with `python -m app.mgmt_admin`.
+    if settings.is_production and body.password in settings.published_password_list:
+        db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="LOGIN_REFUSED_DEFAULT_PASSWORD",
+                        entity_type="users", entity_id=user.id))
+        db.commit()
+        raise HTTPException(
+            403,
+            "This account still uses a published default password. An operator must set a new "
+            "password before it can sign in.",
+        )
+
     if user.mfa_secret and user.mfa_confirmed_at:
         db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="LOGIN_MFA_REQUIRED"))
         db.commit()
+        # A scoped, short-lived handle for step two. It is not a session: every authenticated
+        # dependency refuses it, so a password alone still grants nothing.
         return {"mfa_required": True, "email": user.email,
-                "message": "Enter the 6-digit code from your authenticator app."}
+                "challenge_token": create_access_token(
+                    str(user.id), user.role,
+                    extra={"scope": MFA_CHALLENGE_SCOPE, "jti": secrets.token_urlsafe(12),
+                           "exp": datetime.now(timezone.utc)
+                           + timedelta(seconds=max(1, settings.mfa_challenge_ttl_seconds))}),
+                "challenge_expires_in": max(1, settings.mfa_challenge_ttl_seconds),
+                "mfa_method": "totp",
+                "message": ("Open your authenticator app and enter the current 6-digit code, "
+                            "or one of your recovery codes.")}
 
     # Mandatory-MFA roles that have not enrolled get an enrolment-scoped token, never a
     # session. Previously this branch returned a full token with "mfa_recommended": true,
@@ -256,28 +287,251 @@ def analytics(days: int = 30, db: Session = Depends(get_db), user: User = Depend
 
 
 # ------------------------------------------------------------------ settings
-@router.get("/settings")
-def admin_settings(db: Session = Depends(get_db), user: User = Depends(require_role("ADMIN"))):
+# The public contact details have their own validated endpoints as well as a place in the
+# generic settings form. One row (SiteSetting id=1) stays the single source of truth: the
+# header, footer, contact page, mobile navigation and WhatsApp button all read it through
+# GET /public/contact, so there is no second copy to drift out of sync.
+CONTACT_PHONE_FIELD = "Primary phone number"
+CONTACT_FIELDS = ("phones", "emails", "whatsapp_number", "facebook_page_url")
+
+
+class ContactSettingsIn(BaseModel):
+    """The four published contact channels, validated and normalised before they are stored.
+
+    Every rejection message is written for the administrator who typed the value, and the
+    normalisation is shared with the generic settings endpoint so both routes agree.
+    """
+
+    primary_phone: str
+    whatsapp_number: str
+    email: str
+    facebook_url: str
+    office_address: Optional[str] = None
+    office_hours: Optional[str] = None
+    whatsapp_message: Optional[str] = None
+    whatsapp_enabled: bool = True
+    # The full list, so an administrator can retire a number that is no longer answered.
+    # Omitting them keeps the stored extras (a caller that only edits the primary cannot
+    # silently delete the office's second line); sending them replaces the list.
+    extra_phones: Optional[list[str]] = None
+    extra_emails: Optional[list[str]] = None
+
+    @field_validator("extra_phones", mode="before")
+    @classmethod
+    def _extra_phones(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.splitlines()
+        return validation.normalize_phone_list([str(v) for v in value], field="Additional phone number")
+
+    @field_validator("extra_emails", mode="before")
+    @classmethod
+    def _extra_emails(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.splitlines()
+        return validation.normalize_email_list([str(v) for v in value], field="Additional email address")
+
+    @field_validator("primary_phone", mode="before")
+    @classmethod
+    def _primary_phone(cls, value: Any) -> str:
+        return validation.normalize_phone(str(value or ""), field=CONTACT_PHONE_FIELD)
+
+    @field_validator("whatsapp_number", mode="before")
+    @classmethod
+    def _whatsapp_number(cls, value: Any) -> str:
+        return validation.normalize_phone(str(value or ""), field="WhatsApp number")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _email(cls, value: Any) -> str:
+        return validation.normalize_email(str(value or ""), field="Public contact email")
+
+    @field_validator("facebook_url", mode="before")
+    @classmethod
+    def _facebook_url(cls, value: Any) -> str:
+        return validation.normalize_facebook_url(str(value or ""))
+
+
+class ContactSettingsOut(BaseModel):
+    primary_phone: str
+    primary_phone_display: str
+    extra_phones: list[str] = []
+    whatsapp_number: str
+    whatsapp_link_number: str
+    email: str
+    extra_emails: list[str] = []
+    facebook_url: str
+    office_address: Optional[str] = None
+    office_hours: Optional[str] = None
+    whatsapp_message: Optional[str] = None
+    whatsapp_enabled: bool = True
+    updated_at: Optional[str] = None
+
+
+def contact_payload(row: SiteSetting) -> Dict[str, Any]:
+    """Read the four published channels off the settings row, tolerating legacy values.
+
+    A row seeded before this endpoint existed can hold something an entry form would reject
+    (the shipped placeholder number, for instance). Reading never fails: unusable values are
+    returned as-is so the administrator can see and correct them.
+    """
+    phones = [str(p) for p in (row.phones or []) if str(p).strip()]
+    emails = [str(e) for e in (row.emails or []) if str(e).strip()]
+    wa = (row.whatsapp_number or "").strip()
+    return {
+        "primary_phone": phones[0] if phones else "",
+        "primary_phone_display": validation.phone_display(phones[0]) if phones else "",
+        "extra_phones": phones[1:],
+        "whatsapp_number": wa,
+        "whatsapp_link_number": validation.whatsapp_number(wa),
+        "email": emails[0] if emails else "",
+        "extra_emails": emails[1:],
+        "facebook_url": row.facebook_page_url or "",
+        "office_address": row.office_address,
+        "office_hours": row.office_hours,
+        "whatsapp_message": row.whatsapp_default_message,
+        "whatsapp_enabled": bool(row.whatsapp_enabled),
+        "updated_at": S._dt(row.updated_at),
+    }
+
+
+def _settings_row(db: Session) -> SiteSetting:
     row = db.get(SiteSetting, 1)
     if row is None:  # the settings row is created by the migration/seed; absence is a 404
         raise HTTPException(status_code=404, detail="Site settings are not initialised")
-    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+    return row
+
+
+@router.get("/settings/contact", response_model=ContactSettingsOut)
+def admin_contact_settings(db: Session = Depends(get_db), user: User = Depends(require_role("ADMIN"))):
+    """Exactly what the public website is publishing right now."""
+    return contact_payload(_settings_row(db))
+
+
+@router.put("/settings/contact", response_model=ContactSettingsOut)
+def update_contact_settings(body: ContactSettingsIn, db: Session = Depends(get_db),
+                            user: User = Depends(require_role("ADMIN"))):
+    """Persist the four channels in one transaction and audit what actually changed.
+
+    The API is the validation boundary, not the form: the same request can be made with curl.
+    Extra entries already stored in the phone/email lists are kept behind the new primary one
+    so an office with two numbers does not lose the second by editing the first.
+    """
+    row = _settings_row(db)
+    before = contact_payload(row)
+
+    old_phones = [str(p) for p in (row.phones or []) if str(p).strip()]
+    old_emails = [str(e) for e in (row.emails or []) if str(e).strip()]
+    extras = ([p for p in body.extra_phones if p != body.primary_phone]
+              if body.extra_phones is not None
+              else [p for p in old_phones if p != body.primary_phone])
+    extra_mails = ([e for e in body.extra_emails if e != body.email]
+                   if body.extra_emails is not None
+                   else [e for e in old_emails if e != body.email])
+    row.phones = [body.primary_phone] + extras
+    row.emails = [body.email] + extra_mails
+    row.whatsapp_number = body.whatsapp_number
+    row.whatsapp_enabled = body.whatsapp_enabled
+    row.facebook_page_url = body.facebook_url
+    if body.office_address is not None:
+        row.office_address = body.office_address
+    if body.office_hours is not None:
+        row.office_hours = body.office_hours
+    if body.whatsapp_message is not None:
+        row.whatsapp_default_message = body.whatsapp_message
+
+    after = contact_payload(row)
+    changed = {k: {"from": before.get(k), "to": after.get(k)}
+               for k in ("primary_phone", "whatsapp_number", "email", "facebook_url")
+               if before.get(k) != after.get(k)}
+    db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="UPDATE_CONTACT_SETTINGS",
+                    entity_type="site_settings", entity_id=1, detail={"changed": changed}))
+    db.commit()
+    db.refresh(row)
+    return contact_payload(row)
+
+
+@router.get("/settings")
+def admin_settings(db: Session = Depends(get_db), user: User = Depends(require_role("ADMIN"))):
+    return {c.name: getattr(_settings_row(db), c.name) for c in SiteSetting.__table__.columns}
+
+
+SETTINGS_READ_ONLY = {"id", "created_at", "updated_at"}
+# Values that end up in an href, a tel:/mailto: attribute or a rendered embed. They are
+# scheme- and format-checked here because this endpoint is reachable with curl, not just
+# through the form that happens to have a validation message.
+SETTINGS_URL_FIELDS = {
+    "facebook_page_url", "messenger_url", "instagram_url", "linkedin_url", "youtube_url",
+    "tiktok_url", "x_url", "logo_url", "favicon_url", "default_og_image", "map_embed_url",
+}
+
+
+def _validate_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise a generic settings payload, or reject it with a readable 422.
+
+    Unknown or read-only keys are dropped rather than written: the old implementation set any
+    attribute that happened to exist on the row, which is how ``javascript:`` reached an
+    ``<a href>`` on every page. ``(field, reason)`` pairs are surfaced as the HTTP error.
+    """
+    columns = {c.name for c in SiteSetting.__table__.columns} - SETTINGS_READ_ONLY
+    clean: Dict[str, Any] = {}
+    problems: list[Dict[str, str]] = []
+    for key, value in payload.items():
+        if key not in columns:
+            continue
+        try:
+            if key == "phones":
+                clean[key] = validation.normalize_phone_list(value or [], field="Phone number")
+            elif key == "emails":
+                clean[key] = validation.normalize_email_list(value or [], field="Email address")
+            elif key == "whatsapp_number":
+                text = str(value or "").strip()
+                clean[key] = validation.normalize_phone(text, field="WhatsApp number") if text else None
+            elif key == "facebook_page_url":
+                text = str(value or "").strip()
+                clean[key] = validation.normalize_facebook_url(text) if text else None
+            elif key in SETTINGS_URL_FIELDS:
+                text = str(value or "").strip()
+                clean[key] = (validation.normalize_https_url(text, field=key.replace("_", " "),
+                                                             allow_http=key == "map_embed_url")
+                              if text else None)
+            else:
+                clean[key] = value
+        except ValueError as exc:
+            problems.append({"field": key, "message": str(exc)})
+    if problems:
+        raise HTTPException(status_code=422, detail=problems)
+    return clean
 
 
 @router.put("/settings")
 def update_settings(payload: Dict[str, Any], db: Session = Depends(get_db),
                     user: User = Depends(require_role("ADMIN"))):
-    row = db.get(SiteSetting, 1)
-    for k, v in payload.items():
-        if hasattr(row, k) and k not in ("id", "created_at"):
-            setattr(row, k, v)
+    """Every editable setting in one write, validated and audited field by field."""
+    row = _settings_row(db)
+    clean = _validate_settings_payload(payload)
+    changed = {k: {"from": getattr(row, k), "to": v}
+               for k, v in clean.items() if getattr(row, k) != v}
+    for k, v in clean.items():
+        setattr(row, k, v)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="UPDATE_SETTINGS",
-                    entity_type="site_settings", entity_id=1, detail={"fields": list(payload)}))
+                    entity_type="site_settings", entity_id=1,
+                    detail={"fields": sorted(changed), "count": len(changed)}))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "changed": sorted(changed)}
 
 
 # ------------------------------------------------------------------ generic CRUD
+# Columns that must never appear in an API response. Keyed by model so that adding a resource
+# to RESOURCES cannot silently leak a new secret: a model without an entry keeps every column.
+SECRET_COLUMNS: Dict[Any, frozenset] = {
+    User: frozenset({"password_hash", "mfa_secret", "mfa_recovery_codes"}),
+}
+
+
 def _model(resource: str):
     if resource not in RESOURCES:
         raise HTTPException(404, f"Unknown resource '{resource}'")
@@ -285,7 +539,17 @@ def _model(resource: str):
 
 
 def _row_to_dict(row) -> Dict[str, Any]:
-    return {c.name: S._dt(getattr(row, c.name)) for c in row.__table__.columns}
+    """Serialise one row for the back office, minus the columns that are secrets.
+
+    ``users`` is the row type where this matters: ``password_hash`` is an offline-crackable
+    credential, ``mfa_secret`` is the TOTP seed and ``mfa_recovery_codes`` are the single-use
+    codes printed at enrolment. Together they are the whole account, so they never travel to a
+    browser - not to an ADMIN and not to any other staff role that may read this endpoint. The
+    fields stay write-only: passwords arrive through create/update and are stored as a hash.
+    """
+    hidden = SECRET_COLUMNS.get(type(row), frozenset())
+    return {c.name: S._dt(getattr(row, c.name))
+            for c in row.__table__.columns if c.name not in hidden}
 
 
 @router.get("/resources")
@@ -328,6 +592,21 @@ def _assert_writable(resource: str) -> None:
         raise HTTPException(405, f"'{resource}' is an immutable audit record and cannot be modified.")
 
 
+def _checked_password(password: Any) -> str:
+    """Apply the staff-password policy before anything is hashed or stored.
+
+    The generic CRUD form is not a validation boundary - anyone can POST here directly - so the
+    policy is enforced on the way in. A rejected password is never stored: the 422 is raised
+    before the row is built or the hash is replaced.
+    """
+    from app.core.passwords import password_policy_error
+
+    error = password_policy_error(password)
+    if error:
+        raise HTTPException(422, error)
+    return str(password)
+
+
 @router.post("/{resource}")
 def create_row(resource: str, payload: Dict[str, Any], db: Session = Depends(get_db),
                user: User = Depends(require_staff)):
@@ -337,7 +616,8 @@ def create_row(resource: str, payload: Dict[str, Any], db: Session = Depends(get
         data["slug"] = slugify(str(data[slug_field]))
     if model is User and payload.get("password"):
         from app.core.security import hash_password
-        data["password_hash"] = hash_password(payload["password"])
+        data.pop("password", None)
+        data["password_hash"] = hash_password(_checked_password(payload["password"]))
     row = model(**data)
     db.add(row)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="CREATE", entity_type=resource))
@@ -356,7 +636,7 @@ def update_row(resource: str, row_id: int, payload: Dict[str, Any], db: Session 
         raise HTTPException(404, "Not found")
     if model is User and payload.get("password"):
         from app.core.security import hash_password
-        row.password_hash = hash_password(payload.pop("password"))
+        row.password_hash = hash_password(_checked_password(payload.pop("password")))
     for k, v in payload.items():
         if hasattr(row, k) and k not in ("id", "created_at"):
             setattr(row, k, v)

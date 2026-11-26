@@ -736,8 +736,13 @@ export function SecurityPanel() {
   const [enrolment, setEnrolment] = useState<Dict | null>(null);
   const [code, setCode] = useState("");
   const [codes, setCodes] = useState<string[] | null>(null);
+  const [regenCode, setRegenCode] = useState("");
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [resetMsg, setResetMsg] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const me = useResource("/auth/me");
 
   const start = async () => {
     setBusy(true); setMsg("");
@@ -755,6 +760,37 @@ export function SecurityPanel() {
       setEnrolment(null); setCode("");
       reload();
     } catch (e: any) { setMsg(e?.message ?? "That code was not accepted."); }
+    finally { setBusy(false); }
+  };
+
+  const regenerate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setMsg("");
+    try {
+      const res = await adminFetch<Dict>("/auth/mfa/recovery-codes/regenerate", {
+        method: "POST", body: JSON.stringify({ code: regenCode }),
+      });
+      setCodes(res.recovery_codes ?? []);
+      setRegenCode("");
+      reload();
+    } catch (e: any) { setMsg(e?.message ?? "Could not regenerate the recovery codes."); }
+    finally { setBusy(false); }
+  };
+
+  const resetOther = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setResetMsg("");
+    try {
+      const found = await adminFetch<Dict>(`/users?q=${encodeURIComponent(resetEmail)}&page_size=5`);
+      const items: Dict[] = found.items ?? [];
+      const target = items.find((u) => String(u.email).toLowerCase() === resetEmail.trim().toLowerCase());
+      if (!target) throw new Error("No staff account matches that email address.");
+      const res = await adminFetch<Dict>("/auth/mfa/reset", {
+        method: "POST", body: JSON.stringify({ user_id: target.id, code: resetCode }),
+      });
+      setResetMsg(res.message ?? "Two-factor authentication was reset.");
+      setResetCode("");
+    } catch (e: any) { setResetMsg(e?.message ?? "Could not reset that account."); }
     finally { setBusy(false); }
   };
 
@@ -793,6 +829,12 @@ export function SecurityPanel() {
         {enrolment && (
           <form onSubmit={confirm} className="mt-4 space-y-3">
             <p className="text-sm text-slate-700">{enrolment.instructions}</p>
+            {typeof enrolment.qr_data_uri === "string" && enrolment.qr_data_uri.startsWith("data:") && (
+              <div className="flex justify-center rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                {/* Data-URI SVG from the API, so an <img> cannot be talk back to a remote host. */}
+                <img src={enrolment.qr_data_uri} alt="Two-factor setup QR code" width={200} height={200} />
+              </div>
+            )}
             <div className="rounded-xl bg-slate-900 p-4">
               <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Setup key</p>
               <p className="mt-1 break-all font-mono text-sm font-bold text-emerald-300">{enrolment.manual_entry}</p>
@@ -823,9 +865,65 @@ export function SecurityPanel() {
             <ul className="mt-3 grid grid-cols-2 gap-1.5 font-mono text-sm font-bold text-amber-950">
               {codes.map((c) => <li key={c} className="rounded bg-white/70 px-2 py-1 text-center">{c}</li>)}
             </ul>
+            <button type="button" onClick={() => setCodes(null)}
+              className="mt-3 text-[11px] font-semibold text-amber-900 underline">
+              I have saved them
+            </button>
           </div>
         )}
+
+        {data.enrolled && (
+          <form onSubmit={regenerate} className="mt-5 border-t border-slate-200 pt-4">
+            <p className="text-sm font-bold text-slate-800">Replace your recovery codes</p>
+            <p className="mt-1 text-[11px] text-slate-600">
+              Use this after a code is used, or if the list may have been seen. All existing codes
+              stop working immediately. Confirm with a current 6-digit code.
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <input value={regenCode} onChange={(e) => setRegenCode(e.target.value)} inputMode="numeric" maxLength={6}
+                placeholder="123456" aria-label="Current 6-digit code"
+                className="w-32 rounded-xl border border-slate-300 px-3 py-2 text-center font-mono tracking-[0.2em]" />
+              <button type="submit" disabled={busy || regenCode.length !== 6}
+                className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-bold text-slate-800 disabled:opacity-50">
+                Regenerate codes
+              </button>
+            </div>
+          </form>
+        )}
       </Panel>
+
+      {me.data?.role === "ADMIN" && (
+        <Panel title="Reset another staff member's two-factor">
+          <p className="mb-3 text-[11px] leading-relaxed text-slate-600">
+            For a lost phone <em>and</em> lost recovery codes. The account keeps its password and must
+            register a new authenticator at its next sign-in.
+          </p>
+          <form onSubmit={resetOther} className="grid gap-3 sm:grid-cols-2">
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Staff email</span>
+              <input type="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} required
+                placeholder="counselor@example.com"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Your own code</span>
+              <input value={resetCode} onChange={(e) => setResetCode(e.target.value)} required inputMode="numeric"
+                placeholder="Your 6-digit code" autoComplete="one-time-code"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 font-mono text-sm tracking-[0.15em]" />
+            </label>
+            <div className="sm:col-span-2 flex flex-wrap items-center gap-3">
+              <button type="submit" disabled={busy}
+                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">
+                Reset their two-factor
+              </button>
+              <span className="text-[11px] text-slate-500">The account holder is notified, and the reset is audited.</span>
+            </div>
+          </form>
+          {resetMsg && (
+            <p className="mt-3 rounded-lg bg-slate-100 p-3 text-xs text-slate-700">{resetMsg}</p>
+          )}
+        </Panel>
+      )}
 
       <p className="rounded-xl bg-slate-100 p-4 text-[11px] leading-relaxed text-slate-600">
         Codes are time-based (TOTP, 30-second window) and work with Google Authenticator, Authy, 1Password

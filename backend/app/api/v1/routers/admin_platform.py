@@ -29,7 +29,8 @@ from app.core import llm, runtime
 from app.core.database import get_db
 from app.core.deps import require_role
 from app.models.crm import AuditLog, DataVerification, ImportBatch, ImportRow, User
-from app.services import importer, readiness, retrieval, source_verification
+from app.services import email as email_service
+from app.services import email_templates, importer, readiness, retrieval, source_verification
 
 router = APIRouter()
 
@@ -93,12 +94,17 @@ def _fail(label: str, detail: str, **extra: Any) -> Dict[str, Any]:
 
 @router.post("/config/test/{target}")
 def test_integration(target: str, db: Session = Depends(get_db),
-                     user: User = Depends(require_role("ADMIN"))):
+                     user: User = Depends(require_role("ADMIN")),
+                     body: Optional[Dict[str, Any]] = Body(default=None)):
     """Prove a credential actually works, from the server, right now.
 
     A saved token that is wrong is worse than no token, because the failure shows up later
     as a silently undelivered message. Each test performs the cheapest real call the vendor
     offers and reports the verbatim error on failure.
+
+    ``smtp`` is the exception that needs a body: an empty ``{}`` proves the connection and the
+    credentials, and ``{"to": "<your own address>"}`` also sends one message. The recipient
+    must be the caller's own account, so this can never be used to mail an arbitrary address.
     """
     from app.core.config import settings  # dynamic view, DB overlay on
     target = target.lower()
@@ -106,6 +112,38 @@ def test_integration(target: str, db: Session = Depends(get_db),
     db.commit()
 
     try:
+        if target == "smtp":
+            state = email_service.status()
+            if not state["configured"]:
+                return _fail("Email (SMTP)", state["reason"] or "SMTP is not configured.",
+                             status=state)
+            if not body or not body.get("to"):
+                probe = email_service.verify_connection()
+                if probe.ok:
+                    return _ok("Email (SMTP)",
+                               f"Connected to {state['host']}:{state['port']} over "
+                               f"{state['security']} as {state['username']}. "
+                               "Send a test message to confirm delivery end to end.",
+                               status=state)
+                return _fail("Email (SMTP)", probe.error or "connection failed", status=state)
+
+            requested = str(body.get("to") or "").strip().lower()
+            if requested != (user.email or "").strip().lower():
+                # No open relay: the owner verifies their own mailbox, nobody else's.
+                return _fail("Email (SMTP)",
+                             "A test message can only be sent to your own account address "
+                             f"({user.email}).")
+            rendered = email_templates.test_message(to=user.email, triggered_by=user.email)
+            sent = email_service.send(user.email, rendered.subject, rendered.text, rendered.html)
+            if sent.ok:
+                return _ok("Email (SMTP)",
+                           f"The mail server accepted the message for "
+                           f"{email_service.mask_email(user.email)} on attempt {sent.attempts}. "
+                           "Check that mailbox (and its spam folder) to confirm the last mile.",
+                           status=state, attempts=sent.attempts)
+            return _fail("Email (SMTP)", sent.error or "send failed",
+                         status=state, attempts=sent.attempts)
+
         if target == "whatsapp":
             token = (settings.whatsapp_access_token or "").strip()
             phone_id = (settings.whatsapp_phone_number_id or "").strip()

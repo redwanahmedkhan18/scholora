@@ -93,10 +93,11 @@ def test_mfa_enrolment_flow_and_login_gate(client, api, auth):
     assert step1.get("mfa_required") is True
     assert "access_token" not in step1
 
-    # The challenge accepts a TOTP…
+    # The challenge accepts a TOTP. A code is single-use, and confirming enrolment already spent
+    # the current 30-second step, so this asks for the next step (still inside the drift window).
     ok = client.post(f"{api}/admin/auth/mfa/challenge", json={
         "email": "mfa.flow@scholara.com.bd", "password": "Testing@12345",
-        "code": mfa.current_code(secret),
+        "code": mfa.current_code(secret, time.time() + 30),
     })
     assert ok.status_code == 200 and ok.json()["access_token"]
 

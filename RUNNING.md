@@ -4,7 +4,7 @@ Two parts: **local development** and **production**. Every command below has bee
 against this codebase; the gotchas in each section are failures that actually happened,
 not hypotheticals.
 
-Companion: `ARCHITECTURE.md`, and `docs/08-deployment-security-and-roadmap.md` for the
+Companion: `ARCHITECTURE.md`. The deployment runbook in the local `docs/` working copy covers the
 longer-form deployment discussion.
 
 ---
@@ -71,7 +71,7 @@ ENVIRONMENT=development
 Migrate and seed:
 
 ```bash
-alembic upgrade head              # 48 tables
+alembic upgrade head              # 47 tables (+ alembic_version)
 python3 -m app.seed               # demo content, users, homepage slides
 ./../scripts/load-reference-data.sh   # countries, universities, programmes, scholarships
 ```
@@ -88,9 +88,20 @@ python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ```bash
 cd backend
-python3 -m celery -A app.services.tasks:celery_app worker --pool=threads --concurrency=2
+python3 -m celery -A app.services.tasks:celery_app worker --pool=prefork --concurrency=2
 python3 -m celery -A app.services.tasks:celery_app beat        # scheduled jobs
 ```
+
+> **Use `--pool=prefork`, not `--pool=threads`.** Prefork gives you real worker recycling and
+> supports `task_reject_on_worker_lost`, which requeues work when a child process dies — none of
+> which a thread pool can offer. The working copy also configures a 900 s hard / 780 s soft time
+> limit, which Celery enforces *only* through prefork: measured there, a 20 s task with a 5 s hard
+> limit completed normally under `--pool=threads` and was never killed. **This commit sets no time
+> limits**, so prefork here is a recommendation about recycling, not about enforcement.
+>
+> Whatever the pool, delivery is **at-least-once**: a crashed worker's task is restored after
+> `visibility_timeout` (1800 s) and runs again. Every job is therefore written to be idempotent,
+> and `tests/test_tasks.py` runs the whole schedule twice to keep it that way.
 
 ## 1.5 Frontend
 
@@ -117,7 +128,14 @@ directly, because the user's browser is not inside your network.
 MFA code for the seeded dev secret: `./scripts/mfa-code.sh [email]`
 Student portal demo token: `demo-student`
 
-**Change every one of these before any public deployment.**
+**Change every one of these before any public deployment.** These accounts and that script do
+not exist in a production environment: `seed.py` skips them when `ENVIRONMENT=production`, the
+script refuses to run there, and migration `a7b8c9d0e1f2` clears any account still holding one
+of the published TOTP secrets. Provision real staff with `python -m app.mgmt_admin --create-admin`.
+
+The admin sign-in screen no longer prints these credentials; the hint is compiled out of a
+production build. Enrolment now shows a QR code, and the security panel can regenerate recovery
+codes or reset another staff member's second factor.
 
 ## 1.7 Running with no third-party credentials
 
@@ -130,9 +148,32 @@ Fully supported and the default. Each integration degrades to a defined behaviou
 | Facebook Page | page panel shows "not connected" |
 | Grok / Mistral / Gemini | assistant + extraction use the deterministic path |
 | Analytics IDs | placeholder values (`G-XXXXXXXXXX`) load no scripts at all |
+| Gmail SMTP | security notices stay in the staff inbox (`status=QUEUED`, reason on the row); startup logs `email disabled: ...` |
 
 Verify from the admin UI: **Platform → Test connection** (`/config/test/{target}` for
-`whatsapp`, `meta_capi`, `facebook_page`, `embeddings`, `llm`).
+`whatsapp`, `meta_capi`, `facebook_page`, `embeddings`, `llm`, `smtp`).
+
+### Enabling email locally
+
+```bash
+# backend/.env (never commit it)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your.address@gmail.com     # a Google App Password, not the account password
+SMTP_PASSWORD=abcd efgh ijkl mnop
+SMTP_FROM_NAME=Scholara
+```
+
+Then, instead of guessing:
+
+```bash
+cd backend
+python -m app.mgmt_admin --email-status                    # config + live login, sends nothing
+python -m app.mgmt_admin --send-test-email you@example.org  # one real message
+```
+
+Full detail, including the Gmail App Password steps and the sending limits:
+the email chapter of the local `docs/` working copy.
 
 ## 1.8 Everything at once
 
@@ -144,12 +185,26 @@ chmod +x scripts/*.sh      # the execute bit does not always survive a checkout
 ## 1.9 Tests and checks
 
 ```bash
-cd backend && python3 -m pytest           # 253 tests
+cd backend && python3 -m pytest           # 1031 tests on SQLite
 ./scripts/verify-new.sh                   # 63 data/API invariants
 ./scripts/smoke-test.sh                   # every public route
 python3 scripts/check-prerender.py        # 421 prerendered pages return success
 cd frontend && npx tsc --noEmit           # types
 ```
+
+A SQLite run skips the tests that need a real server. This commit carries no PostgreSQL or live
+Redis test module and no `SCHOLARA_REQUIRE_*` switches — those live in the wider working copy,
+which is where you run:
+
+```bash
+export SCHOLARA_TEST_DATABASE_URL='postgresql+psycopg://user:pw@127.0.0.1:5432/disposable_db'
+export SCHOLARA_REQUIRE_PG_TESTS=1 SCHOLARA_REQUIRE_REDIS_TESTS=1   # a skip becomes a failure
+cd backend && python3 -m pytest
+```
+
+The switches matter because a skipped test and a passing test look identical in a summary, so a job
+could "pass" while proving nothing. **No CI workflow is part of this commit**; `.github/workflows/`
+is added later in the working copy.
 
 ---
 
@@ -198,6 +253,7 @@ S3_ACCESS_KEY=...  S3_SECRET_KEY=...
 SIGNED_URL_TTL_SECONDS=300
 
 MFA_REQUIRED_ROLES=ADMIN,SENIOR_COUNSELOR,DATA_MANAGER
+MFA_CHALLENGE_TTL_SECONDS=300
 RATE_LIMIT_ENABLED=true
 SCHEDULER_ENABLED=true
 ```
@@ -213,7 +269,14 @@ GA4_MEASUREMENT_ID=         GOOGLE_ADS_CONVERSION_ID=
 GOOGLE_SITE_VERIFICATION=
 XAI_API_KEY=                MISTRAL_API_KEY=       GEMINI_API_KEY=
 LLM_PROVIDER_ORDER=grok,mistral,gemini
+SMTP_HOST=smtp.gmail.com    SMTP_PORT=587
+SMTP_USER=                  SMTP_PASSWORD=          # Google App Password
+SMTP_FROM_EMAIL=            SMTP_FROM_NAME=Scholara
 ```
+
+Set the SMTP variables on **both** the API and the worker service: the API sends the
+security notices, and a worker that raises notifications needs the same credentials. Confirm
+from the deployed shell with `python -m app.mgmt_admin --email-status`.
 
 Most of these can also be set from **Admin → Platform settings** without a redeploy —
 21 keys across 5 groups, stored encrypted and returned masked.
@@ -245,11 +308,13 @@ npm run start      # or a Node process manager
 
 ```bash
 # Workers
-celery -A app.services.tasks:celery_app worker --pool=threads --concurrency=4 --loglevel=info
+celery -A app.services.tasks:celery_app worker --pool=prefork --concurrency=4 --loglevel=info
 celery -A app.services.tasks:celery_app beat --loglevel=info
 ```
 
-Run exactly **one** beat process. Two will double-send deadline reminders to students.
+Run exactly **one** beat process. Reminders are de-duplicated per entity per day, so a second beat
+no longer double-sends them, but it still duplicates work, competes for the same rows and makes the
+schedule harder to reason about.
 
 ### systemd sketch
 
@@ -329,8 +394,8 @@ curl -X POST .../api/v1/admin/verification/sources/check -H "Authorization: Bear
 # The human verification queue
 curl .../api/v1/admin/verification/queue -H "Authorization: Bearer $TOKEN"
 
-# Citation depth audit → docs/citation-diff.md
-cd backend && python3 scripts/verify_citations.py
+# Provenance rows for one entity type
+curl ".../api/v1/admin/verification/queue" -H "Authorization: Bearer $TOKEN"
 
 # Rebuild the knowledge index (refits the local LSA model)
 curl -X POST .../api/v1/admin/embeddings/reindex -H "Authorization: Bearer $TOKEN"
@@ -339,8 +404,9 @@ curl -X POST .../api/v1/admin/embeddings/reindex -H "Authorization: Bearer $TOKE
 Reindex after any bulk import. Retrieval scores are only comparable within one fitted
 model, so stale vectors degrade search quietly rather than loudly.
 
-Backups: nightly `pg_dump`, plus the object store. The database holds all 4,551
-provenance records — losing it loses the evidence trail, not just the content.
+Backups: nightly `pg_dump`, plus the object store. The database holds the provenance register —
+one row per verified field, three of them from the demo seed and the rest written by imports — so
+losing a backup loses the evidence trail, not just the content.
 
 ## 2.6 Troubleshooting
 

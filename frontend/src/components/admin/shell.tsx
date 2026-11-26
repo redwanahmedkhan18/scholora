@@ -128,16 +128,34 @@ function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
-  const [stage, setStage] = useState<"password" | "mfa" | "enrol" | "recovery">("password");
+  const [stage, setStage] = useState<"password" | "mfa" | "enrol" | "recovery" | "lost">("password");
   // Set when the account is forced to enrol: a token that may only call the MFA set-up
   // endpoints, plus the secret to show the user and the recovery codes handed back on success.
   const [enrolToken, setEnrolToken] = useState("");
   const [enrolSecret, setEnrolSecret] = useState("");
   const [enrolUri, setEnrolUri] = useState("");
+  const [enrolQr, setEnrolQr] = useState("");
+  // Step two is finished with this scoped token, never by re-posting the password.
+  const [challenge, setChallenge] = useState("");
   const [recovery, setRecovery] = useState<string[]>([]);
   const [pending, setPending] = useState<{ token: string; user: any } | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  /** Fetch a fresh secret + QR for the current enrolment token and show the setup screen. */
+  const startEnrolment = async (token: string) => {
+    const enr = await fetch("/api/v1/admin/auth/mfa/enroll", {
+      method: "POST", headers: { Authorization: `Bearer ${token}` },
+    });
+    const info = await enr.json().catch(() => ({}));
+    if (!enr.ok) throw new Error(typeof info?.detail === "string" ? info.detail : "Could not start two-factor set-up.");
+    setEnrolToken(token);
+    setEnrolSecret(info.manual_entry ?? info.secret ?? "");
+    setEnrolUri(info.otpauth_url ?? "");
+    setEnrolQr(info.qr_data_uri ?? "");
+    setCode("");
+    setStage("enrol");
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -159,16 +177,46 @@ function Login() {
         return;
       }
 
-      const path = stage === "mfa" ? "/api/v1/admin/auth/mfa/challenge" : "/api/v1/admin/auth/login";
-      const res = await fetch(path, {
+      // Lost authenticator: password plus one unused recovery code, then re-enrol.
+      if (stage === "lost") {
+        const res = await fetch("/api/v1/admin/auth/mfa/recover", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password, recovery_code: code.trim() }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(typeof data?.detail === "string" ? data.detail
+            : "That recovery code was not accepted. Try another one.");
+        }
+        await startEnrolment(data.access_token as string);
+        return;
+      }
+
+      if (stage === "mfa") {
+        const res = await fetch("/api/v1/admin/auth/mfa/challenge", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ challenge_token: challenge, code: code.trim() }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(typeof data?.detail === "string" ? data.detail : "That code was not accepted.");
+        }
+        setSession(data.access_token, data.user);
+        return;
+      }
+
+      const res = await fetch("/api/v1/admin/auth/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(stage === "mfa" ? { email, password, code } : { email, password }),
+        body: JSON.stringify({ email, password }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data?.detail === "string" ? data.detail : "Invalid email or password.");
 
-      // Step 1 succeeded but the account has an authenticator enrolled.
-      if (data.mfa_required && !data.access_token) {
+      // Step 1 succeeded but the account has an authenticator enrolled. Only a scoped,
+      // short-lived challenge token comes back - no session until the code is verified.
+      if (data.mfa_required) {
+        setChallenge(data.challenge_token ?? "");
+        setCode("");
         setStage("mfa");
         setErr("");
         return;
@@ -178,17 +226,7 @@ function Login() {
       // only opens the enrolment endpoints, so it must not be stored as a session - doing so
       // would produce a dashboard that 403s on every panel with no explanation.
       if (data.mfa_enrolment_required) {
-        const token = data.access_token as string;
-        const enr = await fetch("/api/v1/admin/auth/mfa/enroll", {
-          method: "POST", headers: { Authorization: `Bearer ${token}` },
-        });
-        const info = await enr.json().catch(() => ({}));
-        if (!enr.ok) throw new Error(typeof info?.detail === "string" ? info.detail : "Could not start MFA set-up.");
-        setEnrolToken(token);
-        setEnrolSecret(info.manual_entry ?? info.secret ?? "");
-        setEnrolUri(info.otpauth_url ?? "");
-        setCode("");
-        setStage("enrol");
+        await startEnrolment(data.access_token as string);
         return;
       }
 
@@ -225,11 +263,17 @@ function Login() {
         ) : stage === "enrol" ? (
           <div className="mt-6">
             <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900 ring-1 ring-amber-200">
-              Two-factor authentication is required for this role and has not been set up yet.
-              Add the key below to Google Authenticator, Authy or 1Password, then enter the code
-              it shows.
+              {enrolQr
+                ? "Two-factor authentication is required for this role. Scan the code below with Google Authenticator, Microsoft Authenticator, Authy or 1Password, then enter the 6-digit code it shows."
+                : "Two-factor authentication is required for this role. Add the setup key below to your authenticator app, then enter the 6-digit code it shows."}
             </p>
             <div className="mt-3 rounded-xl bg-slate-50 p-3">
+              {enrolQr && (
+                <div className="mb-3 flex justify-center rounded-lg bg-white p-2">
+                  {/* A data-URI SVG: an <img> cannot execute it, unlike injected markup. */}
+                  <img src={enrolQr} alt="Two-factor setup QR code" width={180} height={180} />
+                </div>
+              )}
               <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Setup key</p>
               <p className="mt-1 break-all font-mono text-[13px] font-semibold text-slate-900">{enrolSecret}</p>
               {enrolUri && (
@@ -258,22 +302,49 @@ function Login() {
                 className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-brand-600" />
             </label>
           </>
+        ) : stage === "lost" ? (
+          <div className="mt-6">
+            <p className="rounded-lg bg-brand-50 p-3 text-xs text-brand-900">
+              Enter one of the recovery codes you saved when you set up two-factor for{" "}
+              <strong>{email}</strong>. The code is used up immediately and you will register a
+              new authenticator straight after.
+            </p>
+            <label className="mt-3 block">
+              <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Recovery code</span>
+              <input value={code} onChange={(e) => setCode(e.target.value)} required autoFocus
+                placeholder="xxxx-xxxx-xxxx"
+                className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-center font-mono text-sm tracking-wider outline-none focus:border-brand-600" />
+            </label>
+            <button type="button"
+              onClick={() => { setStage("mfa"); setCode(""); setErr(""); }}
+              className="mt-2 text-[11px] font-semibold text-slate-500 underline">
+              I still have my authenticator
+            </button>
+          </div>
         ) : (
           <div className="mt-6">
             <p className="rounded-lg bg-brand-50 p-3 text-xs text-brand-900">
-              Two-factor is enabled for <strong>{email}</strong>. Enter the 6-digit code from your
-              authenticator app, or one of your recovery codes.
+              Two-factor is enabled for <strong>{email}</strong>. Open your authenticator app and
+              enter the current 6-digit code, or one of your recovery codes.
             </p>
             <label className="mt-3 block">
               <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Authentication code</span>
-              <input value={code} onChange={(e) => setCode(e.target.value)} required autoFocus autoComplete="one-time-code"
-                placeholder="123456"
+              <input value={code} onChange={(e) => setCode(e.target.value)} required autoFocus
+                autoComplete="one-time-code" placeholder="123456"
                 className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-center font-mono text-lg tracking-[0.25em] outline-none focus:border-brand-600" />
             </label>
-            <button type="button" onClick={() => { setStage("password"); setCode(""); setErr(""); }}
-              className="mt-2 text-[11px] font-semibold text-slate-500 underline">
-              Use a different account
-            </button>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+              <button type="button"
+                onClick={() => { setStage("lost"); setCode(""); setErr(""); }}
+                className="text-[11px] font-semibold text-brand-800 underline">
+                Lost your authenticator?
+              </button>
+              <button type="button"
+                onClick={() => { setStage("password"); setCode(""); setChallenge(""); setErr(""); }}
+                className="text-[11px] font-semibold text-slate-500 underline">
+                Use a different account
+              </button>
+            </div>
           </div>
         )}
 
@@ -290,18 +361,37 @@ function Login() {
             {busy
               ? (stage === "password" ? "Signing in…" : "Verifying…")
               : stage === "mfa" ? "Verify and continue"
+              : stage === "lost" ? "Use this recovery code"
               : stage === "enrol" ? "Activate two-factor"
               : "Sign in"}
           </button>
         )}
 
-        <p className="mt-4 rounded-lg bg-slate-50 p-3 text-[11px] leading-relaxed text-slate-600">
-          Demo credentials: <strong>admin@scholara.com.bd</strong> / <strong>Admin@12345</strong>.
-          ADMIN and SENIOR_COUNSELOR require a second factor — run{" "}
-          <code className="rounded bg-slate-200 px-1 py-0.5">scripts/mfa-code.sh</code> to get the
-          current code for the seeded accounts. Change these credentials before going live.
-        </p>
+        <DevLoginHint />
       </form>
     </div>
+  );
+}
+
+/**
+ * Development-only sign-in hint.
+ *
+ * This used to be unconditional text on the sign-in screen: it printed the seeded
+ * administrator's email and password and pointed the reader at a repository helper script that
+ * minted a second factor from a published secret. Both belong to a throwaway local database, and
+ * a deployed site must show neither. `process.env.NODE_ENV` is inlined at build time, so in a
+ * production build this branch becomes `false` and the text is not in the bundle at all - it is
+ * not hidden with CSS, and no environment variable can switch it back on.
+ */
+function DevLoginHint() {
+  if (process.env.NODE_ENV !== "development") return null;
+  return (
+    <p className="mt-4 rounded-lg border border-dashed border-amber-300 bg-amber-50 p-3 text-[11px] leading-relaxed text-amber-900">
+      <strong>Local development only.</strong> The development seed creates{" "}
+      <code className="rounded bg-amber-200/60 px-1">admin@scholara.com.bd</code> with a published
+      password and TOTP secret, both listed at the top of{" "}
+      <code className="rounded bg-amber-200/60 px-1">backend/app/seed_data.py</code>. Add the secret
+      to any authenticator app to sign in. Never use these credentials on a deployed site.
+    </p>
   );
 }

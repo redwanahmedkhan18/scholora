@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { getSettings } from "@/lib/api";
+import { contactFromSettings } from "@/lib/contact";
 import { AppointmentForm } from "@/components/forms";
 import { PageHeader } from "@/components/ui";
 
@@ -14,6 +15,7 @@ export const metadata: Metadata = {
 
 export default async function AppointmentsPage() {
   const settings = await getSettings();
+  const contact = contactFromSettings(settings);
 
   return (
     <>
@@ -41,7 +43,7 @@ export default async function AppointmentsPage() {
               <h2 className="text-base font-bold text-slate-900">Where to find us</h2>
               <p className="mt-2 text-sm text-slate-700">{settings.office_address}</p>
               <p className="mt-1 text-sm text-slate-600">{settings.office_hours}</p>
-              {settings.phones?.[0] && <p className="mt-2 text-sm"><a href={`tel:${settings.phones[0]}`} className="font-semibold text-brand-800">{settings.phones[0]}</a></p>}
+              {contact.telHref && <p className="mt-2 text-sm"><a href={contact.telHref} className="font-semibold text-brand-800">{contact.phoneDisplay}</a></p>}
             </div>
             <div className="card bg-brand-950 p-6 text-white">
               <h2 className="text-base font-bold">Come prepared</h2>

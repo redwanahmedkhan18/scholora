@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { adminFetch } from "@/lib/admin";
+import { adminFetch, getToken } from "@/lib/admin";
+import ContactSettingsCard from "@/components/admin/contact-settings";
 
 type Dict = Record<string, any>;
 
@@ -30,6 +31,22 @@ export default function SettingsEditor() {
 
   const set = (k: string, v: any) => setForm((f) => ({ ...(f ?? {}), [k]: v }));
 
+  /** Flush the cached pages so a saved value is live immediately rather than in five minutes. */
+  const publish = async () => {
+    const token = getToken();
+    try {
+      const res = await fetch("/api/revalidate", {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      return res.ok
+        ? "Saved and published — the public site is showing the new values now."
+        : "Saved. The public site will refresh within a few minutes.";
+    } catch {
+      return "Saved. The public site will refresh within a few minutes.";
+    }
+  };
+
   const save = async () => {
     setBusy(true); setMsg(""); setErr("");
     try {
@@ -37,7 +54,7 @@ export default function SettingsEditor() {
       ["id", "created_at", "updated_at"].forEach((k) => delete payload[k]);
       await adminFetch<Dict>("/settings", { method: "PUT", body: JSON.stringify(payload) });
       setForm(await adminFetch<Dict>("/settings"));
-      setMsg("Saved. The public site picks the change up at the next revalidation (within a minute).");
+      setMsg(await publish());
     } catch (e: any) {
       setErr(e?.message ?? "Save failed.");
     } finally {
@@ -60,6 +77,8 @@ export default function SettingsEditor() {
           {busy ? "Saving…" : "Save settings"}
         </button>
       </div>
+
+      <ContactSettingsCard />
 
       {msg && <p className="rounded-xl bg-emerald-50 p-3 text-sm text-emerald-800 ring-1 ring-emerald-200">{msg}</p>}
 
@@ -92,6 +111,35 @@ export default function SettingsEditor() {
   );
 }
 
+/**
+ * A list-valued setting ("one per line").
+ *
+ * `defaultValue` plus an `onBlur` commit looked fine until the server normalised a value: the
+ * textarea then kept showing the old text, so the form and the database silently disagreed
+ * about what had been saved. The draft is local and re-seeded whenever the saved value changes.
+ */
+function ArrayField({ name, label, value, onChange }: {
+  name: string; label: string; value: any[]; onChange: (v: any) => void;
+}) {
+  const saved = (value ?? []).join("\n");
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => setDraft(saved), [saved]);
+
+  const commit = () => {
+    const items = draft.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (items.join("\n") !== saved) onChange(items);
+  };
+
+  return (
+    <label className="block">
+      <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{label} (one per line)</span>
+      <textarea value={draft} onChange={(e) => setDraft(e.target.value)} onBlur={commit}
+        aria-label={name}
+        className="min-h-20 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600" />
+    </label>
+  );
+}
+
 function SettingField({ name, value, onChange }: { name: string; value: any; onChange: (v: any) => void }) {
   const label = name.replace(/_/g, " ");
   const base = "w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600";
@@ -105,13 +153,7 @@ function SettingField({ name, value, onChange }: { name: string; value: any; onC
     );
   }
   if (Array.isArray(value)) {
-    return (
-      <label className="block">
-        <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{label} (one per line)</span>
-        <textarea defaultValue={value.join("\n")} onBlur={(e) => onChange(e.target.value.split("\n").map((s) => s.trim()).filter(Boolean))}
-          className={`${base} min-h-20`} />
-      </label>
-    );
+    return <ArrayField name={name} label={label} value={value} onChange={onChange} />;
   }
   const isLong = typeof value === "string" && (value.length > 90 || /about|description|address|message|embed/.test(name));
   const isColor = /color/.test(name);

@@ -9,9 +9,17 @@
 #   scripts/mfa-code.sh                       # default: admin@scholara.com.bd
 #   scripts/mfa-code.sh senior@scholara.com.bd
 #
-# Real deployments must re-enrol through POST /admin/auth/mfa/enroll - the seeded secrets are
-# published in this repository and are therefore public.
+# DEVELOPMENT ONLY. The seeded secrets are published in this repository and are therefore
+# public, so this script refuses to run against a production configuration: a production
+# administrator enrols through the app (Admin -> My security) and, if the device is lost,
+# through the recovery-code flow or `python -m app.mgmt_admin --reset-mfa`.
 set -euo pipefail
+
+if [ "${ENVIRONMENT:-development}" = "production" ]; then
+  echo "Refusing to print MFA codes for a production environment." >&2
+  echo "Use the in-app enrolment/recovery flow, or: python -m app.mgmt_admin --reset-mfa <email>" >&2
+  exit 1
+fi
 
 EMAIL="${1:-admin@scholara.com.bd}"
 cd "$(dirname "$0")/../backend"

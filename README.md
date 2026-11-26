@@ -19,24 +19,95 @@ professor's email address.
 
 | Path | What it is |
 | --- | --- |
-| `backend/` | FastAPI + SQLAlchemy modular monolith. 42 tables under Alembic, 88 API paths, eligibility / costing / matching / rotation / brochure / retrieval / assistant / WhatsApp services, 174 tests. |
-| `frontend/` | Next.js 16 (App Router, React 19, TypeScript, Tailwind v4). Public site + admin control centre. 70 source files. |
-| `docs/` | The written deliverables — requirements, architecture, data model, API reference, data-integrity policy, SEO/ads playbook, admin guide, deployment & roadmap. |
-| `scripts/` | `stack.sh` (full PostgreSQL/Redis/Celery stack), `dev.sh` (zero-infrastructure SQLite run), `smoke-test.sh` (40 routes), `verify-new.sh` (63 live assertions). |
+| `backend/` | FastAPI + SQLAlchemy modular monolith. 47 tables under Alembic, seven routers, eligibility / costing / matching / rotation / brochure / retrieval / assistant / WhatsApp services, 464 tests on SQLite. |
+| `frontend/` | Next.js 16.3 (App Router, React 19, TypeScript, Tailwind v4). Public site + admin control centre. 86 source files, 28 tests. |
+| `docs/` | The written deliverables — requirements, data model, API reference, data-integrity policy, SEO/ads playbook, admin guide, deployment runbook, workstream records. **Local only: excluded from version control and never published.** |
+| `scripts/` | `stack.sh` (full PostgreSQL/Redis/Celery stack), `dev.sh` (zero-infrastructure SQLite run), `smoke-test.sh` (40 routes), `verify-new.sh` (50 live assertions), `check-prerender.py`, `mfa-code.sh`, and `policy-check.py` — the fail-closed guard for the `docs/` and `.env*` exclusion policy. |
 
-### Documents
+### Scope of this commit
 
-| # | Document | Read it for |
-| --- | --- | --- |
-| 01 | [Product requirements](docs/01-product-requirements.md) | Scope, personas, every module and its acceptance criteria |
-| 02 | [System architecture](docs/02-system-architecture.md) | How the pieces fit, request flow, rotation engine, caching |
-| 03 | [Data model](docs/03-data-model.md) | All 42 tables, the verification mixin, enums |
-| 04 | [API reference](docs/04-api-reference.md) | Every endpoint, parameters, response envelopes |
-| 05 | [Data integrity & trust policy](docs/05-data-integrity-and-trust-policy.md) | **The rules that make this platform different.** Confidence states, eligibility verdicts, faculty email policy, AI guardrails |
-| 06 | [SEO, marketing & ads playbook](docs/06-seo-marketing-and-ads-playbook.md) | URL architecture, structured data, Facebook page + Meta Pixel/CAPI, GA4, Google Ads, UTM attribution |
-| 07 | [Admin operations guide](docs/07-admin-operations-guide.md) | Running the CMS day to day, the 30-second homepage rotation, lead pipeline |
-| 08 | [Deployment, security & roadmap](docs/08-deployment-security-and-roadmap.md) | Production stack, env vars, migrations, security controls, testing, phased plan |
-| 09 | [Specification compliance audit](docs/09-specification-compliance.md) | **An honest gap analysis.** 40/40 modules, all 7 named stack technologies adopted, the 5 real bugs that auditing exposed (2 PostgreSQL, 3 requirement-level), the 1 accepted deviation, and why the dataset is still demo content |
+This commit publishes the security work — MFA hardening and replay guarding, the staff password
+policy, transactional email with templates and a delivery log, and admin-managed contact routing.
+It is a snapshot of the wider working copy, not the whole product: the scope resolver, catalogue
+integrity and change review, privacy erasure, the PostgreSQL concurrency suite, the Celery
+hardening (`acks_late`, time limits, `visibility_timeout`) and `.github/workflows/ci.yml` were
+developed afterwards and are **not** part of it. Where a paragraph below describes those, it says
+so. Nothing here depends on them to run.
+
+### Where the written deliverables live
+
+The long-form documents — requirements, data model, API reference, the data-integrity policy, the
+admin guide, the deployment runbook and the workstream records — live in `docs/` **in this
+working copy only**. That directory is deliberately excluded from version control and from
+publication, so it will not appear on GitHub.
+
+What is published is this file and [`ARCHITECTURE.md`](ARCHITECTURE.md). They carry the product
+description, the technology stack, the commands, the environment-variable names and the system
+architecture on their own; nothing published here depends on reading `docs/`.
+
+## How it fits together
+
+```mermaid
+flowchart TB
+    subgraph browser["Trust boundary: the browser"]
+        student["Student / visitor"]
+        staff["Staff (MFA-enforced roles)"]
+    end
+
+    subgraph edge["Frontend — Next.js 16 (App Router, RSC)"]
+        pages["Public pages: SSR / ISR<br/>sitemap · metadata · structured data"]
+        adminui["Admin control centre<br/>client islands + portal hooks"]
+        proxy["Same-origin /api/* proxy<br/>(browser never talks to the API host)"]
+    end
+
+    subgraph api["Backend — FastAPI modular monolith"]
+        routers["7 routers<br/>public · actions · student · integrations · admin ×3"]
+        services["Services: eligibility · costing · matching · rotation<br/>brochure · retrieval · assistant · email<br/>notifications · source verification · readiness"]
+        guard["Guardrails: answer-claim scrubbing · verification policy ·<br/>secret-free serialisation · RBAC"]
+    end
+
+    subgraph data["Stateful dependencies"]
+        pg[("PostgreSQL 16<br/>+ pgvector<br/>47 tables")]
+        cache[("Redis<br/>cache · rate limits · task broker")]
+        worker["Celery worker<br/>(prefork) + beat"]
+    end
+
+    subgraph out["Outbound — every one optional, all degrade locally"]
+        mail["SMTP (STARTTLS)"]
+        wa["WhatsApp Cloud / Meta CAPI"]
+        llm["Grok · Mistral · Gemini"]
+        sites["University websites<br/>(evidence only)"]
+    end
+
+    student --> pages
+    staff --> adminui
+    pages --> proxy
+    adminui --> proxy
+    proxy -->|"HTTP + X-Internal-Token"| routers
+    pages -->|"server-side INTERNAL_API_URL"| routers
+    routers --> guard
+    guard --> services
+    services --> pg
+    services --> cache
+    worker -->|"idempotent jobs"| pg
+    worker --> cache
+    services -.-> mail
+    services -.-> wa
+    services -.-> llm
+    services -.-> sites
+```
+
+**Trust boundaries.** The browser is outside every boundary: it holds an `HttpOnly` session cookie
+and talks only to the Next.js origin, which proxies to the API. Staff routes require a role and,
+for privileged roles, MFA. A generated assistant answer is scrubbed of prohibited claims before it
+reaches a student, and catalogue facts are only published when a named human has verified them.
+
+**Where this is deployed.** The three tiers are what the code supports: SQLite + in-process cache
+for a zero-setup local run; PostgreSQL + Redis + Celery for staging and production; Render for the
+API, worker and beat, Vercel for the site, Supabase for PostgreSQL and Upstash for Redis. The
+hosted configuration itself is **not** verified from this repository — service topology, worker
+pool, backup settings and object storage are dashboard-side facts, and the last audit could not
+read them.
 
 ---
 
@@ -84,13 +155,15 @@ each of which degrades to a working in-process equivalent rather than failing.
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # edit secrets before anything real
-python -m alembic upgrade head  # build the schema (42 tables)
+# Create backend/.env yourself from the variable names listed below.
+# No template is published: every `.env*` file is excluded from this repository by policy,
+# so a fresh clone intentionally contains none.
+python -m alembic upgrade head  # build the schema (47 tables + alembic_version)
 python -m app.seed              # populate data/scholara.db with the demo dataset
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-API: `http://localhost:8000/api/v1` (91 paths / 94 operations) · OpenAPI:
+API: `http://localhost:8000/api/v1` (119 paths / 127 operations) · OpenAPI:
 `http://localhost:8000/api/openapi.json`
 
 #### The AI assistant (optional)
@@ -107,7 +180,7 @@ interchangeable and no code changes:
 
 They are tried in `LLM_PROVIDER_ORDER` (default `grok,mistral,gemini`) and the first that answers
 wins; if one fails the next takes over. Verify a key at **Admin → Operations → AI providers**.
-Full detail in [document 08 §6](docs/08-deployment-security-and-roadmap.md).
+Full detail in the deployment runbook kept in the local `docs/` working copy (§6).
 
 #### Database migrations
 
@@ -148,16 +221,58 @@ error.
 ### Tests and verification
 
 ```bash
-cd backend && python -m pytest          # 174 tests
+cd backend && python -m pytest          # 464 tests on SQLite
+cd backend && python -m ruff check . && python -m mypy app scripts
+cd frontend && npm test                 # 28 tests, node --test plus mounted jsdom lifecycle tests
+cd frontend && npx tsc --noEmit         # type-check; `npm run build` needs a live API
 ```
+
+A plain run uses a throwaway SQLite database. Row locks, `SKIP LOCKED` and unique-violation
+re-evaluation do not exist there, so the tests that need them live in the wider working copy
+alongside the switches that run it against PostgreSQL:
+
+```bash
+export SCHOLARA_TEST_DATABASE_URL='postgresql+psycopg://user:pw@127.0.0.1:5432/disposable'
+export SCHOLARA_REQUIRE_PG_TESTS=1 SCHOLARA_REQUIRE_REDIS_TESTS=1   # a skip becomes a failure
+```
+
+Those switches are not present in this commit's `tests/conftest.py`, and neither is the PostgreSQL
+contract suite — set them against the working copy, not here.
+
+### Continuous integration
+
+This commit contains **no** `.github/workflows/` directory; the CI workflow was written afterwards
+and lives in the wider working copy. A job for this tree should run, in this order: `ruff check`,
+`mypy`, exactly one Alembic head, the backend suite on SQLite, `npm ci`, `tsc --noEmit` and
+`npm test`. No hosted CI run of this commit exists, and nothing below claims one.
 
 | File | Covers |
 | --- | --- |
 | `tests/test_api.py` | Public endpoints, homepage rotation contract, section ordering, filters and pagination, 404s, itemised costing and budget gap, brochure versioning, student portal lifecycle, counselor dashboard, applications board, audit log, notification inbox, every admin resource, scheduled jobs, BM25 retrieval |
 | `tests/test_data_integrity.py` | Provenance on every important field, conflicting sources retained rather than overwritten, the eligibility vocabulary, a regex battery proving no admission-probability language is ever emitted, faculty email labelling, assistant refusal and escalation, partnership data kept private |
 | `tests/test_security.py` | RBAC per role, TOTP and recovery codes, the MFA enrolment flow, signed-URL tampering and expiry, upload rejection, cross-token isolation, webhook signatures, security headers, `no-store` |
-| `tests/test_ratelimit.py` | Rule ordering and strictness, method-scoped matching, middleware headers and 429s, per-client budgets, cache roundtrip and expiry, memory fallback |
+| `tests/test_admin_password_policy.py` | The staff-password policy enforced at every write path — API create/update, the generic admin CRUD and the CLI — with a field-level reason and nothing stored on refusal |
+| `tests/test_user_serialization.py` | Staff credential columns (`password_hash`, `mfa_secret`, recovery codes) never leave the admin API for any role |
+| `tests/test_mfa_hardening.py` | QR/manual-key enrolment, unconfirmed secrets not being active, challenge tokens refused by protected routes, TOTP replay, single-use recovery codes, lost-device recovery, regeneration, admin reset, published default passwords refused in production |
+| `tests/test_email.py` | STARTTLS with a verifying TLS context, sender identity, text+HTML parts, transient-vs-permanent failure classification, retry and give-up, no credentials in the log, masked diagnostics, template escaping and the refusal to render a secret |
+| `tests/test_email_integration.py` | A two-factor change emails the account holder exactly once and the copy never duplicates the inbox item, an unconfigured or broken mailbox leaves the notice `QUEUED`/`FAILED` without failing the security change, the ADMIN-only SMTP test action, and the CLI status/send/reset path |
+| `tests/test_contact_settings.py` | Phone/email/URL validation and normalisation, the admin contact editor endpoint, the narrow public `/contact` document, RBAC, extra numbers surviving an edit, values refused with a field-level reason and never partially written, audit entries, the operator CLI |
+| `tests/test_ratelimit.py` | Rule ordering and strictness, method-scoped matching, middleware headers and 429s, per-client budgets, cache roundtrip and expiry, memory fallback, and trusted-proxy identity: spoofed/malformed/multi-hop `X-Forwarded-For` rejected or bounded, `X-Real-IP` ignored |
 | `tests/test_llm.py` | Grok/Mistral/Gemini resolution, priority order, failover, kill switch, key redaction — plus the generation guardrails, including a hostile model that emits probabilities, guarantees and fake emails and must not reach a student |
+| `tests/test_notifications.py` | Outbound delivery: the in-app inbox row, the WhatsApp branch crossing into an async HTTP client, and failures recorded rather than reported as success |
+| `tests/test_tasks.py` | Background-job wiring and safe execution: jobs read the session factory at call time, a failing job cannot poison the scheduler, and each job returns an identifiable result |
+| `tests/test_source_verification.py` | The link checker's restraint: what it must refuse to conclude, and the status vocabulary for dead, blocked and unreachable sources |
+| `tests/test_connectivity.py` | Deployment connectivity, URL normalisation (`rediss://`, certificate verification) and startup safety — unit tests, no live Supabase or Upstash endpoint required |
+| `tests/test_sitemap_and_cors.py` | `/sitemap-data` never turning a database outage into an empty-but-successful feed, and the CORS allow-list including its production refusals |
+| `tests/test_extraction.py` | Live site extraction, and above all its refusals: declining to guess a domain, and the grounding check rejecting unverifiable output |
+| `tests/test_importer.py` | The import pipeline's integrity rules rather than the happy path: schema checks, staging, and what a commit refuses to write |
+| `tests/test_integration_conformance.py` | Whether the code will work when a real WhatsApp token or provider key is pasted in — conformance of the adapters, not the plumbing |
+| `tests/test_local_semantic.py` | The local embedding model that runs until a hosted provider is configured |
+| `tests/test_seed_guard.py` | The demo seed cannot empty a production database: `run(reset=True)` wipes and re-inserts, so every guard in front of it is pinned |
+
+`frontend/tests/admin-login.test.ts` and `frontend/tests/contact.test.ts` mount the real components
+under jsdom: the sign-in flow including the MFA challenge step, and the contact page rendering the
+validated channels with no dead `tel:` or `javascript:` links.
 
 `conftest.py` builds a throwaway SQLite database in a temp directory and seeds it, so the suite
 never touches `data/scholara.db`. Rate limiting and the scheduler are disabled for the HTTP tests;
@@ -175,6 +290,28 @@ Two shell scripts check a **running** pair of servers rather than the code:
 ./scripts/verify-new.sh     # 63 behavioural assertions against the live API
 ```
 
+### Environment variables
+
+Names and purpose only — values belong in `backend/.env` (never committed) or in the hosting
+dashboard. Every one of them has a working default except where marked.
+
+| Variable | Purpose |
+| --- | --- |
+| `ENVIRONMENT` | `development` / `test` / `production`. Production mode turns on the startup checks described under *Security posture* below |
+| `DATABASE_URL` | SQLAlchemy URL. SQLite for a zero-infrastructure run; PostgreSQL + `sslmode=require` for anything real |
+| `SECRET_KEY` | **Required in production**: 32+ random characters, not any published value. Also the key for stored-secret encryption and password / TOTP hashing |
+| `REDIS_URL` | Cache and rate-limit store. Empty means an in-process fallback (single process only) |
+| `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` | Task broker (Redis). Empty means the in-process scheduler handles the schedule |
+| `SCHEDULER_ENABLED` | `false` in production, where Celery beat owns the schedule |
+| `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`, `PUBLIC_SITE_URL` | Browser origins allowed to call the API; `https://` only in production |
+| `INTERNAL_API_TOKEN` | Shared with the Next.js build so server-side rendering is not rate-limited |
+| `INTERNAL_API_URL` | **Required by the frontend build**: absolute origin of the API |
+| `STORAGE_BACKEND`, `STORAGE_DIR`, `S3_BUCKET`, `S3_*` | Private document storage. `local` means the container's own disk — see *Known limitations* |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS`, `SMTP_SSL` | Outbound email. Refuses to send credentials over a plaintext connection |
+| `LLM_PROVIDER_ORDER`, `XAI_API_KEY`, `MISTRAL_API_KEY`, `GEMINI_API_KEY` | Optional assistant prose. Without a key the assistant still answers, from verified data |
+| `WHATSAPP_*`, `META_*`, `FACEBOOK_*`, `GA4_*`, `GOOGLE_*` | Optional marketing and messaging integrations |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_CONNECT_TIMEOUT`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE` | Connection-pool sizing for a small managed database |
+
 ### Signing in to the admin
 
 `http://localhost:3000/admin`
@@ -189,18 +326,55 @@ Two shell scripts check a **running** pair of servers rather than the code:
 `MFA_REQUIRED_ROLES` defaults to `ADMIN,SENIOR_COUNSELOR`, and it is enforced at sign-in rather
 than merely suggested: an account in one of those roles that has not enrolled receives a token
 scoped to the enrolment endpoints only — it cannot open the back office until a second factor
-is active. The two privileged demo accounts are therefore seeded already enrolled, so the
-password step hands back `mfa_required` and you need the current code:
+is active. The two privileged demo accounts are seeded already enrolled, so the password step
+hands back `mfa_required` and you need the current code:
 
 ```bash
 ./scripts/mfa-code.sh                        # admin@scholara.com.bd
 ./scripts/mfa-code.sh senior@scholara.com.bd
 ```
 
-Those secrets live in `backend/app/seed_data.py` so the demo and the test-suite can sign in
-unattended. They are committed, therefore public: **re-enrol every account before exposing the
-platform**, and rotate these passwords — see
-[document 08](docs/08-deployment-security-and-roadmap.md).
+### These credentials exist in development only
+
+The table above, `scripts/mfa-code.sh` and the TOTP secrets in `backend/app/seed_data.py` are
+development fixtures. Three independent guards keep them out of a deployment:
+
+1. `seed.py` never creates demo staff accounts when `ENVIRONMENT=production`, regardless of
+   `DEV_SEED_ENABLED`.
+2. `scripts/mfa-code.sh` refuses to run against a production environment.
+3. `alembic upgrade head` runs migration `a7b8c9d0e1f2`, which clears the secret and recovery
+   codes of any account still using a published development secret. An existing deployed
+   database therefore cannot be signed into with a code taken from this repository.
+
+The sign-in screen no longer prints credentials or helper-script instructions: that hint is
+compiled out of a production build (`process.env.NODE_ENV`), not hidden with CSS. A deployed
+site is provisioned with real administrators instead:
+
+```bash
+python -m app.mgmt_admin --create-admin you@example.org   # password read from stdin
+python -m app.mgmt_admin --list                          # roles and MFA state
+python -m app.mgmt_admin --reset-mfa you@example.org     # lost phone + lost recovery codes
+python -m app.mgmt_admin --set-password you@example.org  # rotate a password
+```
+
+### Changing contact details and MFA in production
+
+**Contact channels.** Admin → Settings → *Public contact details* writes the phone, WhatsApp
+number, email and Facebook page URL through a validated endpoint (`PUT /admin/settings/contact`).
+The old form stored whatever was typed, so a junk phone produced a dead `tel:` link and a
+`javascript:` URL was rendered as a link. Values are now normalised to E.164, lower-cased, and
+checked against an allow-list of Facebook hosts; anything invalid is refused with a reason and
+nothing is written. Saving also calls `POST /api/revalidate`, which expires the `site-settings`
+cache tag so the header, footer, mobile navigation and contact page show the new number
+immediately — no redeploy and no waiting for the 5-minute ISR window.
+
+**Two-factor.** Enrolment shows a scannable QR code (generated server-side as an SVG data URI)
+plus the manual key. A TOTP code is single-use: the accepted time-step is persisted, so a code
+observed over someone's shoulder cannot be replayed within the drift window. Recovery codes are
+single-use, hashed with a keyed HMAC, and can be regenerated from the security panel with a
+current code. Five wrong codes lock the account for 15 minutes, everything is audited, and an
+administrator can reset another staff member's second factor (which forces re-enrolment at the
+next sign-in) — see *Security* in the back office.
 
 ---
 
@@ -234,7 +408,7 @@ platform**, and rotate these passwords — see
 /admin/notifications    inbox                /admin/audit          audit log
 /admin/marketing        pixels, GA4, ads     /admin/operations     scheduled jobs
 /admin/security         MFA and sessions     /admin/settings       brand, contact, SEO
-/admin/{resource}       a managed table for each of the 36 CMS resources
+/admin/{resource}       a managed table for each of the 37 CMS resources
 ```
 
 Five of those resources are read-only and return 405 on write: audit logs, analytics events, search
@@ -253,3 +427,33 @@ a homepage section hides it without losing it.
 The homepage rotation engine fetches the full slide set **once**, then cycles client-side on a timer
 (default 30 seconds per slide, per-slide overrides allowed) with the next slide preloaded. No page
 reload, no request per cycle, and it respects `prefers-reduced-motion`.
+
+---
+
+## Known limitations
+
+Recorded here because they are true of the code as published, not because they are planned work.
+
+- **Catalogue content is demo data.** The schema, provenance columns and the verification queue
+  are in place; the rows are synthetic until real institutions are imported and checked.
+- **Hosted configuration is unverified from this repository.** Whether production sets
+  `STORAGE_BACKEND=s3`, which worker pool Render runs, whether Supabase backups are enabled and
+  which Vercel environment variables exist are all dashboard-side facts. The last audit found the
+  documented API origin answering `404`, i.e. the deployed site had no reachable backend at that
+  moment.
+- **Local object storage is ephemeral.** With the default `STORAGE_BACKEND=local`, uploaded
+  documents live on the container's disk and do not survive a redeploy. Use `s3` before accepting
+  real student documents.
+- **Task time limits are not configured here.** The 780 s soft / 900 s hard limits and the
+  `acks_late` / `visibility_timeout` hardening belong to the working copy, not this commit. When
+  they are enabled, Celery enforces the limits only through a prefork pool, so run
+  `--pool=prefork`; under `--pool=threads` a hung task runs until the worker restarts.
+- **Delivery is at-least-once once `acks_late` is on.** That is why every scheduled job in the
+  working copy is written to be idempotent and the reminder jobs de-duplicate per entity per day.
+  This commit's jobs run with Celery's default (ack-on-receipt) configuration, which trades a
+  duplicate for a lost run. A reminder band that is missed entirely is not back-filled.
+- **No SMS.** WhatsApp exists and is unverified without credentials; there is no SMS transport.
+- **The S3 backend is untested.** It is excluded from the test coverage because it needs
+  credentials; only the local backend is exercised end to end.
+- **Revision files are dated by plan, not by commit time** (2026-10-03 → 2026-10-05). Alembic
+  orders by `down_revision`, so a filename is a plan label rather than chronology.

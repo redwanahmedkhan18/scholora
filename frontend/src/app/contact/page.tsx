@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { api, getOptions, getSettings } from "@/lib/api";
+import { contactFromSettings, mailtoHref, safeExternalHref, telHref } from "@/lib/contact";
 import { LeadForm } from "@/components/forms";
 import { FacebookPanel } from "@/components/site-chrome";
 import { PageHeader } from "@/components/ui";
@@ -10,9 +11,10 @@ type Dict = Record<string, any>;
 
 export async function generateMetadata(): Promise<Metadata> {
   const s = await getSettings();
+  const contact = contactFromSettings(s);
   return {
     title: "Contact us",
-    description: `Visit ${s.office_address}, call ${s.phones?.[0] ?? ""}, message us on WhatsApp or Messenger, or send an enquiry. ${s.office_hours ?? ""}`,
+    description: `Visit ${s.office_address ?? "our office"}${contact.phoneDisplay ? `, call ${contact.phoneDisplay}` : ""}${contact.email ? `, email ${contact.email}` : ""}, message us on WhatsApp or Messenger, or send an enquiry. ${s.office_hours ?? ""}`.trim(),
     alternates: { canonical: "/contact" },
   };
 }
@@ -22,22 +24,34 @@ export default async function ContactPage() {
     getSettings(), api<Dict[]>("/countries", 300), getOptions("degree_levels"),
   ]);
 
+  const contact = contactFromSettings(settings);
+  const mapHref = safeExternalHref(settings.map_embed_url);
+  const messengerHref = safeExternalHref(settings.messenger_url);
+
+  // Each channel is a label plus a ready-made target; anything the API could not decode is
+  // dropped here rather than rendered as a dead link.
   const channels = [
-    { icon: "📍", title: "Visit the office", body: settings.office_address, note: settings.office_hours, href: settings.map_embed_url ? "#map" : undefined, cta: "See the map" },
-    { icon: "💬", title: "WhatsApp", body: settings.whatsapp_number, note: "Fastest reply — usually within office hours.", href: settings.whatsapp_number ? `https://wa.me/${String(settings.whatsapp_number).replace(/\D/g, "")}` : undefined, cta: "Open WhatsApp" },
-    { icon: "📞", title: "Call us", body: (settings.phones ?? []).join(" · "), note: "Saturday to Thursday.", href: settings.phones?.[0] ? `tel:${settings.phones[0]}` : undefined, cta: "Call now" },
-    { icon: "✉️", title: "Email", body: (settings.emails ?? []).join(" · "), note: "For documents and formal enquiries.", href: settings.emails?.[0] ? `mailto:${settings.emails[0]}` : undefined, cta: "Send email" },
-    { icon: "👍", title: "Facebook page", body: settings.facebook_page_url, note: "Intake alerts and seminar announcements.", href: settings.facebook_page_url, cta: "Open page" },
-    { icon: "📨", title: "Messenger", body: settings.messenger_url, note: "If you already follow us on Facebook.", href: settings.messenger_url, cta: "Message us" },
-  ].filter((c) => c.body);
+    { icon: "📍", title: "Visit the office", body: settings.office_address, note: settings.office_hours,
+      href: mapHref ? "#map" : undefined, cta: "See the map" },
+    { icon: "💬", title: "WhatsApp", body: contact.whatsapp ? contact.phoneDisplay ?? contact.whatsapp : null,
+      note: "Fastest reply — usually within office hours.", href: contact.whatsappHref, cta: "Open WhatsApp" },
+    { icon: "📞", title: "Call us", body: (settings.phones ?? []).filter((p: string) => telHref(p)).join(" · "),
+      note: "Saturday to Thursday.", href: contact.telHref, cta: "Call now" },
+    { icon: "✉️", title: "Email", body: (settings.emails ?? []).filter((e: string) => mailtoHref(e)).join(" · "),
+      note: "For documents and formal enquiries.", href: contact.mailtoHref, cta: "Send email" },
+    { icon: "👍", title: "Facebook page", body: contact.facebookUrl, note: "Intake alerts and seminar announcements.",
+      href: contact.facebookHref, cta: "Open page" },
+    { icon: "📨", title: "Messenger", body: messengerHref, note: "If you already follow us on Facebook.",
+      href: messengerHref, cta: "Message us" },
+  ].filter((c) => c.body && c.href);
 
   const ld = {
     "@context": "https://schema.org", "@type": "ContactPage",
     mainEntity: {
-      "@type": "Organization", name: settings.brand_name, telephone: settings.phones?.[0],
-      email: settings.emails?.[0],
+      "@type": "Organization", name: settings.brand_name, telephone: contact.phone,
+      email: contact.email,
       address: { "@type": "PostalAddress", streetAddress: settings.office_address, addressLocality: "Uttara, Dhaka", addressCountry: "BD" },
-      sameAs: [settings.facebook_page_url, settings.instagram_url, settings.linkedin_url].filter(Boolean),
+      sameAs: [contact.facebookUrl, safeExternalHref(settings.instagram_url), safeExternalHref(settings.linkedin_url)].filter(Boolean),
     },
   };
 
@@ -95,9 +109,9 @@ export default async function ContactPage() {
           </aside>
         </div>
 
-        {settings.map_embed_url && (
+        {mapHref && (
           <div id="map" className="card mt-8 overflow-hidden p-0">
-            <iframe src={settings.map_embed_url} title="Office location map" loading="lazy"
+            <iframe src={mapHref} title="Office location map" loading="lazy"
               referrerPolicy="no-referrer-when-downgrade" className="h-80 w-full border-0" />
           </div>
         )}

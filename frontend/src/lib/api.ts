@@ -61,9 +61,9 @@ async function fetchWithColdStartRetry(
     : new Error("The API did not respond after retries");
 }
 
-export async function api<T = Dict>(path: string, revalidate = 60): Promise<T> {
+export async function api<T = Dict>(path: string, revalidate = 60, tags?: string[]): Promise<T> {
   const res = await fetchWithColdStartRetry(backendUrl(path), {
-    next: { revalidate },
+    next: { revalidate, ...(tags ? { tags } : {}) },
     headers: { Accept: "application/json" },
   });
   if (!res.ok) throw new Error(`API ${path} -> ${res.status}`);
@@ -80,7 +80,7 @@ export async function api<T = Dict>(path: string, revalidate = 60): Promise<T> {
  * page for a university that exists - which is exactly what happened once. Anything that is
  * not a clean 404 therefore throws, so the build fails loudly instead of lying quietly.
  */
-export async function apiOrNull<T = Dict>(path: string, revalidate = 60): Promise<T | null> {
+export async function apiOrNull<T = Dict>(path: string, revalidate = 60, tags?: string[]): Promise<T | null> {
   const url = backendUrl(path);
   const headers: Record<string, string> = { Accept: "application/json" };
   // Server-side only: exempts first-party rendering from the public rate limit. `window`
@@ -91,7 +91,7 @@ export async function apiOrNull<T = Dict>(path: string, revalidate = 60): Promis
 
   let res: Response;
   try {
-    res = await fetchWithColdStartRetry(url, { next: { revalidate }, headers });
+    res = await fetchWithColdStartRetry(url, { next: { revalidate, ...(tags ? { tags } : {}) }, headers });
   } catch (cause) {
     throw new Error(`Cannot reach the API for ${path}`, { cause });
   }
@@ -183,8 +183,17 @@ function flattenSettings(raw: Dict): Dict {
   };
 }
 
+/**
+ * The tag every page that prints a contact detail or a brand value carries.
+ *
+ * `/admin/settings` saves call `POST /api/revalidate` with this tag, which marks the cached
+ * fetch - and every page rendered from it - stale immediately. Without it an administrator's
+ * change waited for the 300-second ISR window (or, on a fully static page, for a redeploy).
+ */
+export const SITE_SETTINGS_TAG = "site-settings";
+
 export async function getSettings(): Promise<Dict> {
-  return flattenSettings((await apiOrNull<Dict>("/settings", 300)) ?? {});
+  return flattenSettings((await apiOrNull<Dict>("/settings", 300, [SITE_SETTINGS_TAG])) ?? {});
 }
 
 /**

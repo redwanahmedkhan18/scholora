@@ -4,6 +4,7 @@ Run:  python -m app.seed
 """
 from __future__ import annotations
 
+import logging
 import random
 from datetime import date, datetime, timedelta, timezone
 
@@ -46,6 +47,8 @@ from app.models.education import (
 NOW = datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc).replace(tzinfo=None)
 REVIEW_DUE = NOW + timedelta(days=90)
 SAMPLE = "Sample dataset - replace with a verified source extract"
+
+log = logging.getLogger(__name__)
 
 DOC_SETS = {
     "BACHELOR": ["Passport copy", "SSC certificate and transcript", "HSC certificate and transcript",
@@ -100,6 +103,53 @@ def wipe(db):
     db.commit()
 
 
+def _naive_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def demo_users_allowed() -> bool:
+    """Whether this process may create the demo staff accounts.
+
+    Production is refused unconditionally - not merely by default. A deployment that set
+    ``DEV_SEED_ENABLED=true`` by accident (or copied a development .env) still must not end up
+    with an administrator whose password and TOTP secret are both published in the repository.
+    """
+    return bool(settings.dev_seed_enabled) and not settings.is_production
+
+
+def _seed_demo_users(db) -> None:
+    """Development-only staff accounts.
+
+    ADMIN and SENIOR_COUNSELOR are in MFA_REQUIRED_ROLES, so they are created already
+    enrolled with fixed, well-known development secrets; without that the demo logins would
+    land on the enrolment wall and nobody could get into the back office. Those secrets are
+    published in this repository, which is exactly why this function is never called in
+    production (see `run`) and why the migration revokes them from deployed databases.
+    """
+    log.warning(
+        "seeding demo staff accounts with published development credentials "
+        "(never do this in production)"
+    )
+    _, admin_recovery_hashed = mfa.issue_recovery_codes()
+    db.add_all([
+        User(email=settings.admin_email.lower(), full_name="Platform Administrator",
+             password_hash=hash_password(settings.admin_password), role="ADMIN",
+             phone="+8801700000001",
+             mfa_secret=D.DEV_MFA_SECRET_ADMIN, mfa_confirmed_at=_naive_utc(),
+             mfa_recovery_codes=admin_recovery_hashed),
+        User(email="senior@scholara.com.bd", full_name="Imrul Kayes",
+             password_hash=hash_password("Senior@12345"), role="SENIOR_COUNSELOR",
+             phone="+8801700000003",
+             mfa_secret=D.DEV_MFA_SECRET_SENIOR, mfa_confirmed_at=_naive_utc(),
+             mfa_recovery_codes=mfa.issue_recovery_codes()[1]),
+        User(email="counselor@scholara.com.bd", full_name="Farzana Haque",
+             password_hash=hash_password("Counselor@123"), role="COUNSELOR", phone="+8801700000002"),
+        User(email="data@scholara.com.bd", full_name="Rumana Sultana",
+             password_hash=hash_password("Data@12345"), role="DATA_MANAGER", phone="+8801700000004"),
+    ])
+    db.commit()
+
+
 def _faculty_kind(name: str) -> str:
     """Faculty / School / College / Institute - taken from the name the university uses."""
     lowered = name.lower()
@@ -125,6 +175,21 @@ def _faculty_name(dept_name: str) -> str:
 
 
 def run(reset: bool = True) -> dict:
+    """Populate a development database. Never a production reset.
+
+    ``reset=True`` deletes every row in every table (``wipe``). Seeding is a development tool,
+    so in production that is refused outright rather than merely defaulted off: a runbook line
+    copied onto a live server must cost the operator an error message and nothing else. The
+    guard sits above every other statement in this function - no session is opened, no schema
+    is created and no row is deleted before it fires.
+    """
+    if settings.is_production and reset:
+        raise SystemExit(
+            "Refusing to run: seed.run(reset=True) deletes every row in every table and must "
+            "never touch a production database. Provision production with "
+            "`python -m alembic upgrade head` and create the administrator with "
+            "`python -m app.mgmt_admin --create-admin you@example.org`."
+        )
     random.seed(42)
     # Production schema is owned by Alembic. Tests and zero-config SQLite development may
     # still create their throwaway schema, but seeding must never be an implicit migration.
@@ -171,27 +236,19 @@ def run(reset: bool = True) -> dict:
     db.commit()
 
     # ------------------------------------------------------------------ users
-    # ADMIN and SENIOR_COUNSELOR are in MFA_REQUIRED_ROLES, so they are seeded already
-    # enrolled with fixed, well-known development secrets. Without this the demo logins
-    # would land on the enrolment wall and nobody could get into the back office.
-    # These constants are dev-only; real deployments enrol through /admin/auth/mfa/enroll.
-    admin_recovery_plain, admin_recovery_hashed = mfa.issue_recovery_codes()
-    db.add_all([
-        User(email=settings.admin_email.lower(), full_name="Platform Administrator",
-             password_hash=hash_password(settings.admin_password), role="ADMIN",
-             phone="+8801700000001",
-             mfa_secret=D.DEV_MFA_SECRET_ADMIN, mfa_confirmed_at=datetime.now(timezone.utc),
-             mfa_recovery_codes=admin_recovery_hashed),
-        User(email="senior@scholara.com.bd", full_name="Imrul Kayes",
-             password_hash=hash_password("Senior@12345"), role="SENIOR_COUNSELOR", phone="+8801700000003",
-             mfa_secret=D.DEV_MFA_SECRET_SENIOR, mfa_confirmed_at=datetime.now(timezone.utc),
-             mfa_recovery_codes=mfa.issue_recovery_codes()[1]),
-        User(email="counselor@scholara.com.bd", full_name="Farzana Haque",
-             password_hash=hash_password("Counselor@123"), role="COUNSELOR", phone="+8801700000002"),
-        User(email="data@scholara.com.bd", full_name="Rumana Sultana",
-             password_hash=hash_password("Data@12345"), role="DATA_MANAGER", phone="+8801700000004"),
-    ])
-    db.commit()
+    # Demo staff accounts exist so a fresh checkout has something to sign in with. They carry
+    # a published password and a TOTP secret that is checked into this repository, so in
+    # production they are not created at all - a deployed environment provisions its real
+    # administrators instead. `DEV_SEED_ENABLED=false` turns them off everywhere else too.
+    if not demo_users_allowed():
+        log.warning(
+            "skipping demo staff accounts (is_production=%s, dev_seed_enabled=%s); "
+            "provision real administrators with `python -m app.mgmt_admin`",
+            settings.is_production, settings.dev_seed_enabled,
+        )
+        db.commit()
+    else:
+        _seed_demo_users(db)
 
     # ------------------------------------------------------------------ countries
     countries = {}

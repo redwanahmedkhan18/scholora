@@ -67,6 +67,24 @@ OVERRIDABLE: Dict[str, Overridable] = {o.key: o for o in [
     Overridable("whatsapp_app_secret", "whatsapp", "App secret", secret=True,
                 help="Used to validate the X-Hub-Signature-256 on every inbound webhook."),
 
+    # ---- Outbound email ----------------------------------------------------
+    # Editable here so a mailbox can be fixed from the admin without a Render redeploy. The
+    # environment stays the fallback, and clearing a field hands the key back to it.
+    Overridable("smtp_host", "email", "SMTP host",
+                help="smtp.gmail.com for Gmail."),
+    Overridable("smtp_port", "email", "SMTP port", kind="int", minimum=1, maximum=65535,
+                help="587 with STARTTLS is the Gmail recommendation; 465 uses implicit TLS."),
+    Overridable("smtp_user", "email", "SMTP username",
+                help="The full mailbox address, e.g. notifications@yourdomain or you@gmail.com."),
+    Overridable("smtp_password", "email", "SMTP password", secret=True,
+                help="A Google App Password (16 characters), never the account password."),
+    Overridable("smtp_from_email", "email", "From address",
+                help="Defaults to the username. Gmail requires this to be that account or an alias."),
+    Overridable("smtp_from_name", "email", "From name",
+                help="Display name on outbound mail. Defaults to the application name."),
+    Overridable("smtp_use_tls", "email", "STARTTLS", kind="bool",
+                help="Upgrade the plaintext connection with STARTTLS. Certificates are always verified."),
+
     # ---- Meta / Facebook ---------------------------------------------------
     Overridable("facebook_page_access_token", "meta", "Page access token", secret=True,
                 help="Lets the platform read the linked Facebook page."),
@@ -112,6 +130,7 @@ OVERRIDABLE: Dict[str, Overridable] = {o.key: o for o in [
 GROUP_LABELS = {
     "whatsapp": "WhatsApp Business",
     "meta": "Meta / Facebook",
+    "email": "Outbound email (SMTP)",
     "llm": "Assistant model",
     "embeddings": "Embeddings",
     "retrieval": "Retrieval tuning",

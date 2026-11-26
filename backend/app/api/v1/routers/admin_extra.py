@@ -7,6 +7,8 @@ audit-log viewer (§91), scheduled-job control and assistant reindexing (§64).
 """
 from __future__ import annotations
 
+import logging
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -19,8 +21,15 @@ from app.api import serializers as S
 from app.core import llm, mfa, storage
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import current_user, enrolling_user, require_role, require_staff
-from app.core.security import create_access_token, verify_password
+from app.core.deps import (
+    MFA_CHALLENGE_SCOPE,
+    MFA_ENROLMENT_SCOPE,
+    current_user,
+    enrolling_user,
+    require_role,
+    require_staff,
+)
+from app.core.security import create_access_token, decode_token, verify_password
 from app.models.base import APPLICATION_STATUSES
 from app.models.crm import (
     Application,
@@ -38,6 +47,8 @@ from app.models.education import Program, University
 from app.services import extraction, retrieval, tasks
 from app.services import notifications as notify
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(tags=["admin"])
 
 
@@ -46,42 +57,179 @@ def _audit(db: Session, user: User, action: str, entity_type: str,
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action=action,
                     entity_type=entity_type, entity_id=entity_id, detail=detail or {}))
 
-
 # ====================================================================== MFA
+#
+# The shape of this exchange, and why:
+#
+#   POST /auth/login            -> {"mfa_required": true, "challenge_token": ...}   (no session)
+#   POST /auth/mfa/challenge    -> full session, from a TOTP *or* a recovery code
+#
+# A login that needs a second factor never receives an access token, and the challenge token
+# it receives instead is scoped (refused by every `current_user`/`require_*` dependency),
+# short-lived, and useless once the code attached to it has been spent. Codes are single-use:
+# the 30-second time-step of the last accepted TOTP code is stored on the user, so replaying a
+# code inside its drift window - which the earlier implementation allowed for up to 90 seconds -
+# is refused.
 class MfaVerifyIn(BaseModel):
     code: str
 
 
 class MfaChallengeIn(BaseModel):
+    """Step two. `challenge_token` is the supported path; email+password is kept because the
+    operational shell scripts and third-party clients post it, and it carries both factors."""
+
+    challenge_token: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+    code: str
+
+
+class MfaRecoverIn(BaseModel):
     email: str
     password: str
+    recovery_code: str
+
+
+class MfaRegenerateIn(BaseModel):
     code: str
+
+
+class MfaResetIn(BaseModel):
+    user_id: int
+    code: str
+
+
+def _utcnow() -> datetime:
+    """Naive UTC, matching the DateTime columns. Mixing aware and naive values is what makes
+    comparisons fail on PostgreSQL, so every write goes through this one function."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _issue_challenge(user: User) -> str:
+    """A short-lived token that says exactly one thing: this password was correct."""
+    ttl = max(1, int(settings.mfa_challenge_ttl_seconds))
+    return create_access_token(
+        str(user.id), user.role,
+        extra={
+            "scope": MFA_CHALLENGE_SCOPE,
+            "jti": secrets.token_urlsafe(12),
+            "exp": datetime.now(timezone.utc) + timedelta(seconds=ttl),
+        },
+    )
+
+
+def _user_from_challenge(token: str, db: Session) -> User:
+    try:
+        payload = decode_token(token)
+    except Exception as exc:
+        raise HTTPException(401, "This sign-in attempt has expired. Start again.") from exc
+    if payload.get("scope") != MFA_CHALLENGE_SCOPE:
+        raise HTTPException(401, "This is not a sign-in challenge. Start again.")
+    try:
+        user_id = int(payload.get("sub", 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(401, "This sign-in attempt is not valid. Start again.") from exc
+    user = db.get(User, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(401, "This sign-in attempt is not valid. Start again.")
+    return user
+
+
+def _assert_not_locked(user: User) -> None:
+    if user.locked_until and user.locked_until > _utcnow():
+        raise HTTPException(423, "Too many incorrect codes. This account is locked for a few minutes.")
+
+
+def _record_mfa_failure(db: Session, user: User) -> None:
+    user.failed_login_count = (user.failed_login_count or 0) + 1
+    if user.failed_login_count >= 5:
+        user.locked_until = _utcnow() + timedelta(minutes=15)
+    db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="MFA_FAILED",
+                    entity_type="users", entity_id=user.id,
+                    detail={"attempts": user.failed_login_count}))
+    db.commit()
+
+
+def _accept_second_factor(db: Session, user: User, code: str) -> str:
+    """Verify a TOTP or a recovery code, burning whichever was used.
+
+    Returns "totp" or "recovery". Raises 401 with a specific message otherwise, so the UI can
+    distinguish a wrong code from an already-used one without guessing.
+    """
+    typed = (code or "").strip()
+    if not typed:
+        _record_mfa_failure(db, user)
+        raise HTTPException(401, "Enter the code from your authenticator app.")
+
+    step = mfa.match_step(user.mfa_secret or "", typed)
+    if step is not None:
+        if user.mfa_last_used_step is not None and step <= user.mfa_last_used_step:
+            _record_mfa_failure(db, user)
+            raise HTTPException(
+                401, "That code has already been used. Wait for your authenticator to show the next one."
+            )
+        user.mfa_last_used_step = step
+        return "totp"
+
+    remaining, used = mfa.consume_recovery_code(user.mfa_recovery_codes or [], typed)
+    if used:
+        user.mfa_recovery_codes = remaining
+        return "recovery"
+
+    _record_mfa_failure(db, user)
+    raise HTTPException(401, "That code is not valid. Check your device clock and try again.")
+
+
+def _notify_security_change(db: Session, user: User, trigger: str, **fields: Any) -> None:
+    """Announce a security change: staff inbox always, email when SMTP is configured.
+
+    Delegates to `notifications.security_notice` so the in-app record and the outbound copy
+    are produced by one function - the CLI reset path uses the same one.
+    """
+    try:
+        notify.security_notice(db, user, trigger, **fields)
+    except Exception:            # a notification must never fail the security operation
+        log.warning("security notice %s could not be recorded", trigger, exc_info=True)
 
 
 @router.get("/auth/mfa/status")
 def mfa_status(user: User = Depends(enrolling_user)):
     return {
         "enrolled": bool(user.mfa_confirmed_at),
+        "pending_enrolment": bool(user.mfa_secret and not user.mfa_confirmed_at),
         "required": user.role in settings.mfa_required_role_list,
-        "recovery_codes_remaining": len(user.mfa_recovery_codes or []),
+        "recovery_codes_remaining": mfa.recovery_code_count(user.mfa_recovery_codes),
         "issuer": settings.mfa_issuer,
+        "challenge_ttl_seconds": settings.mfa_challenge_ttl_seconds,
     }
 
 
 @router.post("/auth/mfa/enroll")
 def mfa_enroll(db: Session = Depends(get_db), user: User = Depends(enrolling_user)):
-    """Issue a fresh secret. It is not active until a valid code confirms it."""
+    """Issue a fresh secret. It is not an active factor until a code confirms it.
+
+    Rotating an existing secret deliberately clears the confirmation first: an unconfirmed
+    secret must never be what the login gate trusts.
+    """
     secret = mfa.generate_secret()
     user.mfa_secret = secret
     user.mfa_confirmed_at = None
+    user.mfa_last_used_step = None
+    otpauth_url = mfa.provisioning_uri(secret, user.email, settings.mfa_issuer)
     _audit(db, user, "MFA_ENROLL_START", "users", user.id)
     db.commit()
+    # The secret is returned to its owner, once, over an authenticated channel. It is never
+    # written to a log, an audit row, or any public endpoint.
     return {
         "secret": secret,
-        "otpauth_url": mfa.provisioning_uri(secret, user.email, settings.mfa_issuer),
+        "otpauth_url": otpauth_url,
+        "qr_data_uri": mfa.qr_data_uri(otpauth_url),
         "manual_entry": " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)),
-        "digits": 6, "period": 30,
-        "instructions": "Add the key to Google Authenticator, Authy or 1Password, then enter the 6-digit code to confirm.",
+        "digits": mfa.DIGITS, "period": mfa.PERIOD,
+        "instructions": (
+            "Scan the QR code with Google Authenticator, Microsoft Authenticator, Authy or "
+            "1Password, or type the setup key, then enter the 6-digit code it shows."
+        ),
     }
 
 
@@ -89,12 +237,20 @@ def mfa_enroll(db: Session = Depends(get_db), user: User = Depends(enrolling_use
 def mfa_confirm(body: MfaVerifyIn, db: Session = Depends(get_db), user: User = Depends(enrolling_user)):
     if not user.mfa_secret:
         raise HTTPException(400, "Start enrolment first.")
-    if not mfa.verify(user.mfa_secret, body.code):
+    step = mfa.match_step(user.mfa_secret, body.code)
+    if step is None:
+        _audit(db, user, "MFA_CONFIRM_FAILED", "users", user.id)
+        db.commit()
         raise HTTPException(400, "That code is not valid. Check your device clock and try again.")
-    plain, hashed = mfa.issue_recovery_codes()
+    plain, hashed = mfa.issue_recovery_codes(int(settings.mfa_recovery_code_count))
     user.mfa_recovery_codes = hashed
-    user.mfa_confirmed_at = datetime.now(timezone.utc)
-    _audit(db, user, "MFA_ENABLED", "users", user.id)
+    user.mfa_last_used_step = step
+    user.mfa_confirmed_at = _utcnow()
+    user.failed_login_count = 0
+    user.locked_until = None
+    _audit(db, user, "MFA_ENABLED", "users", user.id,
+           detail={"recovery_codes": len(plain)})
+    _notify_security_change(db, user, "MFA_CHANGED", change="Two-factor authentication was turned on")
     db.commit()
     # Both factors have now been demonstrated in this exchange - the password that minted the
     # enrolment token, and possession of the secret just proved by the code. Hand back a real
@@ -114,12 +270,15 @@ def mfa_confirm(body: MfaVerifyIn, db: Session = Depends(get_db), user: User = D
 def mfa_disable(body: MfaVerifyIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     if user.role in settings.mfa_required_role_list:
         raise HTTPException(403, f"MFA is mandatory for the {user.role} role and cannot be switched off.")
-    if not (user.mfa_secret and mfa.verify(user.mfa_secret, body.code)):
-        raise HTTPException(400, "Enter a valid code to disable MFA.")
+    if not (user.mfa_secret and user.mfa_confirmed_at):
+        raise HTTPException(400, "MFA is not enabled on this account.")
+    _accept_second_factor(db, user, body.code)
     user.mfa_secret = None
     user.mfa_confirmed_at = None
     user.mfa_recovery_codes = []
+    user.mfa_last_used_step = None
     _audit(db, user, "MFA_DISABLED", "users", user.id)
+    _notify_security_change(db, user, "MFA_CHANGED", change="Two-factor authentication was turned off")
     db.commit()
     return {"ok": True}
 
@@ -127,40 +286,131 @@ def mfa_disable(body: MfaVerifyIn, db: Session = Depends(get_db), user: User = D
 @router.post("/auth/mfa/challenge")
 def mfa_challenge(body: MfaChallengeIn, db: Session = Depends(get_db)):
     """Second step of login for an MFA-enrolled account. Accepts a TOTP or a recovery code."""
-    user = db.execute(select(User).where(User.email == body.email.lower().strip())).scalars().first()
-    if not user or not verify_password(body.password, user.password_hash) or not user.is_active:
-        raise HTTPException(401, "Invalid email or password")
-    if user.locked_until and user.locked_until > datetime.now(timezone.utc).replace(tzinfo=None):
-        raise HTTPException(423, "Account temporarily locked after repeated failed codes.")
+    if body.challenge_token:
+        user = _user_from_challenge(body.challenge_token, db)
+    elif body.email and body.password:
+        # Compatibility path for the shell smoke tests and any older client: the password is
+        # re-proved here, so this is still two factors, not a shortcut around the gate.
+        candidate = db.execute(
+            select(User).where(User.email == body.email.lower().strip())
+        ).scalars().first()
+        if (not candidate or not verify_password(body.password, candidate.password_hash)
+                or not candidate.is_active):
+            raise HTTPException(401, "Invalid email or password")
+        user = candidate
+    else:
+        raise HTTPException(400, "Start signing in again.")
+
     if not (user.mfa_secret and user.mfa_confirmed_at):
-        raise HTTPException(400, "This account does not have MFA enabled.")
+        raise HTTPException(400, "This account does not have two-factor authentication enabled.")
+    _assert_not_locked(user)
 
-    ok = mfa.verify(user.mfa_secret, body.code)
-    if not ok:
-        remaining, used = mfa.consume_recovery_code(user.mfa_recovery_codes or [], body.code)
-        if used:
-            user.mfa_recovery_codes = remaining
-            ok = True
-
-    if not ok:
-        user.failed_login_count = (user.failed_login_count or 0) + 1
-        if user.failed_login_count >= 5:
-            user.locked_until = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=15)
-        db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="MFA_FAILED",
-                        entity_type="users", entity_id=user.id,
-                        detail={"attempts": user.failed_login_count}))
-        db.commit()
-        raise HTTPException(401, "Invalid authentication code")
+    method = _accept_second_factor(db, user, body.code)
 
     user.failed_login_count = 0
     user.locked_until = None
-    user.last_login_at = datetime.now(timezone.utc)
-    db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="LOGIN_MFA",
-                    entity_type="users", entity_id=user.id))
+    user.last_login_at = _utcnow()
+    _audit(db, user, "LOGIN_MFA", "users", user.id, detail={"method": method})
     db.commit()
     return {"access_token": create_access_token(str(user.id), user.role), "token_type": "bearer",
-            "user": {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role}}
+            "mfa_method": method,
+            "user": {"id": user.id, "email": user.email, "full_name": user.full_name,
+                     "role": user.role, "mfa_enrolled": True}}
 
+
+@router.post("/auth/mfa/recover")
+def mfa_recover(body: MfaRecoverIn, db: Session = Depends(get_db)):
+    """I lost my authenticator. Password + one unused recovery code gets back to enrolment.
+
+    The recovery code is spent, and the answer is an *enrolment-scoped* token - not a session.
+    The caller must register a new authenticator and confirm a fresh code before the account
+    is usable again, so losing a device can never leave an account with a second factor the
+    owner no longer controls.
+    """
+    user = db.execute(
+        select(User).where(User.email == body.email.lower().strip())
+    ).scalars().first()
+    if not user or not verify_password(body.password, user.password_hash) or not user.is_active:
+        raise HTTPException(401, "Invalid email or password")
+    _assert_not_locked(user)
+
+    remaining, used = mfa.consume_recovery_code(user.mfa_recovery_codes or [], body.recovery_code)
+    if not used:
+        _record_mfa_failure(db, user)
+        raise HTTPException(401, "That recovery code is not valid or has already been used.")
+
+    user.mfa_recovery_codes = remaining
+    user.failed_login_count = 0
+    user.locked_until = None
+    _audit(db, user, "MFA_RECOVERY_CODE_USED", "users", user.id,
+           detail={"remaining": len(remaining)})
+    _notify_security_change(db, user, "MFA_CHANGED",
+                            change="A recovery code was used to start re-enrolment")
+    db.commit()
+    return {
+        "access_token": create_access_token(str(user.id), user.role,
+                                            extra={"scope": MFA_ENROLMENT_SCOPE}),
+        "token_type": "bearer",
+        "scope": MFA_ENROLMENT_SCOPE,
+        "recovery_codes_remaining": len(remaining),
+        "message": ("Recovery code accepted. Set up your authenticator again: this token only "
+                    "permits /admin/auth/mfa/enroll and /admin/auth/mfa/confirm."),
+    }
+
+
+@router.post("/auth/mfa/recovery-codes/regenerate")
+def mfa_regenerate_recovery_codes(body: MfaRegenerateIn, db: Session = Depends(get_db),
+                                  user: User = Depends(current_user)):
+    """Replace every recovery code. The old ones stop working the moment this succeeds."""
+    if not (user.mfa_secret and user.mfa_confirmed_at):
+        raise HTTPException(400, "Enable two-factor authentication first.")
+    _assert_not_locked(user)
+    method = _accept_second_factor(db, user, body.code)
+    plain, hashed = mfa.issue_recovery_codes(int(settings.mfa_recovery_code_count))
+    user.mfa_recovery_codes = hashed
+    _audit(db, user, "MFA_RECOVERY_CODES_REGENERATED", "users", user.id,
+           detail={"count": len(plain), "method": method})
+    _notify_security_change(db, user, "MFA_CHANGED", change="Recovery codes were regenerated")
+    db.commit()
+    return {"ok": True, "recovery_codes": plain,
+            "warning": "The previous codes no longer work. Store these now; they are not shown again."}
+
+
+@router.post("/auth/mfa/reset")
+def mfa_reset(body: MfaResetIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Administrator-initiated reset of *another* account's two-factor enrolment.
+
+    Requires an ADMIN session and a live code from the acting administrator's own
+    authenticator, so a stolen session alone cannot strip the second factor off anyone. The
+    affected account is notified and the action is audited against the actor.
+    """
+    if user.role != "ADMIN":
+        raise HTTPException(403, "Only an administrator can reset another account's two-factor authentication.")
+    if body.user_id == user.id:
+        raise HTTPException(400, "Use your own security page to change your two-factor settings.")
+    target = db.get(User, body.user_id)
+    if not target:
+        raise HTTPException(404, "User not found")
+    _assert_not_locked(user)
+    if not (user.mfa_secret and user.mfa_confirmed_at):
+        raise HTTPException(400, "Your own account must have two-factor authentication enabled.")
+    _accept_second_factor(db, user, body.code)
+
+    target.mfa_secret = None
+    target.mfa_confirmed_at = None
+    target.mfa_recovery_codes = []
+    target.mfa_last_used_step = None
+    target.failed_login_count = 0
+    target.locked_until = None
+    _audit(db, user, "MFA_RESET_BY_ADMIN", "users", target.id,
+           detail={"target_email": target.email, "target_role": target.role})
+    _notify_security_change(db, target, "MFA_RESET",
+                            change=f"An administrator ({user.email}) reset two-factor authentication")
+    db.commit()
+    return {"ok": True, "message": (
+        f"Two-factor authentication was reset for {target.email}. They will be asked to enrol "
+        "a new authenticator at their next sign-in."
+    )}
 
 # ======================================================= counselor dashboard
 @router.get("/counselor/dashboard")
@@ -431,7 +681,9 @@ def document_link(document_id: int, db: Session = Depends(get_db), user: User = 
 def notifications_inbox(db: Session = Depends(get_db), user: User = Depends(require_staff),
                         unread_only: bool = False, limit: int = Query(default=50, le=200)):
     stmt = select(Notification).where(
-        or_(Notification.user_id == user.id, Notification.user_id.is_(None))
+        or_(Notification.user_id == user.id, Notification.user_id.is_(None)),
+        # An EMAIL row is the delivery record for a mailbox, not a second inbox item.
+        notify.inbox_filter(),
     ).order_by(desc(Notification.created_at))
     if unread_only:
         stmt = stmt.where(Notification.read_at.is_(None))

@@ -31,6 +31,9 @@ class Rule:
 # Ordered: the first match wins.
 RULES: list[Rule] = [
     Rule(re.compile(r"/api/v1/admin/auth/login$"), 10, 300, ("POST",), "login"),
+    # A lost-device recovery attempt is the most attractive endpoint to guess at: it accepts a
+    # password *and* a recovery code, so it gets a tighter bucket than the rest of the flow.
+    Rule(re.compile(r"/api/v1/admin/auth/mfa/recover$"), 5, 900, ("POST",), "mfa_recover"),
     Rule(re.compile(r"/api/v1/admin/auth/mfa/"), 10, 300, ("POST",), "mfa"),
     Rule(re.compile(r"/api/v1/leads$"), 8, 3600, ("POST",), "leads"),
     Rule(re.compile(r"/api/v1/appointments$"), 6, 3600, ("POST",), "appointments"),
@@ -39,6 +42,9 @@ RULES: list[Rule] = [
     Rule(re.compile(r"/api/v1/brochures/generate$"), 20, 3600, ("POST",), "brochure"),
     Rule(re.compile(r"/api/v1/(match|eligibility)/"), 60, 3600, ("POST",), "engines"),
     Rule(re.compile(r"/api/v1/documents/"), 40, 3600, ("POST", "PUT", "DELETE"), "documents"),
+    # An admin-triggered SMTP test sends real mail (and burns the Gmail daily quota), so it gets
+    # its own small bucket: a stolen session must not be able to use the mailbox as a weapon.
+    Rule(re.compile(r"/api/v1/admin/config/test/"), 10, 300, ("POST",), "config_test"),
     Rule(re.compile(r"/api/v1/track$"), 600, 3600, ("POST",), "track"),
     Rule(re.compile(r"/api/v1/admin/"), 600, 60, name="admin"),
     Rule(re.compile(r"/api/v1/"), 300, 60, name="public"),

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { SITE_URL, apiOrNull, getSettings } from "@/lib/api";
+import { contactFromSettings, safeExternalHref } from "@/lib/contact";
 import SiteHeader from "@/components/site-header";
 import Analytics from "@/components/analytics";
 import { BottomNav, SiteFooter, WhatsAppButton } from "@/components/site-chrome";
@@ -48,6 +49,8 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     apiOrNull<any[]>("/countries", 300).then((c) => c ?? []),
   ]);
 
+  const contact = contactFromSettings(settings);
+
   const org = {
     "@context": "https://schema.org",
     "@type": settings.organization_type || "EducationalOrganization",
@@ -63,10 +66,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       postalCode: "1230",
       addressCountry: "BD",
     },
-    telephone: settings.phones?.[0],
-    email: settings.emails?.[0],
+    telephone: contact.phone ?? undefined,
+    email: contact.email ?? undefined,
     openingHours: settings.office_hours,
-    sameAs: [settings.facebook_page_url, settings.instagram_url, settings.linkedin_url, settings.youtube_url].filter(Boolean),
+    sameAs: [contact.facebookUrl, settings.instagram_url, settings.linkedin_url, settings.youtube_url]
+      .map((u) => safeExternalHref(u))
+      .filter(Boolean),
     areaServed: "Bangladesh",
   };
 

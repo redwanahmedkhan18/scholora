@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { apiOrNull, getSettings } from "@/lib/api";
+import { contactFromSettings } from "@/lib/contact";
 import { LEVEL_LABEL, dateLabel, money, months, sourceTypeLabel } from "@/lib/format";
 import PrintBar from "@/components/print-bar";
 
@@ -372,7 +373,8 @@ export default async function BrochurePage({ params }: Props) {
         <p className="mt-2">
           {/* Imprint is assembled from site settings so a change of office, phone or email
               reaches every previously generated brochure without a redeploy. */}
-          {[settings.brand_name, settings.office_address, settings.emails?.[0], settings.phones?.[0]]
+          {[settings.brand_name, settings.office_address,
+            contactFromSettings(settings).email, contactFromSettings(settings).phoneDisplay]
             .filter(Boolean)
             .join(" · ")}
           {". "}

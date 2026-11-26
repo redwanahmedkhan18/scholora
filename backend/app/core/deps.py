@@ -21,6 +21,16 @@ ROLE_HIERARCHY = {
 # who never enrolled still received an unrestricted token.
 MFA_ENROLMENT_SCOPE = "mfa_enrolment"
 
+# A token that proves the password was correct and nothing else. It is the handle the login
+# screen holds between the two steps, so the second step does not have to resend the password
+# and cannot be replayed as a session.
+MFA_CHALLENGE_SCOPE = "mfa_challenge"
+
+# Every token that is *not* a session. Anything in this set must be refused by
+# current_user/require_* - the failure mode of forgetting one was a half-authenticated token
+# reaching the whole back office.
+NON_SESSION_SCOPES = frozenset({MFA_ENROLMENT_SCOPE, MFA_CHALLENGE_SCOPE})
+
 
 def _authenticate(authorization: Optional[str], db: Session) -> tuple[User, dict]:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -38,12 +48,13 @@ def _authenticate(authorization: Optional[str], db: Session) -> tuple[User, dict
 
 
 def current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)) -> User:
-    """A fully authenticated session. Enrolment-scoped tokens are refused here."""
+    """A fully authenticated session. Any scoped (non-session) token is refused here."""
     user, payload = _authenticate(authorization, db)
-    if payload.get("scope") == MFA_ENROLMENT_SCOPE:
+    scope = payload.get("scope")
+    if scope in NON_SESSION_SCOPES:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Multi-factor authentication must be set up before this account can be used.",
+            "Multi-factor authentication must be completed before this account can be used.",
         )
     return user
 
@@ -54,8 +65,14 @@ def enrolling_user(authorization: Optional[str] = Header(None), db: Session = De
 
     Used only by the MFA set-up endpoints, so someone locked out by the mandatory-MFA rule
     can still complete enrolment, and an already-signed-in user can rotate their secret.
+    A *challenge* token is refused: it has not seen a second factor yet.
     """
-    user, _ = _authenticate(authorization, db)
+    user, payload = _authenticate(authorization, db)
+    if payload.get("scope") == MFA_CHALLENGE_SCOPE:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Complete the authentication challenge before changing two-factor settings.",
+        )
     return user
 
 

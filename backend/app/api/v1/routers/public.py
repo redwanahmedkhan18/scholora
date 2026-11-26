@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api import serializers as S
+from app.core import validation
 from app.core.connectivity import log_database_error
 from app.core.database import get_db
 from app.models.base import (
@@ -62,6 +63,66 @@ def get_settings(db: Session = Depends(get_db)):
     if not row:
         raise HTTPException(404, "Site settings not initialised")
     return S.site_settings(row)
+
+
+@router.get("/contact")
+def get_contact(db: Session = Depends(get_db)):
+    """The only contact fields the public site is allowed to see, in one small document.
+
+The header, footer, contact page, mobile navigation and WhatsApp button all render this.
+Nothing administrative leaks: no ids, no tracking configuration, no credentials, no
+settings that are not already printed on the page. ``link`` forms are pre-computed so the
+browser never has to guess how to build a ``tel:``/``wa.me`` URL from a display string.
+"""
+    row = db.get(SiteSetting, 1)
+    if not row:
+        raise HTTPException(404, "Site settings not initialised")
+    # Rows written before the admin form was validated can still hold junk ("not-a-phone",
+    # "javascript:alert(1)"). The admin endpoint refuses new ones, but this endpoint is the one
+    # the public page renders, so it re-checks and publishes nothing it cannot prove is usable.
+    phones = _usable(validation.normalize_phone, row.phones or [])
+    emails = _usable(validation.normalize_email, row.emails or [])
+    whatsapp = _maybe(validation.normalize_phone, row.whatsapp_number) or ""
+    wa_digits = validation.whatsapp_number(whatsapp)
+    facebook = _maybe(validation.normalize_facebook_url, row.facebook_page_url)
+    return {
+        "phone": phones[0] if phones else None,
+        "phone_display": validation.phone_display(phones[0]) if phones else None,
+        "extra_phones": phones[1:],
+        "email": emails[0] if emails else None,
+        "extra_emails": emails[1:],
+        "whatsapp": {
+            "number": whatsapp or None,
+            "link_number": wa_digits or None,
+            "enabled": bool(row.whatsapp_enabled) and bool(wa_digits),
+            "default_message": row.whatsapp_default_message or "",
+        },
+        "facebook_url": facebook,
+        "office_address": row.office_address,
+        "office_hours": row.office_hours,
+        "updated_at": S._dt(row.updated_at),
+    }
+
+
+def _maybe(normalize, raw):
+    """``normalize(raw)`` or None - the value is unusable, so it is not published."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return normalize(text)
+    except ValueError:
+        return None
+
+
+def _usable(normalize, values) -> list[str]:
+    """Only the values that normalise; a bad entry is dropped, not passed through."""
+    out: list[str] = []
+    for value in values:
+        cleaned = _maybe(normalize, value)
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
 
 
 

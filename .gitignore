@@ -9,15 +9,11 @@
 # 1. ENVIRONMENT VARIABLES & SECRETS
 # ============================================================
 
-# Ignore ALL files and directories beginning with .env
+# Ignore EVERY file whose basename begins with .env, at any depth, without exception.
+# There are no committed templates by policy: a template is still a .env* file and must never be
+# published. Local copies stay on disk; `git rm --cached` only stops tracking them.
 .env*
 **/.env*
-.env.example
-# ...except the committed templates. backend/.env.example was added before the rule and is
-# tracked; without this negation a new template (frontend/.env.example) silently cannot be
-# committed, which is how documentation goes missing.
-!/backend/.env.example
-!/frontend/.env.example
 
 # Secret and credential files
 *.pem
@@ -89,6 +85,11 @@ eggs/
 .eggs/
 lib/
 lib64/
+# ...except the frontend's own source directory, which Next calls src/lib by convention. The
+# Python-packaging rule above matched it, so a new file there (contact.ts) was silently ignored
+# and a fresh clone could not build.
+!/frontend/src/lib/
+!/frontend/src/lib/**
 parts/
 sdist/
 var/
@@ -199,6 +200,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+# TypeScript's incremental build cache. It was committed early, so the broad glob below did not
+# apply to it; this explicit rule plus `git rm --cached` keeps the generated file out of Git
+# while leaving it on disk for the next build.
+frontend/tsconfig.tsbuildinfo
 *.tsbuildinfo
 
 # Runtime
@@ -483,7 +488,9 @@ crash.*.log
 
 # Generated documentation
 site/
-docs/_build/
+# The written deliverables are a local working archive and are never published. Root-anchored so
+# it cannot match a nested directory of the same name in another project.
+/docs/
 
 # Generated assets
 generated-assets/

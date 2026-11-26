@@ -133,6 +133,9 @@ export function PlatformConfig() {
   const TESTS: Dict = {
     whatsapp: [["whatsapp", "Test WhatsApp"]],
     meta: [["meta_capi", "Test Conversions API"], ["facebook_page", "Test page token"]],
+    // Verifies the connection and the App Password without sending anything (no body).
+    // To prove the last mile, run `python -m app.mgmt_admin --send-test-email you@example.org`.
+    email: [["smtp", "Test SMTP"]],
     llm: [["grok", "Test Grok"], ["mistral", "Test Mistral"], ["gemini", "Test Gemini"]],
     embeddings: [["embeddings", "Test embeddings"]],
   };

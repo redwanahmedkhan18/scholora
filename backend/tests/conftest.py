@@ -40,6 +40,9 @@ for _external_credential in (
     "FACEBOOK_PAGE_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN",
     "WHATSAPP_APP_SECRET", "XAI_API_KEY", "MISTRAL_API_KEY", "GEMINI_API_KEY",
     "GA4_MEASUREMENT_ID", "GOOGLE_ADS_CONVERSION_ID", "S3_ACCESS_KEY", "S3_SECRET_KEY",
+    # SMTP too: a developer's real Gmail App Password in backend/.env must never be used by a
+    # test run, and tests that assert "not configured" must actually see an empty mailbox.
+    "SMTP_HOST", "SMTP_USER", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL",
 ):
     os.environ[_external_credential] = ""
 
@@ -63,6 +66,20 @@ def _database():
 def client():
     with TestClient(fastapi_app) as c:
         yield c
+
+
+@pytest.fixture
+def smtp(monkeypatch):
+    """A working mailbox backed by the fake SMTP server (no socket is ever opened)."""
+    from smtp_fake import configure
+    return configure(monkeypatch)
+
+
+@pytest.fixture
+def unconfigured(monkeypatch):
+    """No mailbox configured - the default state of a fresh environment."""
+    from smtp_fake import unconfigure
+    unconfigure(monkeypatch)
 
 
 @pytest.fixture(scope="session")
@@ -91,8 +108,11 @@ def admin_token(client, api) -> str:
         return body["access_token"]
 
     assert body.get("mfa_required") is True, body
+    challenge = body.get("challenge_token")
+    assert challenge, body
     res = client.post(f"{api}/admin/auth/mfa/challenge",
-                      json={**creds, "code": mfa.current_code(DEV_MFA_SECRET_ADMIN)})
+                      json={"challenge_token": challenge,
+                            "code": mfa.current_code(DEV_MFA_SECRET_ADMIN)})
     assert res.status_code == 200, res.text
     return res.json()["access_token"]
 

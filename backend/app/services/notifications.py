@@ -3,6 +3,13 @@
 One table drives the staff inbox, the student portal and the outbound channels. Delivery
 adapters are pluggable: WhatsApp and email are attempted when credentials exist, otherwise
 the row stays QUEUED and is visible in the admin so nothing disappears silently.
+
+Two kinds of row live here and they are deliberately distinguishable:
+
+* an **inbox row** (channel WEBSITE/WHATSAPP) - the record an operator or student reads;
+* an **email copy** (channel EMAIL) - the delivery record for the message that went to the
+  recipient's mailbox. It is kept out of the inbox by ``INBOX_CHANNELS`` so one event does
+  not look like two.
 """
 from __future__ import annotations
 
@@ -19,6 +26,15 @@ from app.core.config import settings
 from app.models.crm import Notification, User
 
 log = logging.getLogger(__name__)
+
+#: Channels that produce something to read in the in-app inbox. An EMAIL row is a delivery
+#: record for a mailbox, not a second inbox item.
+INBOX_CHANNELS = ("WEBSITE", "WHATSAPP", "SMS", "IN_APP")
+
+#: Triggers important enough to also leave the building by email. All of them are security
+#: events about the recipient's own account, which is the one category worth an outbound
+#: message; marketing blasts are not part of this application.
+EMAIL_TRIGGERS = frozenset({"MFA_CHANGED", "MFA_RESET"})
 
 TEMPLATES: dict[str, dict[str, str]] = {
     "LEAD_CREATED": {
@@ -55,6 +71,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "title": "{count} records need verification",
         "body": "Fields past their review date are showing as NEEDS_REVIEW on the public site.",
         "severity": "WARNING",
+    },
+    "MFA_CHANGED": {
+        "title": "Two-factor authentication changed",
+        "body": "{change}. If this was not you, contact an administrator immediately.",
+        "severity": "WARNING",
+    },
+    "MFA_RESET": {
+        "title": "Two-factor authentication was reset by an administrator",
+        "body": "{change}. You will be asked to enrol an authenticator app at your next sign-in.",
+        "severity": "CRITICAL",
     },
     "DATA_CONFLICT": {
         "title": "Conflicting sources: {entity}",
@@ -160,7 +186,78 @@ def _deliver(db: Session, note: Notification, commit: bool = True) -> None:
             db.commit()
         return
 
+    if note.channel == "EMAIL":
+        _deliver_email(note)
+        if commit:
+            db.commit()
+        return
+
     # No transport configured: leave QUEUED so it is visible and retryable in the admin.
+
+
+def _deliver_email(note: Notification) -> None:
+    """Attempt one email and record the server's answer on the row.
+
+    Never raises: a mailbox problem must not fail the security operation that triggered the
+    notice. The row keeps the verbatim (scrubbed) error so the admin can see *why*.
+    """
+    from app.services import email, email_templates
+
+    rendered = email_templates.security_notice(
+        note.title or "Security notice",
+        note.body or "",
+        action_url=note.action_url,
+        account=note.recipient,
+    )
+    result = email.send(note.recipient, rendered.subject, rendered.text, rendered.html)
+    if result.ok:
+        note.status = "SENT"
+        note.sent_at = datetime.utcnow()
+    elif result.detail.get("skipped"):
+        # Nothing was attempted because SMTP is not configured: QUEUED is the honest state.
+        note.status = "QUEUED"
+        note.body = f"{note.body or ''}\n\n[not sent: {result.error}]".strip()
+        log.info("notifications: email copy for %s left QUEUED - %s", note.trigger, result.error)
+    else:
+        note.status = "FAILED"
+        # The reason belongs on the record, not only in the log: an operator looking at the
+        # admin sees why the message did not arrive and what to fix.
+        note.body = f"{note.body or ''}\n\n[delivery failed after {result.attempts} attempt(s): {result.error}]".strip()
+        log.warning("notifications: email copy for %s failed - %s", note.trigger, result.error)
+
+
+def security_notice(db: Session, user: User, trigger: str, **fields: Any) -> Notification:
+    """Record a security event in the inbox and, when SMTP exists, email the account holder.
+
+    The single entry point for MFA enrol/disable/reset/recovery so the in-app record and the
+    outbound copy can never drift apart. Delivery failures are recorded, never raised: the
+    security change itself has already succeeded by the time this runs.
+    """
+    note = create(db, trigger, recipient=user.email, user_id=user.id,
+                  entity_type="users", entity_id=user.id, action_url="/admin",
+                  commit=False, **fields)
+    if trigger not in EMAIL_TRIGGERS or not user.email:
+        db.commit()
+        return note
+
+    copy = Notification(
+        channel="EMAIL", recipient=user.email, trigger=trigger,
+        title=note.title, body=note.body, status="QUEUED",
+        # user_id is recorded for traceability, but INBOX_CHANNELS keeps it out of the inbox.
+        user_id=user.id, entity_type="users", entity_id=user.id,
+        action_url=note.action_url, severity=note.severity,
+    )
+    db.add(copy)
+    db.commit()
+    db.refresh(copy)
+    _deliver_email(copy)
+    db.commit()
+    return note
+
+
+def inbox_filter():
+    """The clause that keeps mailbox delivery records out of the in-app inbox."""
+    return Notification.channel.in_(INBOX_CHANNELS)
 
 
 def mark_read(db: Session, note_id: int, *, user_id: Optional[int] = None,
@@ -179,7 +276,7 @@ def mark_read(db: Session, note_id: int, *, user_id: Optional[int] = None,
 
 def unread_count(db: Session, *, user_id: Optional[int] = None,
                  student_profile_id: Optional[int] = None) -> int:
-    stmt = select(Notification).where(Notification.read_at.is_(None))
+    stmt = select(Notification).where(Notification.read_at.is_(None), inbox_filter())
     if user_id:
         stmt = stmt.where(Notification.user_id == user_id)
     if student_profile_id:

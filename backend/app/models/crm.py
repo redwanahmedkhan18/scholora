@@ -30,6 +30,10 @@ class User(Base, TimestampMixin):
     mfa_secret: Mapped[Optional[str]] = mapped_column(String(64))
     mfa_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     mfa_recovery_codes: Mapped[Optional[list]] = mapped_column(JSONType, default=list)
+    # The TOTP time-step of the last accepted code. A code belongs to a 30-second step and
+    # was previously accepted for the whole drift window, so a captured code could be
+    # replayed for up to 90 seconds. Anything at or below this step is now refused.
+    mfa_last_used_step: Mapped[Optional[int]] = mapped_column(Integer)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
 

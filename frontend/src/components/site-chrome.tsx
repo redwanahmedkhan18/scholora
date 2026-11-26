@@ -4,7 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getProfileToken } from "@/lib/portal";
-import { track, whatsappHref } from "@/lib/track";
+import { track } from "@/lib/track";
+import { contactFromSettings, mailtoHref, safeExternalHref, telHref, whatsappHref } from "@/lib/contact";
 
 type Dict = Record<string, any>;
 
@@ -15,10 +16,12 @@ export function WhatsAppButton({ settings }: { settings: Dict }) {
   useEffect(() => { const t = setTimeout(() => setShow(true), 900); return () => clearTimeout(t); }, []);
   if (settings.whatsapp_enabled === false || !settings.whatsapp_number) return null;
   if (pathname.startsWith("/admin") || pathname.startsWith("/brochure")) return null;
+  const contact = contactFromSettings(settings);
+  if (!contact.whatsappHref) return null;
 
   return (
     <a
-      href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message, `(page: ${pathname})`)}
+      href={whatsappHref(settings.whatsapp_number, contact.whatsappMessage, `(page: ${pathname})`) ?? undefined}
       target="_blank" rel="noopener noreferrer"
       onClick={() => track("whatsapp_click", { placement: "floating", path: pathname }, "Contact")}
       aria-label="Chat with a counselor on WhatsApp"
@@ -86,7 +89,7 @@ export function BottomNav({ settings }: { settings: Dict }) {
           return (
             <li key={it.label}>
               {it.href === "wa" ? (
-                <a href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message)}
+                <a href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message) ?? undefined}
                   target="_blank" rel="noopener noreferrer"
                   onClick={() => track("whatsapp_click", { placement: "bottom_nav" }, "Contact")}
                   className="flex flex-col items-center py-2 text-emerald-600">
@@ -157,11 +160,11 @@ export function SiteFooter({ settings, countries }: { settings: Dict; countries:
             <address className="mt-4 space-y-1 text-sm not-italic">
               <p>{settings.office_address}</p>
               <p>{settings.office_hours}</p>
-              {settings.phones?.map((p: string) => (
-                <p key={p}><a href={`tel:${p}`} className="hover:text-accent-400">{p}</a></p>
+              {Array.isArray(settings.phones) && settings.phones.filter((p: string) => telHref(p)).map((p: string) => (
+                <p key={p}><a href={telHref(p) ?? undefined} className="hover:text-accent-400">{p}</a></p>
               ))}
-              {settings.emails?.map((e: string) => (
-                <p key={e}><a href={`mailto:${e}`} className="hover:text-accent-400">{e}</a></p>
+              {Array.isArray(settings.emails) && settings.emails.filter((e: string) => mailtoHref(e)).map((e: string) => (
+                <p key={e}><a href={mailtoHref(e) ?? undefined} className="hover:text-accent-400">{e}</a></p>
               ))}
             </address>
           </div>
@@ -199,8 +202,8 @@ export function SiteFooter({ settings, countries }: { settings: Dict; countries:
               <Link href="/appointments" className="block rounded-xl bg-white/10 px-4 py-2.5 text-center text-sm font-bold text-white ring-1 ring-white/20 hover:bg-white/20">
                 Book a counselor
               </Link>
-              {settings.whatsapp_number && (
-                <a href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message)} target="_blank" rel="noopener noreferrer"
+              {settings.whatsapp_number && whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message) && (
+                <a href={whatsappHref(settings.whatsapp_number, settings.whatsapp_default_message) ?? undefined} target="_blank" rel="noopener noreferrer"
                   onClick={() => track("whatsapp_click", { placement: "footer" }, "Contact")}
                   className="block rounded-xl bg-emerald-600 px-4 py-2.5 text-center text-sm font-bold text-white hover:bg-emerald-500">
                   WhatsApp {settings.whatsapp_number}
@@ -213,9 +216,9 @@ export function SiteFooter({ settings, countries }: { settings: Dict; countries:
               {[["Facebook", settings.facebook_page_url], ["Messenger", settings.messenger_url],
                 ["Instagram", settings.instagram_url], ["LinkedIn", settings.linkedin_url],
                 ["YouTube", settings.youtube_url]]
-                .filter(([, href]) => !!href)
+                .filter(([, href]) => !!safeExternalHref(href))
                 .map(([label, href]) => (
-                  <a key={label as string} href={href as string} target="_blank" rel="noopener noreferrer"
+                  <a key={label as string} href={safeExternalHref(href) ?? undefined} target="_blank" rel="noopener noreferrer"
                     onClick={() => track("social_click", { network: label })}
                     className="rounded-lg bg-white/10 px-3 py-1.5 text-xs font-semibold text-white ring-1 ring-white/15 hover:bg-white/20">
                     {label}
@@ -250,7 +253,9 @@ export function SiteFooter({ settings, countries }: { settings: Dict; countries:
 
 /* ----------------------------------------------- Facebook page embed block */
 export function FacebookPanel({ settings }: { settings: Dict }) {
-  if (!settings.facebook_page_url) return null;
+  const pageHref = safeExternalHref(settings.facebook_page_url);
+  const messengerHref = safeExternalHref(settings.messenger_url);
+  if (!pageHref) return null;
   return (
     <div className="card p-5">
       <div className="flex items-center gap-3">
@@ -261,13 +266,13 @@ export function FacebookPanel({ settings }: { settings: Dict }) {
         </div>
       </div>
       <div className="mt-4 grid gap-2 sm:grid-cols-2">
-        <a href={settings.facebook_page_url} target="_blank" rel="noopener noreferrer"
+        <a href={pageHref} target="_blank" rel="noopener noreferrer"
           onClick={() => track("facebook_page_click", { placement: "panel" })}
           className="rounded-xl bg-[#1877F2] px-4 py-2.5 text-center text-sm font-bold text-white hover:brightness-110">
           Visit our page
         </a>
-        {settings.messenger_url && (
-          <a href={settings.messenger_url} target="_blank" rel="noopener noreferrer"
+        {messengerHref && (
+          <a href={messengerHref} target="_blank" rel="noopener noreferrer"
             onClick={() => track("messenger_click", { placement: "panel" }, "Contact")}
             className="rounded-xl bg-slate-900 px-4 py-2.5 text-center text-sm font-bold text-white hover:bg-slate-800">
             Message us
