@@ -8,6 +8,7 @@ Git command that does not answer is an error, never a clean result.
 
     python3 scripts/policy-check.py                       # index + staged + ignore rules
     python3 scripts/policy-check.py --range origin/main..HEAD
+    python3 scripts/policy-check.py --all-commits        # every commit in the history
 
 Exit codes: 0 clean, 1 violation found, 2 the check could not be performed.
 
@@ -141,6 +142,33 @@ def _commit_changes(commit: str) -> List[Tuple[str, str]]:
     return changes
 
 
+def _scan_commits(commits: Sequence[str]) -> List[str]:
+    """Report every prohibited path a commit *introduces or modifies*.
+
+    Deletions are the remediation itself, so they are not offenders — but the commit that
+    introduced the file is still caught, even when a later commit removes it again.
+    """
+    offenders: List[str] = []
+    for commit in commits:
+        for status, path in _commit_changes(commit):
+            if not is_prohibited(path):
+                continue
+            if status.startswith("D"):
+                continue
+            offenders.append(f"{commit[:7]}:{status} {path}")
+    return offenders
+
+
+def check_all_commits() -> List[str]:
+    """Every commit reachable from HEAD, root commits included.
+
+    A range check cannot see the root commit, and on a public repository the whole history is
+    what a clone downloads — so a prohibited file committed once and deleted later is still
+    published to everyone who clones. This is the check CI runs on every push.
+    """
+    return _scan_commits(nul_paths(git("rev-list", "-z", "HEAD")))
+
+
 def check_range(spec: str) -> List[str]:
     """Inspect **every commit** in the range, not the net difference.
 
@@ -157,21 +185,7 @@ def check_range(spec: str) -> List[str]:
     for endpoint in (base, head):
         git("rev-parse", "--verify", "--quiet", f"{endpoint}^{{commit}}")  # raises if unknown
 
-    offenders: List[str] = []
-    commits = nul_paths(git("rev-list", "-z", "--reverse", f"{base}..{head}"))
-    for commit in commits:
-        for status, path in _commit_changes(commit):
-            if not is_prohibited(path):
-                continue
-            # Deleting a prohibited path is the remediation itself, and is the only permissible way
-            # for one to appear in a publication range. Introducing or modifying one is not: the
-            # introducing commit is caught here even if a later commit deletes the file again.
-            if status.startswith("D"):
-                continue
-            # A rename is reported on both sides, so moving content *out of* docs/ is flagged too:
-            # the old path disappears but its contents are published under an allowed name.
-            offenders.append(f"{commit[:7]}:{status} {path}")
-    return offenders
+    return _scan_commits(nul_paths(git("rev-list", "-z", "--reverse", f"{base}..{head}")))
 
 
 def report(title: str, offenders: Iterable[str]) -> bool:
@@ -189,6 +203,8 @@ def main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--range", dest="range_spec", metavar="A..B",
                         help="also check a commit range, e.g. origin/main..HEAD")
+    parser.add_argument("--all-commits", action="store_true",
+                        help="also check every commit reachable from HEAD, root commits included")
     args = parser.parse_args(argv)
 
     try:
@@ -198,6 +214,9 @@ def main(argv: Sequence[str]) -> int:
         if args.range_spec:
             clean &= report(f"no prohibited path in any commit of {args.range_spec}",
                             check_range(args.range_spec))
+        if args.all_commits:
+            clean &= report("no prohibited path in any commit reachable from HEAD",
+                            check_all_commits())
     except InspectionError as exc:
         print(f"ERROR {exc}")
         print("ERROR the policy could not be verified, so this result is not a pass")

@@ -241,10 +241,30 @@ contract suite — set them against the working copy, not here.
 
 ### Continuous integration
 
-This commit contains **no** `.github/workflows/` directory; the CI workflow was written afterwards
-and lives in the wider working copy. A job for this tree should run, in this order: `ruff check`,
-`mypy`, exactly one Alembic head, the backend suite on SQLite, `npm ci`, `tsc --noEmit` and
-`npm test`. No hosted CI run of this commit exists, and nothing below claims one.
+`.github/workflows/ci.yml` runs five jobs on every push to `main`, every pull request and on
+demand, with `permissions: contents: read` and no secrets:
+
+| Job | What it proves |
+| --- | --- |
+| `backend-sqlite` | `ruff`, `mypy app scripts`, and the whole suite on the zero-setup engine |
+| `backend-postgres` | a fresh PostgreSQL 16 + pgvector service: the database starts empty, `alembic upgrade head` builds it, pgvector and `knowledge_chunks.embedding_vec` exist, exactly one revision row, `downgrade base` → `upgrade head` round-trip, and the application answers `/api/health/live` and `/api/health/ready` with PostgreSQL as its database |
+| `backend-redis` | a real Redis service, asserting the `Cache` facade is genuinely Redis-backed (two clients share state, counters, TTLs and JSON payloads) rather than silently using the in-process fallback |
+| `frontend` | `npm ci`, `npx tsc --noEmit`, `npm test` |
+| `repository-policy` | `scripts/policy-check.py` on the tree and on the commits of the change, plus a mutation test proving the guard fails when a prohibited path is introduced |
+
+Two boundaries are deliberate. The backend suite is **SQLite-only**: its fixtures create a
+throwaway SQLite file, so running it against PostgreSQL would test the fixture, not the database —
+the PostgreSQL job therefore verifies the schema and the request path instead. And the policy job
+checks from the publication commit forward: history before it predates the exclusion rule, so the
+guard's `--all-commits` mode (which would scan that older history) is not used as a gate.
+
+Celery is **not** covered by a broker-backed test here. The jobs' wiring is unit-tested, but
+nothing in this snapshot proves worker-loss redelivery, visibility timeouts or beat topology, and
+no such claim is made.
+
+The workflow is verified locally, job by job, against the same container images. A hosted run is
+cited only once one has actually been observed and its logs read: a green tick is not by itself
+evidence that any assertion above held.
 
 | File | Covers |
 | --- | --- |

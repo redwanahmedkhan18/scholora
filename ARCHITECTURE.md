@@ -441,6 +441,13 @@ reports whether the database, cache and broker actually answer and returns the *
 dependencies only; liveness (`/api/health/live`) touches nothing, so a dependency blip cannot put
 Render into a restart loop.
 
+**Continuous integration** (`.github/workflows/ci.yml`) runs five read-only jobs: the SQLite suite
+with `ruff`/`mypy`, a PostgreSQL 16 + pgvector service that migrates an empty database and then
+serves requests through it, a real Redis cache check, the frontend tests and TypeScript build, and
+the publication-policy guard. Each job asserts the *positive* fact it exists for — the cache job
+fails if the cache fell back to memory, the database job fails if the schema is not a vector
+schema, the policy job fails if its own guard can be made to pass on a contaminated history.
+
 **What this repository cannot tell you.** Service names, instance types, the deployed commit,
 whether a dedicated beat service exists and is a single instance, the worker's pool flag,
 Supabase backup schedule and retention, the storage bucket behind `STORAGE_BACKEND`, and which
