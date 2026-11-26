@@ -154,7 +154,7 @@ each of which degrades to a working in-process equivalent rather than failing.
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt   # dev = ruff, mypy, pytest
+pip install -r requirements-dev.txt   # pulls requirements.txt in, and adds pytest/ruff/mypy
 # Create backend/.env yourself from the variable names listed below.
 # No template is published: every `.env*` file is excluded from this repository by policy,
 # so a fresh clone intentionally contains none.
@@ -221,7 +221,7 @@ error.
 ### Tests and verification
 
 ```bash
-cd backend && python -m pytest          # 464 tests on SQLite (needs requirements-dev.txt)
+cd backend && python -m pytest          # 464 tests on SQLite
 cd backend && python -m ruff check . && python -m mypy app scripts
 cd frontend && npm test                 # 28 tests, node --test plus mounted jsdom lifecycle tests
 cd frontend && npx tsc --noEmit         # type-check; `npm run build` needs a live API

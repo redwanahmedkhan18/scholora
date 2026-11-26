@@ -68,6 +68,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          # requirements-dev.txt already pulls requirements.txt in; both are named so the
+          # dependency is explicit at the call site.
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Ruff
