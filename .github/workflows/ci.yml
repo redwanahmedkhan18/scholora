@@ -26,8 +26,11 @@
 name: CI
 
 on:
+  # Every branch, not just main: a change has to be verifiable before it is merged, and a pull
+  # request does not exist yet while the branch is being prepared. A branch with an open pull
+  # request therefore runs twice (once for the push, once for the pull request) - the cost of a
+  # few minutes on a free runner, against the cost of merging something never built.
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
