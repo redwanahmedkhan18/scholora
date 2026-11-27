@@ -235,16 +235,13 @@ def pending_for(db: Session, entity_type: str, entity_id: int) -> List[Catalogue
     ).scalars())
 
 
-def has_pending_material_change(db: Session, entity_type: str, entity_id: int) -> bool:
-    """Whether anything about this record awaits a decision. Suspicious counts."""
-    return bool(db.scalar(
-        select(func.count()).select_from(CatalogueChange).where(
-            CatalogueChange.entity_type == entity_type,
-            CatalogueChange.entity_id == entity_id,
-            CatalogueChange.status == "PENDING",
-            CatalogueChange.classification.in_((MATERIAL, SUSPICIOUS)),
-        )
-    ))
+#: There is deliberately no "is a decision pending for this record?" helper here, and no caller
+#: asks the question before presenting a value. A staged proposal is a proposal: the stored record
+#: keeps the value a human already approved, and the read-time policy decides what may be shown from
+#: that stored value. Suppressing a *currently approved* figure because somebody has drafted a
+#: change to it would hide true information in favour of a draft, which is the opposite of what the
+#: change log is for. (A helper that answered this question existed and was never called; it was
+#: removed rather than wired in, because wiring it in would have introduced that suppression.)
 
 
 def history(db: Session, entity_type: str, entity_id: int, *, limit: int = 50,

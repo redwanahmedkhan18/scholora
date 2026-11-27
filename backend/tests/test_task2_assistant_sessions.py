@@ -84,8 +84,13 @@ def test_no_raw_credential_in_logs_audit_records_or_errors(client, api, db, capl
         assert raw not in repr(row.__dict__)
         res = client.get(f"{api}/assistant/session")
         assert raw not in res.text
-        # A failed request must not echo the cookie either.
-        client.cookies.set(COOKIE, raw[:-1] + "x", path=sessions.COOKIE_PATH)
+        # A failed request must not echo the cookie either. The replacement character is chosen so
+        # the value is *always* different: "raw[:-1] + 'x'" is the same string whenever the
+        # credential already ends in 'x' (base64url contains it), which made this assertion pass
+        # for the wrong reason in about one run in 64.
+        tampered = raw[:-1] + ("A" if raw[-1] != "A" else "B")
+        assert tampered != raw
+        client.cookies.set(COOKIE, tampered, path=sessions.COOKIE_PATH)
         bad = client.get(f"{api}/assistant/session")
         assert bad.status_code == 401 and raw not in bad.text
     finally:
