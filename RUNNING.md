@@ -71,7 +71,7 @@ ENVIRONMENT=development
 Migrate and seed:
 
 ```bash
-alembic upgrade head              # 47 tables (+ alembic_version)
+alembic upgrade head              # 48 tables
 python3 -m app.seed               # demo content, users, homepage slides
 ./../scripts/load-reference-data.sh   # countries, universities, programmes, scholarships
 ```
@@ -92,12 +92,11 @@ python3 -m celery -A app.services.tasks:celery_app worker --pool=prefork --concu
 python3 -m celery -A app.services.tasks:celery_app beat        # scheduled jobs
 ```
 
-> **Use `--pool=prefork`, not `--pool=threads`.** Prefork gives you real worker recycling and
-> supports `task_reject_on_worker_lost`, which requeues work when a child process dies — none of
-> which a thread pool can offer. The working copy also configures a 900 s hard / 780 s soft time
-> limit, which Celery enforces *only* through prefork: measured there, a 20 s task with a 5 s hard
-> limit completed normally under `--pool=threads` and was never killed. **This commit sets no time
-> limits**, so prefork here is a recommendation about recycling, not about enforcement.
+> **Use `--pool=prefork`, not `--pool=threads`.** The worker is configured with a hard time limit
+> (900 s) and a soft one (780 s), and Celery enforces those only through a prefork pool. With
+> `--pool=threads` a task that hangs runs until the worker is restarted: measured, a 20 s task with
+> a 5 s hard limit completed normally and was never killed. Prefork also supports
+> `task_reject_on_worker_lost`, which requeues work when a child process dies.
 >
 > Whatever the pool, delivery is **at-least-once**: a crashed worker's task is restored after
 > `visibility_timeout` (1800 s) and runs again. Every job is therefore written to be idempotent,
@@ -185,26 +184,56 @@ chmod +x scripts/*.sh      # the execute bit does not always survive a checkout
 ## 1.9 Tests and checks
 
 ```bash
-cd backend && python3 -m pytest           # 1031 tests on SQLite
+cd backend && python3 -m pytest           # 1,037 tests on SQLite (25 skipped: the live-service tests)
 ./scripts/verify-new.sh                   # 63 data/API invariants
 ./scripts/smoke-test.sh                   # every public route
 python3 scripts/check-prerender.py        # 421 prerendered pages return success
 cd frontend && npx tsc --noEmit           # types
 ```
 
-A SQLite run skips the tests that need a real server. This commit carries no PostgreSQL or live
-Redis test module and no `SCHOLARA_REQUIRE_*` switches — those live in the wider working copy,
-which is where you run:
+A SQLite run skips the tests that need a real server (`pg` and `redis_live`), because row locks,
+`SKIP LOCKED`, unique-violation re-evaluation and shared counters do not exist there. To run them:
 
 ```bash
-export SCHOLARA_TEST_DATABASE_URL='postgresql+psycopg://user:pw@127.0.0.1:5432/disposable_db'
+export SCHOLARA_PG_URL='postgresql+psycopg://user:pw@127.0.0.1:5432/disposable_db'
+export SCHOLARA_TEST_DATABASE_URL="$SCHOLARA_PG_URL"   # run the whole suite on PostgreSQL
+export SCHOLARA_REDIS_URL='redis://127.0.0.1:6379/0'   # the live cache tests
 export SCHOLARA_REQUIRE_PG_TESTS=1 SCHOLARA_REQUIRE_REDIS_TESTS=1   # a skip becomes a failure
 cd backend && python3 -m pytest
 ```
 
-The switches matter because a skipped test and a passing test look identical in a summary, so a job
-could "pass" while proving nothing. **No CI workflow is part of this commit**; `.github/workflows/`
-is added later in the working copy.
+`SCHOLARA_REQUIRE_*` is what the PostgreSQL CI job uses: without it a skipped test and a passing
+test look identical in a summary, so the job could "pass" while proving nothing. With it set, a
+missing URL is a usage error and any required test that skips fails the run.
+
+That four-variable profile is the strongest local check this repository has: **1,062 passed, zero
+skipped**, the whole suite against a real PostgreSQL with a real Redis required. CI splits the same
+coverage across two jobs so it does not run it twice — `backend-postgres` runs the suite with only
+`SCHOLARA_REQUIRE_PG_TESTS=1` (1,053 passed, the 9 Redis tests skipped) plus the concurrency module
+explicitly, and `backend-redis` runs it with only `SCHOLARA_REQUIRE_REDIS_TESTS=1` (1,046 passed,
+the 16 PostgreSQL tests skipped) plus the live cache module explicitly. Each job fails if its own
+service's tests skip, so neither can pass by skipping the thing it exists to test. The workflow is
+`.github/workflows/ci.yml`, and `.github` is part of this branch — a green badge here is a run over
+the tree you are reading.
+
+#### Migrations
+
+```bash
+cd backend
+export DATABASE_URL='postgresql+psycopg://user:pw@127.0.0.1:5432/disposable_db'
+python3 -m alembic heads                                    # a3b4c5d6e7f8 (head) — exactly one
+python3 -m alembic history                                  # the published baseline, then seven revisions
+python3 -m alembic upgrade head                             # 51 tables + alembic_version
+python3 -m alembic downgrade a7b8c9d0e1f2                    # back to the published baseline
+python3 -m alembic upgrade head
+```
+
+The seven revisions on top of the published baseline `a7b8c9d0e1f2` are `b8c9d0e1f2a3`
+(destination hierarchy, university regions, chunk provenance), `c9d0e1f2a3b4` (assistant sessions),
+`d7e8f9a0b1c2` (pending object deletions), `d9e0f1a2b3c4` (explicit contact consent), `e1f2a3b4c5d6`
+(assistant context slots), `f2a3b4c5d6e7` (catalogue changes) and `a3b4c5d6e7f8` (unique change
+version). `tests/test_pg_concurrency.py` is the suite that needs the real server; it runs against a
+dedicated schema (`pgcamp`) and drops it first, so it can share a disposable database.
 
 ---
 
@@ -394,8 +423,8 @@ curl -X POST .../api/v1/admin/verification/sources/check -H "Authorization: Bear
 # The human verification queue
 curl .../api/v1/admin/verification/queue -H "Authorization: Bearer $TOKEN"
 
-# Provenance rows for one entity type
-curl ".../api/v1/admin/verification/queue" -H "Authorization: Bearer $TOKEN"
+# Citation depth audit → the citation diff in the local docs/ working copy
+cd backend && python3 scripts/verify_citations.py
 
 # Rebuild the knowledge index (refits the local LSA model)
 curl -X POST .../api/v1/admin/embeddings/reindex -H "Authorization: Bearer $TOKEN"
@@ -404,9 +433,8 @@ curl -X POST .../api/v1/admin/embeddings/reindex -H "Authorization: Bearer $TOKE
 Reindex after any bulk import. Retrieval scores are only comparable within one fitted
 model, so stale vectors degrade search quietly rather than loudly.
 
-Backups: nightly `pg_dump`, plus the object store. The database holds the provenance register —
-one row per verified field, three of them from the demo seed and the rest written by imports — so
-losing a backup loses the evidence trail, not just the content.
+Backups: nightly `pg_dump`, plus the object store. The database holds all 4,551
+provenance records — losing it loses the evidence trail, not just the content.
 
 ## 2.6 Troubleshooting
 

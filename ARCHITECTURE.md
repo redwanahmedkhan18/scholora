@@ -7,12 +7,6 @@ Single organisation (Uttara, Dhaka). Not SaaS, not multi-tenant.
 > `RUNNING.md` (how to run it). Every table and column, every endpoint, the full trust rules and
 > the gap audit live in the local `docs/` working copy, which is deliberately not published; this
 > file is the published description of the system and does not depend on it.
->
-> **Scope of this commit.** This file describes the platform as a whole. The commit that publishes
-> it contains the security work only — MFA, the password policy, transactional email and contact
-> routing. Scope resolution, catalogue integrity and change review, privacy erasure and the
-> outbox, the PostgreSQL concurrency suite and the Celery delivery hardening were developed later
-> and are marked **(working copy)** where they appear. Counts below are for the published tree.
 
 ---
 
@@ -54,7 +48,7 @@ would buy nothing but operational overhead and distributed-transaction bugs.
               ┌─────────▼──┐  ┌─────▼─────┐  ┌─▼──────────────┐
               │ PostgreSQL │  │   Redis   │  │ Celery workers │
               │ + pgvector │  │ cache /   │  │ + beat         │
-              │ 47 tables  │  │ ratelimit │  │ 6 scheduled    │
+              │ 50 tables  │  │ ratelimit │  │ 7 scheduled    │
               └────────────┘  │ / broker  │  │ jobs           │
                               └───────────┘  └────────────────┘
                                      │
@@ -78,24 +72,21 @@ accounts.
 ```
 backend/app/
 ├── main.py                 app assembly, CORS, /api/health, router mounting
-├── core/          (16)     cross-cutting concerns, no business logic
+├── core/          (14)     cross-cutting concerns, no business logic
 │   ├── config.py           Pydantic settings + meta_graph_base_url
 │   ├── runtime.py          DB overlay over env (_DynamicSettings, 21 keys/5 groups)
 │   ├── database.py         engine, SessionLocal, Base
 │   ├── security.py         password hashing, JWT
-│   ├── passwords.py        the staff-password policy, applied at every write path
 │   ├── deps.py             current_user, require_role, require_staff
-│   ├── mfa.py              TOTP for staff roles, single-use step and recovery codes
+│   ├── mfa.py              TOTP for staff roles
 │   ├── ratelimit.py        fixed-window limiter, first-match-wins rules
 │   ├── cache.py            Redis helpers, graceful no-Redis fallback
 │   ├── storage.py          private docs, short-lived signed URLs
 │   ├── webhooks.py         signature validation
-│   ├── validation.py       phone / email / URL normalisation shared by API and CLI
-│   ├── connectivity.py     deployment URL normalisation (rediss://, TLS)
 │   ├── llm.py              provider failover: grok → mistral → gemini
 │   ├── embeddings.py       hosted → local LSA → hashing
 │   └── local_semantic.py   TF-IDF + TruncatedSVD, no API key
-├── models/        (4)      SQLAlchemy; 47 application tables (+ alembic_version)
+├── models/        (5)      SQLAlchemy; 50 application tables
 │   ├── base.py             JSONType, VerificationMixin, SeoMixin, ALL vocabularies
 │   ├── education.py        Country, University, Faculty, Department, Program,
 │   │                       ProgramRequirement, ProgramIntake, Scholarship,
@@ -103,7 +94,7 @@ backend/app/
 │   ├── content.py          HomepageSlide, Service, SuccessStory, Event, BlogPost, FAQ …
 │   └── crm.py              User, Lead, Application, Document, Appointment,
 │                           DataVerification, SourceCheck, KnowledgeChunk, AuditLog …
-├── services/      (19)     the actual business logic
+├── services/      (18)     the actual business logic
 │   ├── eligibility.py      5 verdicts, never a probability
 │   ├── matching.py         programme scoring + faculty research matching
 │   ├── costing.py / fx.py  personalised cost of attendance
@@ -111,17 +102,15 @@ backend/app/
 │   ├── rotation.py         homepage slide scheduling/priority
 │   ├── retrieval.py        BM25 + dense fusion, confidence-weighted
 │   ├── assistant*.py       RAG assistant with tool-calling + guardrails
-│   ├── email.py / email_templates.py  SMTP transport, retry, delivery log
 │   ├── importer.py         8 entity types, staging + CONFLICT detection
 │   ├── extraction.py       live reading of university websites
 │   ├── source_verification.py  link classification + verification queue
-│   ├── reference_data.py   replay the reference CSVs idempotently
 │   ├── readiness.py        go-live checklist
 │   ├── whatsapp.py / notifications.py
 │   └── tasks.py            Celery jobs
 └── api/
     ├── serializers.py      shaping + field-level visibility rules
-    └── v1/routers/ (7)     public · actions · student · integrations ·
+    └── v1/routers/ (6)     public · actions · student · integrations ·
                             admin · admin_extra · admin_platform
 ```
 
@@ -150,9 +139,9 @@ frontend/src/
 │   ├── programs/…  scholarships/…  phd/…  faculty/…  success-stories/…
 │   ├── search · compare · shortlist · brochure · profile-assessment
 │   ├── my/…                              student portal
-│   └── admin/      15 screens (CMS, leads, data workbench, marketing,
+│   └── admin/      16 screens (CMS, leads, data workbench, marketing,
 │                   platform settings, readiness, extraction)
-└── components/     28, incl. home-experience.tsx (30-second rotation engine)
+└── components/     27, incl. home-experience.tsx (30-second rotation engine)
                     and site-chrome.tsx (mobile bottom nav + WhatsApp FAB)
 ```
 
@@ -182,9 +171,7 @@ This is the part that distinguishes the platform from a brochure site.
 `DataVerification` records, per field: `entity_type`, `entity_id`, `field_name`,
 `field_value`, `source_url`, `source_type` (TIER_1…TIER_7), `retrieved_at`,
 `verified_at`, `verified_by`, `review_due_at`, `status`, `conflict_with`.
-The table starts almost empty: the demo seed writes **3** rows, the importer writes more, and
-`verification_sweep` + `check_source_links` keep them honest. The wider working copy carries an
-enriched dataset; nothing in the code depends on its size.
+Currently **4,551 rows over 104 cited URLs**.
 
 Confidence states: `VERIFIED` · `NEEDS_REVIEW` · `OUTDATED` · `CONFLICTING` ·
 `UNVERIFIED`. Conflicting sources are **surfaced, never silently overwritten** — the
@@ -232,29 +219,25 @@ requests are spaced; output is always `UNVERIFIED` and nothing auto-writes.
 
 ---
 
-### 5.6 The verification register (and what is not here yet)
+### 5.6 Catalogue integrity, review and change history
 
-**Implemented in this commit.** One row per field in `models.crm.DataVerification` carries the
-status, the source and the reviewer, and the entity's confidence is read from that register rather
-than asserted on the entity itself. `admin_platform` exposes the queue
-(`GET /admin/verification/queue`), the resolve action and the source register
-(`GET /admin/verification/sources`, `check`, `verify`), and the `verifications` resource is
-listed in the admin CRUD. Two consequences are enforced today: a value cannot reach `VERIFIED`
-without a source URL and a verification date, and `CONFLICTING` rows are surfaced for a human
-instead of being overwritten — the importer's `CONFLICT` verdict defaults to `SKIP`.
+Three layers, each answering a different question, and none of them able to promote a figure by
+itself:
 
-**Not in this commit (working copy).** Three capabilities were built afterwards and are absent
-from this tree, so do not look for them here:
-
-| Capability | What it adds | Where it would live |
+| Layer | Question it answers | Where |
 | --- | --- | --- |
-| Integrity audit | 14 inconsistency categories (missing source, expired verification, thin coverage, duplicates) with an explicit cap | `services/catalogue_integrity.py` |
-| Change history | One row per material change, recorded at *staging*, with approval as compare-and-swap and per-(entity, field) version numbering | `models.crm.CatalogueChange` |
-| Scope resolution | One immutable `Scope` per question, failing closed on ambiguous or unsupported constraints | `services/scoping.py`, W5 context slots |
+| Integrity audit | *What is inconsistent right now?* 14 categories — missing source, expired verification, conflict, thin coverage, duplicate — reported with an explicit cap, never silently truncated | `services/catalogue_integrity.py` |
+| Verification register | *Who says this value is right, and when?* One row per field with status, source and reviewer; the entity's confidence is **derived** from that register rather than asserted | `models.crm.DataVerification` |
+| Change history | *What changed, and was it approved?* One row per material change, recorded when an import is **staged** so a conflict is visible before it is applied | `models.crm.CatalogueChange` |
 
-What exists in this commit instead: the verification queue plus the review endpoints above, and
-the importer's staging/`CONFLICT` machinery, which is what keeps an upload from certifying
-itself today.
+An upload can never certify itself: a commit forces `NEEDS_REVIEW` and clears the verification
+dates, trust columns are settable only through the review path (the generic admin CRUD strips
+them), a refusal requires a note, and a reviewer cannot approve their own submission. Decisions
+are compare-and-swap on the state that was reviewed, so two reviewers cannot both "win" one field
+and one change cannot be recorded as both approved and rejected. Version numbers per
+(entity, field) are assigned under a PostgreSQL advisory lock and are unique by index. Staleness
+(`CURRENT` / `REVIEW_OVERDUE` / `STALE` / `UNKNOWN`) is reported, and `UNKNOWN` is a state — a
+missing freshness window is never treated as fresh.
 
 ## 6. Retrieval
 
@@ -270,17 +253,14 @@ tokenize → embed → BM25 lexical → dense top-max(limit*5, 25)
 Weighting by confidence means a well-sourced document outranks a shakier one at equal
 textual relevance — the retrieval layer enforces the trust policy rather than ignoring it.
 
-**Narrowing happens at the edges, not in a resolver.** `retrieval.search()` takes an optional
-`entity_types` filter, a limit and the fusion weights; it has no notion of a destination, a
-region, a budget or an intake year. Structured narrowing is done by the calling endpoint, which
-already knows what the student asked for — `/search`, `/programs`, `/scholarships` and the
-eligibility endpoints filter their own SQL — and the assistant passes the entity types it decided
-to consult. A dedicated scope resolver that turns a free-text question into one immutable,
-fail-closed `Scope` (destination, region, university, subject, degree level, budget, intake year,
-with exclusions winning over inclusions) is **not part of this commit**; it was built later in the
-working copy together with the W5 context slots that carry it across turns. Until then, an
-ambiguous question is answered from a broader retrieval rather than being pinned to a wrong
-subset, and the assistant's guardrails still prevent a fabricated figure.
+**Scope before scoring.** A question is first resolved into one immutable `Scope`
+(`services/scoping.py`): destination, region, university, subject, degree level, budget, intake
+year. `RESOLVED` narrows the query; `NEEDS_CLARIFICATION`, `UNSUPPORTED` and `CONTRADICTORY` fail
+closed — the assistant asks a targeted question or returns an honest empty answer, never an
+unfiltered result. The scope is applied in SQL by per-model adapters (one per schema, because the
+five catalogues do not share a shape), and it is carried across turns by the W5 context slots,
+where the server owns the value and a client cannot set it. Exclusions always win over inclusions,
+and an unresolved mandatory constraint is never dropped to make a query succeed.
 
 **Embeddings** fall back in three stages: hosted provider → local LSA → hashing.
 The local tier (`core/local_semantic.py`) is TF-IDF + TruncatedSVD fitted on the corpus
@@ -304,38 +284,33 @@ Celery with a Redis broker. Six scheduled jobs:
 | `scholara.data_quality_digest` | counts by confidence state for the data manager |
 | `scholara.reindex_knowledge` | refit LSA + rebuild the vector index |
 | `scholara.campaign_metrics` | marketing attribution roll-up |
-
-(Working copy: a seventh job, `scholara.process_pending_deletions`, drains the erasure object
-outbox every five minutes. Erasure and its outbox are not part of this commit.)
+| `scholara.process_pending_deletions` | drain the erasure object-deletion outbox (every 5 minutes) |
 
 Every job returns a dict containing `{"job": "<name>"}` so results are identifiable in
 the result backend.
 
-**(Working copy) Delivery is at-least-once, and the jobs are written for it.** In the working copy
-the worker acknowledges a message only after the task finishes (`task_acks_late`), requeues it when
-a worker dies (`task_reject_on_worker_lost`), and the broker restores an unfinished message after
-`visibility_timeout` (1,800 s) — deliberately longer than the 900 s hard time limit, so recovery
-can never hand a *running* task to a second worker. Idempotency is therefore a requirement, not a
-preference: the outbox drain claims rows with `SELECT … FOR UPDATE SKIP
+**Delivery is at-least-once, and the jobs are written for it.** The worker acknowledges a message
+only after the task finishes (`task_acks_late`), requeues it when a worker dies
+(`task_reject_on_worker_lost`), and the broker restores an unfinished message after
+`visibility_timeout` (1,800 s) — which is deliberately longer than the 900 s hard time limit, so
+recovery can never hand a *running* task to a second worker. Idempotency is therefore a
+requirement, not a preference: the outbox drain claims rows with `SELECT … FOR UPDATE SKIP
 LOCKED`, the verification sweep claims the records it flips with `UPDATE … RETURNING`, reminders
 and the digest de-duplicate per entity per day, and the link checker adopts an existing row when
-two sweeps race to insert it. **This commit runs the default ack-on-receipt configuration**; none
-of those guarantees apply until the hardening lands.
+two sweeps race to insert it.
 
-**Time limits need a prefork pool (working copy).** The 780 s soft and 900 s hard limits are
-enforced by Celery only through a prefork worker; under `--pool=threads` a hung task runs until the
-process is restarted. `RUNNING.md` therefore specifies `--pool=prefork`, and the deployment
-documentation previously specified `--pool=threads` — a discrepancy recorded in the audit and left
-for the owner to settle, because changing a service's pool is a deployment decision. This commit
-configures no time limits.
+**Time limits need a prefork pool.** The 780 s soft and 900 s hard limits are enforced by Celery
+only through a prefork worker; under `--pool=threads` a hung task runs until the process is
+restarted. `RUNNING.md` therefore specifies `--pool=prefork`, and the deployment documentation
+previously specified `--pool=threads` — a discrepancy recorded in the audit and left for the owner
+to settle, because changing a service's pool is a deployment decision.
 
 ---
 
 ## 8. Security
 
 - HTTPS everywhere; RBAC via `require_role(minimum)` against `ROLE_HIERARCHY`
-  (STUDENT 10 → COUNSELOR 50 → APPLICATION_OFFICER 55 → DATA_MANAGER 60 →
-  SENIOR_COUNSELOR 70 → ADMIN 100).
+  (STUDENT → COUNSELOR → SENIOR_COUNSELOR → DATA_MANAGER → ADMIN).
 - **MFA (TOTP) enforced** for configured staff roles.
 - Documents stored privately; access only through **300-second signed URLs**. Uploads
   capped at 15 MB with magic-byte sniffing, not extension trust.
@@ -374,23 +349,23 @@ verifiability.
 
 | | count |
 |---|---:|
-| Tables | 47 application tables (+ `alembic_version`) |
-| API paths / operations | 119 / 127 |
+| Tables | 51 |
+| API paths / operations | 131 / 140 |
 | Routers | 7 |
-| Alembic revisions | 9 |
-| Backend tests | 464 (SQLite) |
-| Frontend tests | 28 |
-| Frontend source files | 86 |
+| Alembic revisions | 16 |
+| Backend tests | 1,037 (SQLite) / 1,062 (PostgreSQL) |
+| Frontend tests | 74 |
+| Frontend source files | 93 |
 
 Content depends on which dataset is loaded, so it is not a property of the code:
 
 | Dataset | What it contributes |
 | --- | --- |
-| Demo seed (`app/seed_data.py`) | 14 countries, 23 universities, 55 programmes, 120 intakes, 15 scholarships, 10 faculty, 3 verification rows |
+| Demo seed (`app/seed_data.py`) | 14 countries, 23 universities, 23 programmes, 120 intakes, 15 scholarships, 10 faculty |
 | Reference CSVs (`backend/data/reference/`) | 91 universities, 110 programmes, 149 intakes, 13 scholarships, 30 professors, 5 countries |
 
 Provenance rows, knowledge chunks and indexed embeddings are produced by the importer and the
-reindex job, so their counts change with every import and every reindex.
+reindex job, so their counts change with every import and with `POLICY_MAX_AGE_DAYS`.
 
 **Known thin spots** (tracked in the local gap audit): 16 universities have no programmes
 attached; 13 countries have no faculty; the citation-depth queue from §11 is unworked.
@@ -405,7 +380,7 @@ with two backends: `local` (files under `STORAGE_DIR`, mode `0600`, with a key-t
 expiry — so a link can be shared for minutes and then stops working; tampering and expiry both
 raise rather than degrade.
 
-**Deletion is an outbox, not a hope (working copy).** Erasing a profile revokes its sessions first, deletes its
+**Deletion is an outbox, not a hope.** Erasing a profile revokes its sessions first, deletes its
 dependent rows leaf-first inside one transaction, and writes the storage keys it must destroy into
 `pending_object_deletions` *in that same transaction*. The objects are then deleted and each key is
 removed from the outbox only after the backend confirms the object is gone. A backend that cannot
@@ -440,13 +415,6 @@ topology runs `alembic upgrade head` as a pre-deploy job. The readiness endpoint
 reports whether the database, cache and broker actually answer and returns the *names* of the failed
 dependencies only; liveness (`/api/health/live`) touches nothing, so a dependency blip cannot put
 Render into a restart loop.
-
-**Continuous integration** (`.github/workflows/ci.yml`) runs five read-only jobs: the SQLite suite
-with `ruff`/`mypy`, a PostgreSQL 16 + pgvector service that migrates an empty database and then
-serves requests through it, a real Redis cache check, the frontend tests and TypeScript build, and
-the publication-policy guard. Each job asserts the *positive* fact it exists for — the cache job
-fails if the cache fell back to memory, the database job fails if the schema is not a vector
-schema, the policy job fails if its own guard can be made to pass on a contaminated history.
 
 **What this repository cannot tell you.** Service names, instance types, the deployed commit,
 whether a dedicated beat service exists and is a single instance, the worker's pool flag,
