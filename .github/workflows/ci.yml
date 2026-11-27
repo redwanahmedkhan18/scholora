@@ -435,7 +435,13 @@ jobs:
           set -uo pipefail
           # A suite that is not discovered is not a green suite: a renamed file, a marker
           # expression or a path filter must fail here rather than pass silently.
-          collected="$(python -m pytest tests/test_pg_concurrency.py --collect-only -q 2>&1 | grep -c '::' || true)"
+          #
+          # No `-q` here: pytest.ini already sets `addopts = -q`, and a second one takes pytest to
+          # -qq, which stops printing node ids and prints only a count line - the first hosted run
+          # of this workflow failed on exactly that, counting 0 tests in a suite that had 16.
+          python -m pytest tests/test_pg_concurrency.py --collect-only > collected.log 2>&1
+          head -n 3 collected.log
+          collected="$(grep -cE '^tests/[^ ]*::' collected.log || true)"
           echo "collected ${collected} concurrency tests"
           test "${collected}" -ge 16 \
             || { echo "::error::the concurrency suite collected ${collected} tests, expected at least 16"; exit 1; }
@@ -558,7 +564,11 @@ jobs:
           SCHOLARA_REQUIRE_REDIS_TESTS: "1"
         run: |
           set -uo pipefail
-          collected="$(python -m pytest tests/test_redis_live.py --collect-only -q 2>&1 | grep -c '::' || true)"
+          # See the note in backend-postgres: pytest.ini's addopts already carries `-q`, so a
+          # second one hides the node ids this count is built from.
+          python -m pytest tests/test_redis_live.py --collect-only > collected.log 2>&1
+          head -n 3 collected.log
+          collected="$(grep -cE '^tests/[^ ]*::' collected.log || true)"
           echo "collected ${collected} live Redis tests"
           test "${collected}" -ge 9 \
             || { echo "::error::the live Redis suite collected ${collected} tests, expected at least 9"; exit 1; }
