@@ -1,6 +1,7 @@
 """Admin / counselor API: auth, dashboards, generic CMS CRUD, verification queue, analytics."""
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -18,6 +19,7 @@ from app.core.database import get_db
 from app.core.deps import (
     MFA_CHALLENGE_SCOPE,
     MFA_ENROLMENT_SCOPE,
+    ROLE_HIERARCHY,
     current_user,
     require_role,
     require_staff,
@@ -47,6 +49,7 @@ from app.models.crm import (
     Document,
     Lead,
     Notification,
+    PendingObjectDeletion,
     SearchQueryLog,
     ShortlistItem,
     StudentProfile,
@@ -68,8 +71,11 @@ from app.models.education import (
     UniversityPartnership,
     UniversityRanking,
 )
+from app.services import erasure, read_audit
 
 router = APIRouter(tags=["admin"])
+
+log = logging.getLogger(__name__)
 
 # key -> (model, slug source field or None, searchable fields)
 RESOURCES: Dict[str, Any] = {
@@ -110,12 +116,29 @@ RESOURCES: Dict[str, Any] = {
     "brochures": (Brochure, None, ["student_name", "token"]),
     "research-areas": (ResearchArea, "name", ["name"]),
     "analytics-events": (AnalyticsEvent, None, ["name", "path"]),
+    "pending-object-deletions": (PendingObjectDeletion, None, ["storage_key"]),
 }
+
+#: Columns that only the review path may set (W9/W12).
+#:
+#: ``confidence`` and its dates are decisions, not fields: they say a named person checked stated
+#: evidence. The generic CRUD form takes any model attribute from the payload, so without this a
+#: COUNSELOR could PUT ``{"confidence": "VERIFIED"}`` on a programme and the read-time policy would
+#: present it to students as official - the entire verification workflow bypassed in one request.
+#: Evidence columns (``source_url``, ``source_type``, ``retrieved_at``) stay writable: they support
+#: a decision without making one.
+TRUST_COLUMNS = frozenset({"confidence", "verified_at", "verified_by", "review_due_at"})
+
+#: Resources whose *state* columns are review decisions and may not be set through CRUD.
+REVIEW_STATE_COLUMNS = {"verifications": frozenset({"status"})}
 
 # Resources that are records of what happened, not content. They must never be edited.
 READ_ONLY_RESOURCES = {
     "audit-logs", "analytics-events", "search-queries", "assistant-conversations",
     "application-history",
+    # A queued object deletion is outstanding privacy work, not editable content: staff can see
+    # that it is pending, and cannot edit or delete the task out from under the retry job.
+    "pending-object-deletions",
 }
 
 
@@ -232,6 +255,9 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_staff)
     campaigns = db.execute(select(AdCampaign)).scalars().all()
     lead_by_campaign = dict(db.execute(select(Lead.campaign_id, func.count(Lead.id))
                                        .group_by(Lead.campaign_id)).all())
+    # ``recent_leads`` below is serialised with each lead's name, phone and email, so this
+    # dashboard is a student-data read and is audited as one.
+    _audit_read(db, user, "dashboard", "dashboard")
     return {
         "counters": {
             "new_leads": count(Lead, Lead.stage == "NEW"),
@@ -574,6 +600,10 @@ def list_rows(resource: str, q: Optional[str] = None, page: int = 1, page_size: 
     rows = db.execute(stmt).scalars().all()
     total = len(rows)
     start = (page - 1) * page_size
+    if read_audit.is_student_resource(resource):
+        # One event per request. The query string, the page number and the result count are
+        # deliberately not recorded: they are caller input and can carry a student's name.
+        _audit_read(db, user, resource, "list")
     return {"total": total, "page": page, "page_size": page_size,
             "items": [_row_to_dict(r) for r in rows[start:start + page_size]]}
 
@@ -584,7 +614,34 @@ def get_row(resource: str, row_id: int, db: Session = Depends(get_db), user: Use
     row = db.get(model, row_id)
     if not row:
         raise HTTPException(404, "Not found")
+    if read_audit.is_student_resource(resource):
+        _audit_read(db, user, resource, "detail", subject_id=row_id)
     return _row_to_dict(row)
+
+
+def _audit_read(db: Session, user: User, resource: str, operation: str, *,
+                subject_id: Optional[int] = None) -> None:
+    """Record a staff read of student data, or refuse to serve it.
+
+    Wrapped so every call site behaves identically: one event per request, and a 503 rather
+    than an unaudited response if the record cannot be written.
+    """
+    try:
+        read_audit.audit_student_read(db, user, resource=resource, operation=operation,
+                                      subject_id=subject_id)
+    except read_audit.AuditUnavailable:
+        raise HTTPException(
+            503, "This view is unavailable because the access could not be recorded."
+        ) from None
+
+
+def _assert_trust_authority(resource: str, user: User) -> None:
+    """Writing the verification register is a review action, not data entry."""
+    if resource not in REVIEW_STATE_COLUMNS:
+        return
+    if ROLE_HIERARCHY.get(user.role, 0) < ROLE_HIERARCHY.get("DATA_MANAGER", 100):
+        raise HTTPException(
+            403, "verification records are written through the review workflow, not by this role")
 
 
 def _assert_writable(resource: str) -> None:
@@ -611,7 +668,10 @@ def _checked_password(password: Any) -> str:
 def create_row(resource: str, payload: Dict[str, Any], db: Session = Depends(get_db),
                user: User = Depends(require_staff)):
     model, slug_field, _ = _model(resource)
-    data = {k: v for k, v in payload.items() if hasattr(model, k) and k != "id"}
+    _assert_trust_authority(resource, user)
+    blocked = TRUST_COLUMNS | REVIEW_STATE_COLUMNS.get(resource, frozenset())
+    data = {k: v for k, v in payload.items()
+            if hasattr(model, k) and k != "id" and k not in blocked}
     if slug_field and not data.get("slug") and data.get(slug_field):
         data["slug"] = slugify(str(data[slug_field]))
     if model is User and payload.get("password"):
@@ -637,8 +697,10 @@ def update_row(resource: str, row_id: int, payload: Dict[str, Any], db: Session 
     if model is User and payload.get("password"):
         from app.core.security import hash_password
         row.password_hash = hash_password(_checked_password(payload.pop("password")))
+    _assert_trust_authority(resource, user)
+    blocked = TRUST_COLUMNS | REVIEW_STATE_COLUMNS.get(resource, frozenset())
     for k, v in payload.items():
-        if hasattr(row, k) and k not in ("id", "created_at"):
+        if hasattr(row, k) and k not in ("id", "created_at") and k not in blocked:
             setattr(row, k, v)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="UPDATE",
                     entity_type=resource, entity_id=row_id, detail={"fields": list(payload)}))
@@ -691,6 +753,49 @@ def delete_row(resource: str, row_id: int, db: Session = Depends(get_db),
     row = db.get(model, row_id)
     if not row:
         raise HTTPException(404, "Not found")
+
+    # A student profile is the root of an ownership tree with eight dependent tables, uploaded
+    # documents in object storage and server-owned assistant sessions. A bare row delete can only
+    # fail, so it is routed through the transactional eraser, which revokes sessions first and
+    # removes the dependents leaf-first in one transaction.
+    if model is StudentProfile:
+        try:
+            counts = erasure.erase_student_profile(
+                db, row_id, actor_id=user.id, actor_email=user.email)
+        except erasure.ProfileNotFound:
+            raise HTTPException(404, "Not found") from None
+        except erasure.ErasureConflict:
+            # An expected data conflict: the eraser rolled back, nothing changed, and the client
+            # can act on it. Distinct from a defect in our own code.
+            raise HTTPException(
+                409, "This profile still has records that block erasure; nothing was changed."
+            ) from None
+        except Exception:
+            # Unexpected, and by construction pre-commit: the eraser no longer lets a failure in
+            # the post-commit object deletion escape (it reports that as unconfirmed work below).
+            # So the transaction is genuinely rolled back when we reach here.
+            log.exception("student-profile erasure failed unexpectedly for id=%s", row_id)
+            raise HTTPException(
+                500, "The profile could not be erased and nothing was changed."
+            ) from None
+        body = {"ok": True, "erased": counts}
+        if counts.get("storage_unconfirmed"):
+            # The database erasure committed but file deletion could not be confirmed. Never
+            # dress this up as a rollback: the records are gone and the caller must know that.
+            body["complete"] = False
+            body["objects_pending"] = counts.get("objects_pending", 0)
+            body["detail"] = (
+                "Student records were erased; some file deletions remain pending and will be "
+                "retried."
+            )
+        elif counts.get("objects_pending"):
+            # Be explicit rather than claiming a complete erasure: the database records are gone,
+            # but some stored files are still queued and will be retried.
+            body["complete"] = False
+            body["objects_pending"] = counts["objects_pending"]
+        else:
+            body["complete"] = True
+        return body
 
     detail: dict = {}
     if model is User:

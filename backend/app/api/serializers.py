@@ -12,13 +12,38 @@ def _dt(v) -> Optional[str]:
 
 
 def provenance(o) -> Dict[str, Any]:
+    """Source, verification date and the read-time verdict for one record.
+
+    ``verified`` is not a copy of the confidence column: it is the verification policy's answer
+    for this record right now, so a page can label a figure "unverified" or "out of date" and say
+    why. Recomputed per request because the answer changes when a review deadline passes.
+
+    The conflict register is checked too, whenever the record is attached to a session (it is on
+    every public endpoint). A second source disagreeing with the official one withholds the
+    record even if its own confidence column still says VERIFIED.
+    """
+    from sqlalchemy.orm import object_session
+
+    from app.core import verification_policy as policy
+
+    db = object_session(o)
+    if db is not None:
+        decision = policy.evaluate_record(db, o)
+    else:
+        decision = policy.evaluate(o)
     return {
         "source_url": getattr(o, "source_url", None),
         "source_type": getattr(o, "source_type", None),
         "verified_at": _dt(getattr(o, "verified_at", None)),
-        "verified_by": getattr(o, "verified_by", None),
+        # No ``verified_by``: this block is serialised on public pages, and the reviewer's staff
+        # address is internal information a student has no reason to receive. Who verified a
+        # record stays visible to staff through the admin resource views.
         "review_due_at": _dt(getattr(o, "review_due_at", None)),
         "confidence": getattr(o, "confidence", "UNVERIFIED"),
+        "verified": decision.usable,
+        "verification_reason": decision.reason,
+        "verification_note": decision.note,
+        "policy_version": decision.policy_version,
     }
 
 
@@ -109,7 +134,16 @@ def section(s) -> Dict[str, Any]:
 
 def country(c, counts: Optional[Dict[str, int]] = None, full: bool = False) -> Dict[str, Any]:
     data = {
-        "id": c.id, "name": c.name, "slug": c.slug, "iso2": c.iso2, "flag_emoji": c.flag_emoji,
+        "id": c.id, "name": c.name, "slug": c.slug, "iso2": c.iso2,
+        # A destination is a sovereign country or a region inside one. `kind` and `parent` are
+        # what let the UI show Scotland under the United Kingdom instead of as a country, and
+        # `iso_code` is the ISO 3166-1 (GB) or 3166-2 (GB-SCT) code - never mixed up.
+        "iso_code": getattr(c, "iso_code", None) or c.iso2,
+        "kind": getattr(c, "kind", "COUNTRY") or "COUNTRY",
+        "is_study_destination": getattr(c, "is_study_destination", True),
+        "parent": ({"id": c.parent.id, "name": c.parent.name, "slug": c.parent.slug}
+                   if getattr(c, "parent", None) else None),
+        "flag_emoji": c.flag_emoji,
         "region": c.region, "tagline": c.tagline, "summary": c.summary, "hero_image": c.hero_image,
         "card_image": c.card_image, "accent_color": c.accent_color, "status": c.status,
         "is_featured": c.is_featured, "priority": c.priority, "currency": c.currency,
@@ -179,6 +213,32 @@ def requirement(r) -> Optional[Dict[str, Any]]:
     }
 
 
+def _requirement_decision(r):
+    """The read-time verdict for a programme requirement, or ``None`` when there is none."""
+    if not r:
+        return None
+    from sqlalchemy.orm import object_session
+
+    from app.core import verification_policy as policy
+
+    db = object_session(r)
+    return policy.evaluate_record(db, r) if db is not None else policy.evaluate(r)
+
+
+def _requirement_summary(p) -> Dict[str, Any]:
+    """Entry figures for a programme card - only when the requirement passes the policy.
+
+    A verified programme is not a verified requirement: the numbers live on a different row
+    with its own source and date. If that row is unverified, stale or conflicted, the summary is
+    empty rather than borrowing the programme's green badge.
+    """
+    decision = _requirement_decision(p.requirement)
+    if decision is None or not decision.usable:
+        return {}
+    r = p.requirement
+    return {"min_cgpa": r.min_cgpa, "ielts_overall": r.ielts_overall, "verified": True}
+
+
 def intake(i) -> Dict[str, Any]:
     return {"id": i.id, "label": i.label, "term": i.term, "month": i.month, "year": i.year, "status": i.status,
             "application_opens": _dt(i.application_opens), "application_deadline": _dt(i.application_deadline),
@@ -200,10 +260,7 @@ def program(p, full: bool = False) -> Dict[str, Any]:
                                    "slug": p.university.country.slug,
                                    "flag_emoji": p.university.country.flag_emoji} if p.university.country else None},
         "intakes": [intake(i) for i in sorted(p.intakes, key=lambda x: (x.year or 9999, x.month or 99))],
-        "requirement_summary": {
-            "min_cgpa": p.requirement.min_cgpa if p.requirement else None,
-            "ielts_overall": p.requirement.ielts_overall if p.requirement else None,
-        },
+        "requirement_summary": _requirement_summary(p),
         "provenance": provenance(p),
     }
     if full:

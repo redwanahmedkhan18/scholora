@@ -1,13 +1,13 @@
 """People, pipeline and governance: users, students, leads, applications, documents,
 brochures, WhatsApp conversations, analytics, verification and audit."""
 from datetime import date, datetime
-from typing import Any, List, Optional
+from typing import List, Optional
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-from app.models.base import TimestampMixin, JSONType
+from app.models.base import JSONType, TimestampMixin
 
 
 class User(Base, TimestampMixin):
@@ -115,7 +115,11 @@ class Lead(Base, TimestampMixin):
     priority: Mapped[str] = mapped_column(String(20), default="NORMAL")
     next_action_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     notes: Mapped[Optional[str]] = mapped_column(Text)
-    consent_contact: Mapped[bool] = mapped_column(default=True)
+    #: Tri-state on purpose. True was affirmed through an explicit control; False was explicitly
+    #: declined; NULL means no evidence either way (every historical row, and any record created
+    #: by a path that is not a consent form, such as an inbound WhatsApp message). The old
+    #: ``default=True`` fabricated consent for records nobody ever asked.
+    consent_contact: Mapped[Optional[bool]] = mapped_column(default=None)
 
 
 class Appointment(Base, TimestampMixin):
@@ -134,6 +138,8 @@ class Appointment(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="REQUESTED")
     notes: Mapped[Optional[str]] = mapped_column(Text)
     lead_id: Mapped[Optional[int]] = mapped_column(ForeignKey("leads.id"))
+    #: Same tri-state as ``Lead.consent_contact``. A booking form asks for consent explicitly.
+    consent_contact: Mapped[Optional[bool]] = mapped_column(default=None)
 
 
 class Application(Base, TimestampMixin):
@@ -235,8 +241,55 @@ class DataVerification(Base, TimestampMixin):
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     verified_by: Mapped[Optional[str]] = mapped_column(String(160))
     review_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    status: Mapped[str] = mapped_column(String(20), default="VERIFIED")
+    #: Defaults to NEEDS_REVIEW, never VERIFIED (W12). A register row created without an explicit
+    #: decision is a claim awaiting one; a VERIFIED default meant every insert by any code path
+    #: that forgot to pass a status silently certified the field.
+    status: Mapped[str] = mapped_column(String(20), default="NEEDS_REVIEW")
     conflict_with: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class CatalogueChange(Base, TimestampMixin):
+    """W13 - one factual change to a catalogue record, with the value it replaced.
+
+    The audit log answers "who did what". It cannot answer "what did this field say before, and
+    which version did students see", because it stores decisions rather than values. Without that,
+    a corrected tuition figure overwrites the only copy of the old one and a dispute becomes
+    unresolvable.
+
+    A row here is written **before** the new value is presented as current, keeps both values and
+    the source each came from, and carries an explicit review state. ``version`` is a per-entity
+    sequence so "the third change to this programme's tuition" is expressible without relying on
+    timestamps that two workers can produce out of order.
+    """
+    __tablename__ = "catalogue_changes"
+    #: A version number identifies one change to one field of one record. Declared on the model as
+    #: well as in the migration so ``create_all`` (tests, fresh local databases) and Alembic agree,
+    #: and so the uniqueness holds even for writers that bypass ``services.catalogue_changes``.
+    __table_args__ = (
+        Index("uq_catalogue_changes_version", "entity_type", "entity_id", "field_name",
+              "version", unique=True),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(60), index=True)
+    entity_id: Mapped[int] = mapped_column(Integer, index=True)
+    field_name: Mapped[str] = mapped_column(String(80), index=True)
+    previous_value: Mapped[Optional[str]] = mapped_column(String(600))
+    new_value: Mapped[Optional[str]] = mapped_column(String(600))
+    #: MATERIAL | SUSPICIOUS. Formatting-only differences are never stored.
+    classification: Mapped[str] = mapped_column(String(20), default="MATERIAL", index=True)
+    source_url: Mapped[Optional[str]] = mapped_column(String(600))
+    source_type: Mapped[Optional[str]] = mapped_column(String(60))
+    retrieved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    #: Who or what produced the new value: an importer reference, or a staff address.
+    actor: Mapped[Optional[str]] = mapped_column(String(160))
+    #: PENDING | APPROVED | REJECTED | SUPERSEDED
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    decided_by: Mapped[Optional[str]] = mapped_column(String(160))
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    decision_note: Mapped[Optional[str]] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    batch_id: Mapped[Optional[int]] = mapped_column(ForeignKey("import_batches.id"), index=True)
+    verification_id: Mapped[Optional[int]] = mapped_column(ForeignKey("data_verifications.id"))
 
 
 class SearchQueryLog(Base, TimestampMixin):
@@ -274,6 +327,29 @@ class AuditLog(Base, TimestampMixin):
     entity_id: Mapped[Optional[int]] = mapped_column(Integer)
     detail: Mapped[dict] = mapped_column(JSONType, default=dict)
     ip_address: Mapped[Optional[str]] = mapped_column(String(60))
+
+
+class PendingObjectDeletion(Base, TimestampMixin):
+    """A durable outbox entry for one stored object that must be destroyed.
+
+    Erasure deletes database rows inside a transaction but cannot delete object-storage bytes
+    transactionally. Deleting the object before the commit would mean a rollback restores rows
+    whose files are already gone; deleting it after an unverified call could leave the bytes in
+    place while the operation reports success. So the key is written here *inside* the
+    transaction and the object is removed afterwards, with the row surviving until the backend
+    confirms the object is gone.
+
+    Deliberately minimal: a storage key and processing state. No name, email, phone, filename
+    or document type is copied here - the key is the least information that can identify the
+    object, and the row is removed once deletion is confirmed.
+    """
+    __tablename__ = "pending_object_deletions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    storage_key: Mapped[str] = mapped_column(String(400), unique=True, index=True)
+    reason: Mapped[str] = mapped_column(String(60), default="PROFILE_ERASED")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
 
 
 class Notification(Base, TimestampMixin):
@@ -375,6 +451,9 @@ class KnowledgeChunk(Base, TimestampMixin):
     source_type: Mapped[Optional[str]] = mapped_column(String(60))
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     confidence: Mapped[Optional[str]] = mapped_column(String(30))
+    #: DEMO for passages built from demonstration/seed records. The verification policy refuses
+    #: these outright, so a well-written placeholder paragraph can never be quoted as official.
+    provenance: Mapped[Optional[str]] = mapped_column(String(20), index=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     # Sparse lexical vector (term -> weight). On PostgreSQL an additional pgvector
     # column is created by the migration and used in preference to this.
@@ -386,12 +465,49 @@ class KnowledgeChunk(Base, TimestampMixin):
     embedding_dim: Mapped[Optional[int]] = mapped_column(Integer)
 
 
+class AssistantSession(Base, TimestampMixin):
+    """W4 - a server-owned assistant session.
+
+    ``sid`` is a non-secret database/audit reference. ``credential_hash`` is a keyed hash of
+    the browser credential; the raw value is never stored. Ownership is explicit, and a
+    profile FK is ``RESTRICT`` so deleting a profile cannot silently turn a profile-bound
+    session into an anonymous one - the erasure path must revoke first.
+    """
+    __tablename__ = "assistant_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    credential_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    credential_generation: Mapped[int] = mapped_column(Integer, default=0)
+    ownership: Mapped[str] = mapped_column(String(20), default="ANONYMOUS", index=True)
+    student_profile_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("student_profiles.id", ondelete="RESTRICT"), index=True)
+    #: Keyed fingerprint of the portal profile token that established this binding. It is
+    #: compared on every profile-bound ask so a stale session cannot keep serving profile A
+    #: after the browser has switched to B. The raw token is never stored.
+    profile_token_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    absolute_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    revoked_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    #: W5 - structured conversation context slots (schema-versioned, allowlisted, bounded).
+    #: Owned by ``app.services.context_slots``; never written from client input. NULL means no
+    #: context yet, which is also what every session created before W5 has.
+    context_json: Mapped[Optional[dict]] = mapped_column(JSONType)
+    #: Compare-and-swap counter for ``context_json``. A write only lands when the value it read
+    #: is still current, so two concurrent turns cannot silently overwrite each other.
+    context_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
 class AssistantConversation(Base, TimestampMixin):
     """§85 - every assistant exchange is retained with the tools it called and the
     sources it cited, so an answer can be audited after the fact."""
     __tablename__ = "assistant_conversations"
     id: Mapped[int] = mapped_column(primary_key=True)
     session_id: Mapped[str] = mapped_column(String(80), index=True)
+    #: Verified server-owned session (W4). Legacy client ids leave this NULL and never
+    #: establish ownership or permission.
+    session_ref_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("assistant_sessions.id", ondelete="SET NULL"), index=True)
     student_profile_id: Mapped[Optional[int]] = mapped_column(ForeignKey("student_profiles.id"))
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text)

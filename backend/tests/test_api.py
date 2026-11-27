@@ -103,14 +103,19 @@ def test_brochure_is_versioned_and_sourced(client, api):
 
 # ----------------------------------------------------------- student portal
 def test_portal_overview_shape(client, api, student_token):
-    body = client.get(f"{api}/portal/{student_token}").json()
+    response = client.get(f"{api}/portal/{student_token}")
+    assert response.status_code == 200
+    assert "no-store" in response.headers.get("cache-control", "").lower()
+    body = response.json()
     assert set(body) >= {"profile", "applications", "documents", "shortlist", "brochures",
                          "notifications", "counts", "stages", "document_types"}
     assert body["profile"]["token"] == student_token
 
 
 def test_portal_rejects_unknown_token(client, api):
-    assert client.get(f"{api}/portal/does-not-exist").status_code == 404
+    response = client.get(f"{api}/portal/does-not-exist")
+    assert response.status_code == 404
+    assert "no-store" in response.headers.get("cache-control", "").lower()
 
 
 def test_application_lifecycle(client, api, auth, student_token):
@@ -278,7 +283,12 @@ def test_retrieval_finds_relevant_records(client, api, auth, db):
     from app.services import retrieval
 
     retrieval.rebuild_index(db)
-    hits = retrieval.search(db, "artificial intelligence masters in the united states", limit=5)
+    # apply_policy=False exercises the ranking layer on the demonstration corpus, which is what
+    # this test has always covered. The verification policy deliberately hides those same demo
+    # passages from student-facing search; that contract is asserted separately in
+    # test_task2_verification.py::test_demo_chunks_never_surface_through_student_retrieval.
+    hits = retrieval.search(db, "artificial intelligence masters in the united states", limit=5,
+                            apply_policy=False)
     assert hits, "BM25 retrieval should match seeded programmes without an embedding provider"
     assert all({"title", "content", "score", "url_path"} <= set(h) for h in hits)
     assert hits[0]["score"] >= hits[-1]["score"], "results must be ranked"
@@ -338,7 +348,7 @@ def _future(days=2):
 
 
 def test_appointment_rejects_a_mode_the_office_does_not_offer(client, api):
-    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000001",
+    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000001", "consent_contact": True,
                                         "scheduled_date": _future(), "scheduled_time": "11:00",
                                         "mode": "TELEPATHY"})
     assert r.status_code == 400
@@ -346,7 +356,7 @@ def test_appointment_rejects_a_mode_the_office_does_not_offer(client, api):
 
 
 def test_appointment_rejects_an_unbookable_time(client, api):
-    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000002",
+    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000002", "consent_contact": True,
                                         "scheduled_date": _future(), "scheduled_time": "03:00"})
     assert r.status_code == 400
     assert "bookable" in r.json()["detail"].lower()
@@ -355,7 +365,7 @@ def test_appointment_rejects_an_unbookable_time(client, api):
 def test_appointment_defaults_come_from_settings_not_a_hard_coded_code(client, api):
     """An omitted service_type must resolve to a configured option, never an invented one."""
     offered = [o["value"] for o in client.get(f"{api}/settings").json()["appointments"]["service_types"]]
-    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000003",
+    r = client.post(f"{api}/appointments", json={"full_name": "Vocab Test", "phone": "+8801799000003", "consent_contact": True,
                                         "scheduled_date": _future(), "scheduled_time": "10:00"})
     assert r.status_code == 200, r.text
     assert offered, "no service types configured"

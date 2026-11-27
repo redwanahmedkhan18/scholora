@@ -16,16 +16,24 @@ Layers, applied in order:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.core import llm
+from app.core import academic_year as academic_year_mod
+from app.core import claim_validation, llm
+from app.core import verification_policy as policy
+from app.core.config import settings
 from app.models.crm import AssistantConversation
 from app.services import assistant as tools_mod
-from app.services import retrieval
+from app.services import context_slots, domain_gate, retrieval
+
+log = logging.getLogger("scholara.assistant")
 
 # --------------------------------------------------------------------- policy
 SYSTEM_PROMPT = """You are the Scholara study-abroad assistant for a consultancy in Uttara, Dhaka.
@@ -118,6 +126,13 @@ ESCALATION_TRIGGERS = [
     "talk to a human", "speak to someone", "call me", "counselor", "counsellor",
 ]
 
+#: Said when the database cannot be read. No figures, no names, no fallback to demo rows.
+DEGRADED_MESSAGE = (
+    "Verified records are temporarily unavailable, so I won't quote any figure for this. "
+    "Nothing has been guessed or substituted. Please try again shortly, or ask a counselor on "
+    "WhatsApp."
+)
+
 HANDOFF_TEXT = (
     "This needs a counselor rather than an automated answer. You can book a free session at "
     "our Uttara office, or message us on WhatsApp and a counselor will pick it up during "
@@ -184,6 +199,43 @@ def _apply_guardrails(text: str, allowed_emails: set[str]) -> tuple[str, list[st
 
 
 # ------------------------------------------------------------------ LLM layer
+def _previous_turn(db: Session, session_ref_id: Optional[int],
+                   student_profile_id: Optional[int] = None) -> tuple[bool, str]:
+    """The previous turn's permission and intent for a **verified** session and owner.
+
+    Not from a request value: a client that could claim "the last turn was allowed" would have
+    a one-line bypass of the gate. A refused, clarifying, empty or degraded turn never licenses
+    a follow-up, and its intent lets the gate recognise a reply to our own clarification.
+
+    Continuity is scoped to the exact current owner. A profile switch reuses the session row
+    (and therefore its id), so filtering by ``session_ref_id`` alone would let Student A's
+    last allowed turn authorize Student B's first follow-up. Anonymous continuity requires
+    an explicitly anonymous row; a NULL/unknown owner never matches a profile-bound request.
+
+    A legacy client-supplied ``session_id`` is deliberately not accepted here. Without a
+    server-owned session there is no continuity and therefore no inherited permission.
+    """
+    if not session_ref_id:
+        return False, ""
+    try:
+        owner_filter = (AssistantConversation.student_profile_id == int(student_profile_id)
+                        if student_profile_id is not None
+                        else AssistantConversation.student_profile_id.is_(None))
+        row = db.execute(
+            select(AssistantConversation)
+            .where(AssistantConversation.session_ref_id == int(session_ref_id),
+                   owner_filter)
+            .order_by(AssistantConversation.id.desc())
+            .limit(1)
+        ).scalars().first()
+    except SQLAlchemyError:
+        return False, ""
+    if row is None:
+        return False, ""
+    intent = (row.intent or "").strip()
+    return intent not in ("refused", "clarify", "empty", "degraded"), intent
+
+
 def _llm_available() -> bool:
     """True when Grok, Mistral or Gemini is configured and generation is switched on."""
     return llm.available()
@@ -228,28 +280,89 @@ def ask(
     context: Optional[Dict[str, Any]] = None,
     session_id: str = "anonymous",
     student_profile_id: Optional[int] = None,
+    session: Optional[Any] = None,
+    slot_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     started = time.time()
     context = context or {}
     question = (question or "").strip()
 
-    if not question:
-        return {
-            "answer": "Ask me about a university, a programme, its requirements, the real annual "
-                      "cost, scholarships or a PhD supervisor.",
-            "intent": "empty", "sources": [], "data": {}, "grounded": True,
-            "escalated": False, "tools_used": [], "suggestions": _suggestions("general"),
-        }
+    # A verified server-owned session (W4) is the only thing that may inherit permission from
+    # a previous turn. ``session_id`` is retained as non-authoritative audit/correlation
+    # metadata for existing clients and is never consulted for authorization.
+    session_ref_id = int(session.id) if session is not None else None
+    audit_session_id = (getattr(session, "sid", None) or session_id or "anonymous")[:80]
+
+    # ---- layer 0: the domain gate -------------------------------------
+    # Runs before anything else. A refused question never touches the corpus, the tools or a
+    # provider: the only cost of an out-of-scope request is one deterministic match.
+    previous_allowed, previous_intent = _previous_turn(
+        db, session_ref_id, student_profile_id)
+    gate = domain_gate.classify(
+        question,
+        previous_allowed=previous_allowed,
+        previous_intent=previous_intent,
+    )
+    if gate.decision != domain_gate.ALLOW:
+        return _gate_response(db, question, audit_session_id, student_profile_id, gate,
+                              started, session_ref_id=session_ref_id)
 
     low = question.lower()
     escalate = any(trigger in low for trigger in ESCALATION_TRIGGERS)
+    year = academic_year_mod.parse(question)
 
-    # ---- layer 1: retrieval -------------------------------------------
-    hits = retrieval.search(db, question, limit=6)
+    # ---- layers 1-2: retrieval and structured tools -------------------
+    # A schema problem in either layer must degrade into an honest answer, not a 500 and not a
+    # silent fall back to demo rows.
+    # W5: a bare reply to a clarification we asked ("master's") names no intent of its own.
+    # The question we asked stays in flight, so the reply is answered as that question rather
+    # than as an unrelated general query. A reply that does name an intent always wins.
+    pending_intent = (slot_state or {}).get("pending")
+    intent_hint = None
+    if pending_intent in context_slots.PENDING_INTENTS \
+            and tools_mod.detect_intent(question) == "general":
+        intent_hint = pending_intent
 
-    # ---- layer 2: structured tools ------------------------------------
-    structured = tools_mod.answer(db, question, context)
+    # ---- W6: one resolved scope for retrieval and tools ----------------
+    # Resolved before either layer runs, so the corpus and the structured queries cannot
+    # disagree about what the student asked for. An unresolved mandatory constraint is answered
+    # with a targeted question and nothing is retrieved: an empty scope never becomes a
+    # worldwide search.
+    scope = tools_mod.build_scope(db, question, context, intent=intent_hint)
+    if not scope.ok:
+        return _scope_clarify_response(db, question, audit_session_id, student_profile_id,
+                                       started, scope, intent_hint, session_ref_id=session_ref_id)
+
+    try:
+        hits = retrieval.search(db, question, limit=6, academic_year=year, scope=scope)
+        structured = tools_mod.answer(db, question, context, academic_year=year,
+                                      intent=intent_hint, scope=scope)
+    except SQLAlchemyError as exc:
+        log_degraded(db, question, exc)
+        return _degraded_response(db, question, audit_session_id, student_profile_id,
+                                  started, session_ref_id=session_ref_id)
+
     intent = structured.get("intent", "general")
+
+    # ---- W5: ask for context we genuinely cannot answer without -------
+    # Placed after the intent is known (so we ask only the right question) and after the gate
+    # (so an out-of-scope request is never met with a slot question). ``missing_slot`` returns
+    # nothing if the value is already known - from a carried slot, this turn's question or a
+    # verified profile field - or if we have already asked, which makes a loop impossible.
+    if slot_state is not None:
+        missing = context_slots.missing_slot(intent, slot_state, context)
+        if missing:
+            text, _chips = context_slots.clarify_payload(missing)
+            _persist(db, question=question, answer=text, intent="clarify",
+                     session_id=audit_session_id, student_profile_id=student_profile_id,
+                     latency=int((time.time() - started) * 1000),
+                     session_ref_id=session_ref_id)
+            return context_slots.clarify_response(missing, intent=intent, policy_block={
+                "version": policy.POLICY_VERSION,
+                "max_age_days": int(settings.policy_max_age_days or 0),
+                "academic_year": None,
+            })
+
     data = structured.get("data", {}) or {}
     tools_used = [k for k, v in data.items() if v]
 
@@ -292,21 +405,44 @@ def ask(
             "we only publish figures we can link to an official source."
         )
 
+    # ---- layer 4: factual-claim validation (W3) -----------------------
+    # Citation presence is not support. Every factual sentence must be traceable to the
+    # verified evidence for this turn; a sentence whose fee, score or date is absent is
+    # removed rather than presented. This runs on generated and template answers alike.
+    claim_result = claim_validation.validate(answer_text, hits, data)
+    if not claim_result.text.strip() and mode == "llm":
+        fallback = structured.get("answer") or (_render_from_hits(hits) if hits else "")
+        if fallback.strip():
+            claim_result = claim_validation.validate(fallback, hits, data)
+            mode = "template"
+    answer_text = claim_result.text
+    if not answer_text.strip():
+        answer_text = (
+            "I don't have a verified record I can quote for that, so I won't state a figure. "
+            "A counselor can confirm it from the official page."
+        )
+        claim_result = claim_validation.ValidationResult(answer_text, "REJECTED", claim_result.checked,
+                                                         claim_result.rejected, claim_result.rejected_count)
+
     if escalate:
         answer_text = f"{answer_text}\n\n{HANDOFF_TEXT}".strip()
 
-    # ---- layer 4: guardrails ------------------------------------------
+    # ---- layer 5: guardrails ------------------------------------------
     answer_text, violations = _apply_guardrails(answer_text, allowed_emails)
+    if claim_result.rejected_count:
+        violations.append(f"claims_withheld:{claim_result.rejected_count}")
 
     # A generated answer can be quarantined down to nothing. That is a success for the policy
-    # but a failure for the student, so fall back to the deterministic template and record
-    # that the model had to be overridden.
+    # but a failure for the student, so fall back to the deterministic template, validate its
+    # claims too, and record that the model had to be overridden.
     if mode == "llm" and not answer_text.strip():
         fallback = structured.get("answer") or (_render_from_hits(hits) if hits else "")
-        answer_text, extra = _apply_guardrails(fallback, allowed_emails)
+        fallback_result = claim_validation.validate(fallback, hits, data)
+        answer_text, extra = _apply_guardrails(fallback_result.text, allowed_emails)
         violations.extend(extra)
         violations.append("llm_output_rejected")
         mode = "template"
+        claim_result = fallback_result
         if not answer_text.strip():
             answer_text = (
                 "I can't answer that within our data-integrity rules. A counselor can walk you "
@@ -332,11 +468,12 @@ def ask(
             seen.add(url)
             sources.append(citation)
 
-    # ---- layer 5: audit trail -----------------------------------------
+    # ---- layer 6: audit trail -----------------------------------------
     latency = int((time.time() - started) * 1000)
     try:
         db.add(AssistantConversation(
-            session_id=session_id[:80], student_profile_id=student_profile_id,
+            session_id=audit_session_id[:80], session_ref_id=session_ref_id,
+            student_profile_id=student_profile_id,
             question=question[:4000], answer=answer_text[:8000], intent=intent,
             tools_used=tools_used + ([f"guardrail:{v}" for v in violations] if violations else []),
             sources=sources[:10], grounded=grounded, escalated=escalate, latency_ms=latency,
@@ -348,6 +485,12 @@ def ask(
     return {
         "answer": answer_text,
         "intent": intent,
+        "domain": gate.as_dict(),
+        "policy": {"version": policy.POLICY_VERSION,
+                   "max_age_days": int(settings.policy_max_age_days or 0),
+                   "academic_year": year.label if year else None},
+        "academic_year": year.as_dict() if year else None,
+        "claim_validation": claim_result.as_dict(),
         "data": data,
         "sources": sources[:8],
         "grounded": grounded,
@@ -364,6 +507,152 @@ def ask(
             "admission decision, a scholarship award or a visa outcome."
         ),
     }
+
+
+# ------------------------------------------------------- gate / degraded replies
+def _persist(db: Session, *, question: str, answer: str, intent: str, session_id: str,
+             student_profile_id: Optional[int], latency: int, grounded: bool = False,
+             tools_used: Optional[List[str]] = None,
+             session_ref_id: Optional[int] = None) -> None:
+    """Write the audit row. Never raises: losing the audit row must not fail the answer."""
+    try:
+        db.add(AssistantConversation(
+            session_id=(session_id or "anonymous")[:80], session_ref_id=session_ref_id,
+            student_profile_id=student_profile_id,
+            question=question[:4000], answer=answer[:8000], intent=intent,
+            tools_used=tools_used or [], sources=[], grounded=grounded, escalated=False,
+            latency_ms=latency,
+        ))
+        db.commit()
+    except Exception:  # pragma: no cover - defensive
+        db.rollback()
+
+
+def _scope_clarify_response(db: Session, question: str, audit_session_id: str,
+                            student_profile_id: Optional[int], started: float,
+                            scope: Any, intent: Optional[str],
+                            *, session_ref_id: Optional[int]) -> Dict[str, Any]:
+    """A W6 scope that cannot be resolved becomes a question, never an unrestricted search.
+
+    The slot is the one the scope named, so the client's existing clarification chips apply; the
+    stable reason code is reported for diagnostics and contains none of the student's words.
+    """
+    slot = scope.clarify_slot or "country"
+    payload = context_slots.clarify_response(slot, intent=intent or "general", policy_block={
+        "version": policy.POLICY_VERSION,
+        "max_age_days": int(settings.policy_max_age_days or 0),
+        "academic_year": None,
+    })
+    payload["scope"] = {"status": scope.status, "reason": (scope.reasons[0] if scope.reasons else None),
+                        "clarify_slot": slot}
+    _persist(db, question=question, answer=payload["answer"], intent="clarify",
+             session_id=audit_session_id, student_profile_id=student_profile_id,
+             latency=int((time.time() - started) * 1000), session_ref_id=session_ref_id)
+    return payload
+
+
+def _gate_response(db: Session, question: str, session_id: str, student_profile_id: Optional[int],
+                   gate: "domain_gate.GateResult", started: float,
+                   *, session_ref_id: Optional[int] = None) -> Dict[str, Any]:
+    """The two non-answer outcomes, shaped exactly like an answer so clients need no branch."""
+    latency = int((time.time() - started) * 1000)
+    if gate.decision == domain_gate.REFUSE:
+        text = domain_gate.DOMAIN_REFUSAL
+        intent = "refused"
+        suggestions = list(domain_gate.DEFAULT_CHIPS)
+        mode = "refused"
+    else:
+        text = gate.clarification or domain_gate.DEFAULT_CLARIFY
+        intent = "clarify"
+        suggestions = list(gate.suggestions or domain_gate.DEFAULT_CHIPS)
+        mode = "clarify"
+
+    _persist(db, question=question, answer=text, intent=intent, session_id=session_id,
+             student_profile_id=student_profile_id, latency=latency,
+             session_ref_id=session_ref_id)
+    try:
+        from app.models.crm import AnalyticsEvent
+
+        db.add(AnalyticsEvent(name="assistant_gate", meta={
+            "decision": gate.decision, "reason": gate.reason, "score": round(gate.score, 3),
+        }))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {
+        "answer": text,
+        "intent": intent,
+        "domain": gate.as_dict(),
+        "policy": {"version": policy.POLICY_VERSION,
+                   "max_age_days": int(settings.policy_max_age_days or 0),
+                   "academic_year": None},
+        "academic_year": None,
+        "claim_validation": {"status": "NOT_APPLICABLE", "claims_checked": 0,
+                             "claims_rejected": 0, "reasons": []},
+        "data": {},
+        "sources": [],
+        "grounded": False,
+        "escalated": False,
+        "tools_used": [],
+        "retrieved": [],
+        "mode": mode,
+        "provider": None,
+        "model": None,
+        "latency_ms": latency,
+        "suggestions": suggestions,
+        "disclaimer": (
+            "Scholara's assistant answers questions about studying abroad, using its own "
+            "source-verified records."
+        ),
+    }
+
+
+def _degraded_response(db: Session, question: str, session_id: str,
+                       student_profile_id: Optional[int], started: float,
+                       *, session_ref_id: Optional[int] = None) -> Dict[str, Any]:
+    """A schema/database failure: say so, invent nothing, and still return 200 to the client."""
+    latency = int((time.time() - started) * 1000)
+    _persist(db, question=question, answer=DEGRADED_MESSAGE, intent="degraded",
+             session_id=session_id, student_profile_id=student_profile_id, latency=latency,
+             session_ref_id=session_ref_id)
+    return {
+        "answer": DEGRADED_MESSAGE,
+        "intent": "degraded",
+        "domain": {"decision": domain_gate.ALLOW, "reason": "in_scope", "score": 1.0,
+                   "matched": [], "clarification": None},
+        "policy": {"version": policy.POLICY_VERSION,
+                   "max_age_days": int(settings.policy_max_age_days or 0),
+                   "academic_year": None},
+        "academic_year": None,
+        "claim_validation": {"status": "NOT_APPLICABLE", "claims_checked": 0,
+                             "claims_rejected": 0, "reasons": []},
+        "data": {},
+        "sources": [],
+        "grounded": False,
+        "escalated": False,
+        "tools_used": [],
+        "retrieved": [],
+        "mode": "degraded",
+        "provider": None,
+        "model": None,
+        "latency_ms": latency,
+        "suggestions": [],
+        "disclaimer": ("Verified records are unavailable right now. No figure has been guessed "
+                       "or substituted from older data."),
+    }
+
+
+def log_degraded(db: Session, question: str, exc: Exception) -> None:
+    """Diagnostics without secrets or student details.
+
+    The table/column that is missing is genuinely useful to an operator; the question text is
+    personal data and stays out of the log.
+    """
+    log.warning(
+        "assistant degraded: database/schema failure (%s). question length=%d session=%s",
+        type(exc).__name__, len(question or ""), "anonymous",
+    )
 
 
 def _render_from_hits(hits: List[Dict[str, Any]]) -> str:

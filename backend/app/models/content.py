@@ -215,6 +215,9 @@ class EventRegistration(Base, TimestampMixin):
     preferred_country: Mapped[Optional[str]] = mapped_column(String(120))
     degree_level: Mapped[Optional[str]] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(20), default="REGISTERED")
+    #: Tri-state, same meaning as ``Lead.consent_contact``: an event registration is a contact
+    #: request (we message the registrant), so it records the explicit answer it was given.
+    consent_contact: Mapped[Optional[bool]] = mapped_column(default=None)
 
 
 class BlogPost(Base, TimestampMixin, SeoMixin):

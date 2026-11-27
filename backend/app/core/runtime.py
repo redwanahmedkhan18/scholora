@@ -125,6 +125,22 @@ OVERRIDABLE: Dict[str, Overridable] = {o.key: o for o in [
     Overridable("retrieval_min_score", "retrieval", "Dense floor", kind="float",
                 minimum=0.0, maximum=1.0,
                 help="A chunk with no shared vocabulary needs at least this cosine score to qualify."),
+
+    # ---- Verification policy (core/verification_policy.py) -----------------
+    Overridable("policy_max_age_days", "verification", "Maximum verification age (days)", kind="int",
+                minimum=0, maximum=3650,
+                help="A record verified longer ago than this is not presented as current, even if its "
+                     "own review date is still in the future. 0 disables the age check."),
+    Overridable("policy_require_review_date", "verification", "Require a review date", kind="bool",
+                help="When on, a record with no review deadline is treated as not current."),
+
+    # ---- Assistant domain gate (services/domain_gate.py) -------------------
+    Overridable("domain_gate_enabled", "assistant", "Enforce the counselling domain gate", kind="bool",
+                help="Refuses unrelated questions before retrieval or any answer-generating model call."),
+    Overridable("domain_semantic_enabled", "assistant", "Semantic tie-breaker for ambiguous questions",
+                kind="bool",
+                help="Off by default. Only consulted in the ambiguous band; it can never override a "
+                     "deterministic refusal."),
 ]}
 
 GROUP_LABELS = {

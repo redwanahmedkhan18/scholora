@@ -127,13 +127,43 @@ def create(
     return note
 
 
-def broadcast_to_role(db: Session, role: str, trigger: str, **kwargs: Any) -> int:
-    """Notify every active staff member holding a role."""
+def broadcast_to_role(db: Session, role: str, trigger: str, *,
+                      dedupe_since: Optional[datetime] = None, **kwargs: Any) -> int:
+    """Notify every active staff member holding a role. Returns how many were created.
+
+    ``dedupe_since`` exists for *time-driven* reminders. A scheduled job that runs twice before
+    its own window closes - two beat instances, a manual re-run, an in-process scheduler whose
+    interval is shorter than a day - used to send every counsellor the same reminder twice, and
+    each one is also delivered by email. Event-driven callers pass nothing and keep their
+    behaviour: two status changes are two notifications, because the entity differs.
+    """
     users = list(db.scalars(select(User).where(User.role == role, User.is_active.is_(True))))
+    created = 0
     for user in users:
+        if dedupe_since is not None and _already_notified(
+                db, trigger, user.id, kwargs.get("entity_type"), kwargs.get("entity_id"),
+                dedupe_since):
+            continue
         create(db, trigger, recipient=user.email, user_id=user.id, commit=False, **kwargs)
+        created += 1
     db.commit()
-    return len(users)
+    return created
+
+
+def _already_notified(db: Session, trigger: str, user_id: Optional[int],
+                      entity_type: Optional[str], entity_id: Optional[int],
+                      since: datetime) -> bool:
+    """True when this person already received this reminder for this record since ``since``."""
+    rows = db.scalar(
+        select(Notification.id).where(
+            Notification.trigger == trigger,
+            Notification.user_id == user_id,
+            Notification.entity_type == entity_type,
+            Notification.entity_id == entity_id,
+            Notification.created_at >= since,
+        ).limit(1)
+    )
+    return rows is not None
 
 
 def _run_async(coro_factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:

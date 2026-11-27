@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.content import SiteSetting
 from app.models.crm import Lead, WhatsAppContact, WhatsAppConversation, WhatsAppMessage
-from app.services import assistant
+from app.services import assistant, domain_gate
 
 MENU = """Welcome to {brand}.
 
@@ -91,12 +91,26 @@ def handle_text(db: Session, wa_id: str, profile_name: str, text: str) -> Dict[s
                  "(career / university selection / PhD / scholarship / visa).\n\n"
                  f"Reference: {lead.reference}")
     else:
-        result = assistant.answer(db, stripped, ctx)
-        reply = result["answer"]
-        if result["citations"]:
-            reply += "\n\nSources:\n" + "\n".join(f"- {c['label']}: {c['url']}" for c in result["citations"][:3] if c.get("url"))
-        reply += "\n\nReply 10 at any time to talk to a counselor."
-        ctx.update({k: v for k, v in result.get("data", {}).items() if k in ("country", "degree_level")})
+        # The same counselling domain gate as the website, before any retrieval or tool call.
+        # WhatsApp is a second front door; it must not be a way around the restriction. The
+        # conversation state supplies the follow-up context, and a refused/clarifying turn never
+        # licenses the next one.
+        previous_allowed = convo.state not in ("MENU", "CLARIFY", "REFUSED", "DEGRADED", "START")
+        gate = domain_gate.classify(stripped, previous_allowed=previous_allowed,
+                                    previous_intent=convo.state.lower())
+        if gate.decision == domain_gate.REFUSE:
+            reply = domain_gate.DOMAIN_REFUSAL
+            intent = "refused"
+        elif gate.decision == domain_gate.CLARIFY:
+            reply = gate.clarification or domain_gate.DEFAULT_CLARIFY
+            intent = "clarify"
+        else:
+            result = assistant.answer(db, stripped, ctx)
+            reply = result["answer"]
+            if result["citations"]:
+                reply += "\n\nSources:\n" + "\n".join(f"- {c['label']}: {c['url']}" for c in result["citations"][:3] if c.get("url"))
+            reply += "\n\nReply 10 at any time to talk to a counselor."
+            ctx.update({k: v for k, v in result.get("data", {}).items() if k in ("country", "degree_level")})
 
     convo.context = ctx
     convo.state = intent.upper()

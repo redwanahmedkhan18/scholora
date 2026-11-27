@@ -1,8 +1,24 @@
 """Application configuration (12-factor, env-driven)."""
+import ipaddress
 from functools import lru_cache
 from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Published values that must never be accepted in production. They are intentionally
+# case-insensitive; a "Dev-Secret-Change-Me" is no safer than the original.
+#: Values that name a *shared bypass* rather than a secret. INTERNAL_API_TOKEN is sent by the
+#: Next.js proxy to skip rate limiting during a build; the published default is not a secret.
+INSECURE_INTERNAL_TOKENS = frozenset({"dev-internal-render-token"})
+
+INSECURE_SECRETS = frozenset({
+    "dev-secret-change-me",
+    "test-secret-key-not-for-production",
+    "changeme",
+    "change-me",
+    "secret",
+    "password",
+})
 
 
 def normalize_origin(raw: str) -> str:
@@ -45,11 +61,19 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 180
     db_sslmode: str = ""                     # empty => Supabase URLs get "require"
     cors_origins: str = "*"
+    # Deployment documents historically used APP_ENV and ALLOWED_ORIGINS. They are read so a
+    # mismatch is detected and reported at startup instead of being silently ignored.
+    app_env: str = ""
+    allowed_origins: str = ""
     # A regex for extra allowed origins (sandbox previews). Empty by default: a pattern
     # like https://.*\.e2b\.app lets *any* sandbox on the internet call the API, so it
     # must be an explicit, per-environment decision rather than a built-in.
     cors_origin_regex: str = ""
     public_site_url: str = "http://localhost:3000"
+    #: Comma-separated CIDRs of reverse proxies whose X-Forwarded-For chain may be trusted.
+    #: Empty (the safe default) means the direct ASGI peer is the only client identity and
+    #: every caller behind a proxy shares one rate-limit bucket.
+    trusted_proxies: str = ""
 
     # --- infrastructure ---------------------------------------------------
     redis_url: str = ""                      # empty => in-process fallback (dev only)
@@ -169,6 +193,34 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     retrieval_dense_weight: float = 0.65   # dense vs lexical in the hybrid fusion
     retrieval_min_score: float = 0.10      # dense floor for a match with no shared vocabulary
+
+    # ---- verification policy (core/verification_policy.py) ------------------
+    # Applied at read time to every assistant retrieval path and public serializer. A record
+    # older than this window is reported as not current, even if its own review date is in the
+    # future; a record without a review date is allowed to rely on the age check alone unless
+    # policy_require_review_date is switched on.
+    policy_max_age_days: int = 365
+    policy_require_review_date: bool = False
+    # There is deliberately no switch that lets a secondary source (including the owner's own
+    # website) make a record VERIFIED. That is a product rule, not a deployment preference.
+
+    # ---- assistant domain gate (services/domain_gate.py) --------------------
+    # Deterministic-first classification runs before retrieval and before any answer-generating
+    # LLM call. The optional semantic tie-breaker exists only for the ambiguous band and can
+    # never override an explicit refusal; it is off by default.
+    domain_gate_enabled: bool = True
+    domain_semantic_enabled: bool = False
+    domain_allow_score: float = 0.80       # at or above: clearly in scope
+    domain_refuse_score: float = 0.30      # below: clearly out of scope, between: clarify
+
+    # ---- secure assistant sessions (core/assistant_sessions.py, W4) ---------
+    # A raw credential is 384 random bits and is only ever sent in an HttpOnly cookie.
+    # The database stores a keyed hash. Idle expiry is checked on every request; the
+    # absolute deadline never slides. Set ASSISTANT_SESSION_SECRET to separate this key
+    # from SECRET_KEY; production refuses the published development default.
+    assistant_session_secret: str = ""
+    assistant_session_idle_minutes: int = 60
+    assistant_session_absolute_hours: int = 720
     # Which embedding vendor to try first. Admin-editable at runtime.
     embedding_provider_order: str = "mistral,gemini"
     mistral_embed_model: str = "mistral-embed"
@@ -185,10 +237,16 @@ class Settings(BaseSettings):
         operator clearly meant as an origin should work. The normalised list is logged
         at startup so the correction is visible.
         """
-        if self.cors_origins.strip() == "*":
+        if self.cors_origins.strip() == "*" and self.allowed_origins.strip():
+            # A deployment that only set the legacy name should still work; validation
+            # reports the mismatch rather than silently leaving CORS open.
+            raw_origins = self.allowed_origins
+        else:
+            raw_origins = self.cors_origins
+        if raw_origins.strip() == "*":
             return ["*"]
         origins: List[str] = []
-        for raw in self.cors_origins.split(","):
+        for raw in raw_origins.split(","):
             entry = normalize_origin(raw)
             if entry and entry not in origins:
                 origins.append(entry)
@@ -214,6 +272,87 @@ class Settings(BaseSettings):
         needed and is disabled whenever every origin is allowed.
         """
         return not self.cors_allows_any_origin
+
+    @property
+    def trusted_proxy_networks(self):
+        """Parsed TRUSTED_PROXIES. Invalid entries raise; startup validates them."""
+        networks = []
+        for raw in (self.trusted_proxies or "").split(","):
+            entry = raw.strip()
+            if not entry:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"TRUSTED_PROXIES contains an invalid CIDR: {entry!r}") from exc
+        return networks
+
+    def validate_deployment(self) -> None:
+        """Fail closed on production configuration that would weaken W4.
+
+        Called once at startup. ``APP_ENV``/``ALLOWED_ORIGINS`` are legacy spellings that
+        the application never used; accepting them silently meant an operator could believe
+        production mode was on while cookies were issued without ``Secure``.
+        """
+        try:
+            _ = self.trusted_proxy_networks
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        env = (self.environment or "").strip().lower()
+        app_env = (self.app_env or "").strip().lower()
+        if app_env and app_env != env:
+            raise RuntimeError(
+                f"APP_ENV={self.app_env!r} contradicts ENVIRONMENT={self.environment!r}. "
+                "Set ENVIRONMENT to the actual mode; APP_ENV is not read by the app."
+            )
+
+        legacy = (self.allowed_origins or "").strip()
+        current = (self.cors_origins or "").strip()
+        if legacy and current and current != "*" and legacy != current:
+            raise RuntimeError(
+                "ALLOWED_ORIGINS and CORS_ORIGINS are both set and disagree. "
+                "Use CORS_ORIGINS only."
+            )
+
+        if env not in {"production", "prod"}:
+            return
+
+        if self.cors_allows_any_origin:
+            raise RuntimeError(
+                "CORS_ORIGINS is '*' in production. Set the deployed HTTPS origin(s); "
+                "a wildcard would let any website call credentialed endpoints."
+            )
+        for origin in self.cors_origin_list:
+            if not origin.startswith("https://"):
+                raise RuntimeError(
+                    f"Production CORS origin {origin!r} must use https://."
+                )
+
+        session_secret = (self.assistant_session_secret or "").strip()
+        if not session_secret:
+            raise RuntimeError(
+                "ASSISTANT_SESSION_SECRET is required in production. Set a 32+ character "
+                "random value; it is separate from SECRET_KEY."
+            )
+        for name, value in (("SECRET_KEY", (self.secret_key or "").strip()),
+                            ("ASSISTANT_SESSION_SECRET", session_secret)):
+            if value.lower() in INSECURE_SECRETS or len(value) < 32:
+                raise RuntimeError(
+                    f"{name} is a published/short development value. Generate at least "
+                    "32 random characters before running in production."
+                )
+
+        # The internal token exempts a request from *every* rate limit, including the strict
+        # login rule. Its default value is in the repository, so leaving it unset in production
+        # means anyone can send the header and skip the throttle that protects sign-in.
+        internal = (self.internal_api_token or "").strip()
+        if internal and internal in INSECURE_INTERNAL_TOKENS:
+            raise RuntimeError(
+                "INTERNAL_API_TOKEN is still the published development default. It exempts a "
+                "request from every rate limit by header, so set a random value shared only "
+                "with the frontend build."
+            )
 
     @property
     def mfa_required_role_list(self) -> List[str]:

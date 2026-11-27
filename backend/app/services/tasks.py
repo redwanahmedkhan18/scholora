@@ -16,10 +16,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, cast
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -34,7 +34,6 @@ log = logging.getLogger("scholara.tasks")
 # bare list of distinct classes, which mypy collapses to ``type[Base]``) keeps the mixin fields
 # visible at every use site without resorting to Any.
 VerificationModel = type[University] | type[Program] | type[Scholarship] | type[Professor] | type[ProgramIntake]
-VerificationInstance = University | Program | Scholarship | Professor | ProgramIntake
 VERIFIED_MODELS: list[VerificationModel] = [University, Program, Scholarship, Professor, ProgramIntake]
 
 
@@ -50,19 +49,29 @@ def verification_sweep() -> Dict[str, Any]:
             # each concrete class, not on the declarative Base, so read them explicitly.
             review_due_at = model.review_due_at
             confidence = model.confidence
-            rows = cast(list[VerificationInstance], db.execute(
-                select(model).where(
+            # Claim the rows in one statement instead of reading then writing them one by one.
+            # Two overlapping deliveries of this job (a second worker, a restart, a replacement
+            # during a rolling deploy) both used to see the same rows as VERIFIED, both flipped
+            # them, and both wrote a provenance row and a notification: reproduced on PostgreSQL
+            # as 16 verification rows for 8 records and two identical "N records flipped" notices
+            # to every data manager. Whatever this UPDATE returns is exactly what this run owns,
+            # so the count, the provenance rows and the notification stay singular.
+            claimed = db.execute(
+                update(model)
+                .where(
                     review_due_at.is_not(None),
                     review_due_at < today,
                     confidence == "VERIFIED",
                 )
-            ).scalars().all())
-            for row in rows:
-                row.confidence = "NEEDS_REVIEW"
+                .values(confidence="NEEDS_REVIEW")
+                .returning(model.id, model.source_url)
+                .execution_options(synchronize_session=False)
+            ).all()
+            for entity_id, source_url in claimed:
                 db.add(DataVerification(
-                    entity_type=model.__tablename__, entity_id=row.id,
+                    entity_type=model.__tablename__, entity_id=entity_id,
                     field_name="*", field_value="review window elapsed",
-                    source_url=getattr(row, "source_url", None),
+                    source_url=source_url,
                     status="NEEDS_REVIEW",
                     review_due_at=today + timedelta(days=14),
                 ))
@@ -82,10 +91,19 @@ def verification_sweep() -> Dict[str, Any]:
 
 
 def deadline_reminders(windows: tuple[int, ...] = (30, 14, 7, 3)) -> Dict[str, Any]:
-    """Alert staff about application deadlines inside the warning windows."""
+    """Alert staff about application deadlines inside the warning windows.
+
+    Idempotent within a day. The reminder is a *milestone* - "this deadline is 30 days away" -
+    so it must reach a counsellor once, and running the job twice (a 12h in-process schedule, two
+    beat instances, a manual re-run after a failure) must not send it twice. The windows change
+    daily as the deadline approaches, so the next day's run is a different reminder and is not
+    suppressed.
+    """
     db = SessionLocal()
     try:
         today = date.today()
+        day_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
         sent = 0
         intakes = db.execute(
             select(ProgramIntake).where(
@@ -102,14 +120,13 @@ def deadline_reminders(windows: tuple[int, ...] = (30, 14, 7, 3)) -> Dict[str, A
             if days not in windows:
                 continue
             program = db.get(Program, intake.program_id)
-            notifications.broadcast_to_role(
+            sent += notifications.broadcast_to_role(
                 db, "SENIOR_COUNSELOR", "DEADLINE_APPROACHING",
                 days=days, program=program.name if program else f"programme #{intake.program_id}",
                 intake=intake.label, deadline=intake.application_deadline.isoformat(),
                 entity_type="program_intake", entity_id=intake.id,
-                action_url="/admin/program-intakes",
+                action_url="/admin/program-intakes", dedupe_since=day_start,
             )
-            sent += 1
 
         scholarships = db.execute(
             select(Scholarship).where(
@@ -124,12 +141,12 @@ def deadline_reminders(windows: tuple[int, ...] = (30, 14, 7, 3)) -> Dict[str, A
             days = (sch.deadline - today).days
             if days not in (60, 30, 14):
                 continue
-            notifications.broadcast_to_role(
+            sent += notifications.broadcast_to_role(
                 db, "COUNSELOR", "DEADLINE_APPROACHING", days=days, program=sch.name,
                 intake="scholarship", deadline=sch.deadline.isoformat(),
                 entity_type="scholarship", entity_id=sch.id, action_url="/admin/scholarships",
+                dedupe_since=day_start,
             )
-            sent += 1
 
         log.info("deadline_reminders: %s notifications", sent)
         return {"job": "deadline_reminders", "notifications": sent}
@@ -159,6 +176,11 @@ def data_quality_digest() -> Dict[str, Any]:
                     notifications.broadcast_to_role(
                         db, "DATA_MANAGER", "DATA_CONFLICT", entity=entity, field=f"{count} record(s)",
                         action_url="/admin/verifications",
+                        # A digest is a daily-invariant summary: redelivering the task (a crashed
+                        # worker, a retry) must not page the same reviewer twice for the same
+                        # conflict count.
+                        dedupe_since=datetime.now(timezone.utc).replace(
+                            hour=0, minute=0, second=0, microsecond=0, tzinfo=None),
                     )
         log.info("data_quality_digest: %s conflicts", conflicts)
         return {"job": "data_quality_digest", "summary": summary, "conflicts": conflicts}
@@ -213,6 +235,20 @@ def check_source_links() -> Dict[str, Any]:
         return {"job": "check_source_links", **source_verification.sweep(db, limit=200)}
 
 
+def process_pending_deletions(limit: int = 200) -> Dict[str, Any]:
+    """Retry stored-object deletions that an erasure queued but could not confirm.
+
+    Erasure removes database rows in a transaction and enqueues the object keys; this job is the
+    safety net for a storage backend that was unavailable at that moment. It is idempotent - a
+    key that is already gone simply stops being pending - so running it on a schedule is safe.
+    """
+    from app.services import erasure
+
+    with SessionLocal() as db:
+        return {"job": "process_pending_deletions",
+                **erasure.process_pending_object_deletions(db, limit=limit)}
+
+
 JOBS: Dict[str, Callable[[], Dict[str, Any]]] = {
     "verification_sweep": verification_sweep,
     "deadline_reminders": deadline_reminders,
@@ -220,6 +256,7 @@ JOBS: Dict[str, Callable[[], Dict[str, Any]]] = {
     "reindex_knowledge": reindex_knowledge,
     "campaign_metrics": campaign_metrics,
     "check_source_links": check_source_links,
+    "process_pending_deletions": process_pending_deletions,
 }
 
 # interval in seconds between runs for the in-process scheduler
@@ -229,6 +266,7 @@ SCHEDULE: Dict[str, int] = {
     "deadline_reminders": 12 * 3600,
     "data_quality_digest": 7 * 24 * 3600,
     "reindex_knowledge": 3600,
+    "process_pending_deletions": 300,
     "campaign_metrics": 1800,
 }
 
@@ -259,6 +297,32 @@ def build_celery_app(broker_url: str, result_backend: str = "") -> Any:
         broker_connection_retry_on_startup=True,
         timezone="UTC",
         enable_utc=True,
+        # Ack *after* the task finishes, and requeue it if the worker dies mid-run. With the
+        # default (ack on receipt) a worker killed while a task is running takes the message with
+        # it: observed against a real broker as queue=0, unacked=0, task never executed again
+        # (tests/test_celery_contract.py records the settings; the observation is in docs/11).
+        # This is only safe because every job is idempotent, which tests/test_tasks.py asserts.
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        # A hung task must not hold a worker slot for ever: without a limit a single stuck HTTP
+        # call blocks a concurrency slot indefinitely and the queue backs up behind it.
+        task_time_limit=15 * 60,
+        task_soft_time_limit=13 * 60,
+        # How long the broker holds an unacknowledged message before handing it to another
+        # worker. The 1 hour default made crash recovery an hour late for a 5-minute job, but
+        # too *short* is worse than too long: a value below the hard time limit hands out a
+        # message whose task is still running, and two workers then execute it at once. That was
+        # reproduced against a real broker - one task id, two overlapping 20 s runs - by starting
+        # a replacement worker while the first was still working. The invariant is
+        # visibility_timeout > task_time_limit + margin, asserted in tests/test_celery_contract.py.
+        broker_transport_options={
+            "visibility_timeout": 1800,
+            "socket_connect_timeout": int(settings.redis_socket_connect_timeout),
+            "socket_timeout": int(settings.redis_socket_timeout),
+        },
+        # Do not hand a worker more than it is working on: prefetched-but-unstarted messages are
+        # exactly what an early ack used to lose.
+        worker_prefetch_multiplier=1,
     )
     app.conf.beat_schedule = {
         "verification-sweep": {"task": "scholara.verification_sweep", "schedule": crontab(hour=2, minute=0)},
@@ -266,6 +330,9 @@ def build_celery_app(broker_url: str, result_backend: str = "") -> Any:
         "data-quality-digest": {"task": "scholara.data_quality_digest",
                                  "schedule": crontab(hour=6, minute=0, day_of_week=1)},
         "reindex-knowledge": {"task": "scholara.reindex_knowledge", "schedule": crontab(minute=0)},
+        # Erasure queues object deletions; this drains the queue when the backend was unavailable.
+        "process-pending-deletions": {"task": "scholara.process_pending_deletions",
+                                      "schedule": crontab(minute="*/5")},
         "campaign-metrics": {"task": "scholara.campaign_metrics", "schedule": crontab(minute="*/30")},
         # Weekly is enough: institutional URLs rot over months, and a polite checker
         # should not hammer other people's servers.

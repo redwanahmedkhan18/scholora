@@ -7,13 +7,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.education import Country, Professor, Program, Scholarship, University
-from app.services import costing
+from app.services import costing, scoping
 from app.services.eligibility import DOES_NOT_MEET, MEETS, PARTIALLY, REVIEW, UNAVAILABLE, evaluate
 
 _WEIGHTS = {"academic": 25, "english": 20, "budget": 15, "subject": 15, "intake": 10, "scholarship": 8, "research": 7}
 
 
-def _loaded_programs(db: Session, filters: Dict[str, Any]) -> List[Program]:
+def _loaded_programs(db: Session, filters: Dict[str, Any],
+                     scope: Optional[Any] = None) -> List[Program]:
     stmt = (select(Program)
             .options(selectinload(Program.university).selectinload(University.country),
                      selectinload(Program.requirement),
@@ -22,16 +23,25 @@ def _loaded_programs(db: Session, filters: Dict[str, Any]) -> List[Program]:
             .where(Program.is_published.is_(True)))
     if filters.get("degree_level"):
         stmt = stmt.where(Program.degree_level == filters["degree_level"].upper())
-    if filters.get("country_ids"):
+    destination_clause = scoping.university_clause(db, scope) if scope is not None else None
+    if destination_clause is not None:
+        stmt = stmt.join(University).where(destination_clause)
+    elif filters.get("country_ids"):
         stmt = stmt.join(University).where(University.country_id.in_(filters["country_ids"]))
     if filters.get("subject"):
-        s = f"%{filters['subject'].lower()}%"
+        s = f"%{str(filters['subject']).lower()}%"
         stmt = stmt.where(or_(Program.name.ilike(s), Program.discipline.ilike(s)))
-    return list(db.execute(stmt).scalars().unique())
+    rows = list(db.execute(stmt).scalars().unique())
+    if filters.get("subject"):
+        # Whole-word verification of the database-side narrowing, so a subject filter cannot
+        # admit "Earth Science" for a request about "art".
+        rows = [p for p in rows
+                if scoping.subject_matches(str(filters["subject"]), p.name, p.discipline)]
+    return rows
 
 
 def match_programs(db: Session, student: Dict[str, Any], filters: Optional[Dict[str, Any]] = None,
-                   limit: int = 20) -> Dict[str, Any]:
+                   limit: int = 20, scope: Optional[Any] = None) -> Dict[str, Any]:
     filters = dict(filters or {})
     pref_countries = student.get("preferred_countries") or []
     country_ids: List[int] = []
@@ -46,18 +56,28 @@ def match_programs(db: Session, student: Dict[str, Any], filters: Optional[Dict[
         country_ids = list(rows)
     if country_ids:
         filters["country_ids"] = country_ids
+        if scope is None:
+            # A legacy caller passing raw country ids still gets the same destination semantics as
+            # every other surface, including the region rule.
+            found = list(db.execute(
+                select(Country).where(Country.id.in_(country_ids))).scalars())
+            scope = scoping.scope_from_destinations(db, found)
     filters.setdefault("degree_level", student.get("target_degree_level"))
     filters.setdefault("subject", student.get("target_discipline"))
 
-    programs = _loaded_programs(db, filters)
-    # The subject filter is deliberately "soft": if the exact discipline returns a thin
-    # list we widen the candidate pool and let the relevance score do the ranking, so a
-    # student never sees an empty match page just because of a wording difference.
+    programs = _loaded_programs(db, filters, scope=scope)
+    # A stated subject is a hard constraint: nothing outside it is ever ranked as a match. The
+    # old code appended a widened, subject-free pool into the very same list, so a nursing
+    # programme could outrank a public-health one for a public-health request and be presented as
+    # satisfying it. Near misses are still offered, but in their own bucket, unlabelled as
+    # matches and unranked against them.
+    exact_ids = {p.id for p in programs}
+    alternatives: List[Program] = []
     if filters.get("subject") and len(programs) < max(limit, 8):
         widened = dict(filters)
         widened.pop("subject", None)
-        seen = {p.id for p in programs}
-        programs += [p for p in _loaded_programs(db, widened) if p.id not in seen]
+        alternatives = [p for p in _loaded_programs(db, widened, scope=scope)
+                        if p.id not in exact_ids][:max(limit, 8)]
 
     budget = student.get("budget_per_year")
     target_intake = (student.get("target_intake") or filters.get("intake") or "").lower().strip()
@@ -170,7 +190,7 @@ def match_programs(db: Session, student: Dict[str, Any], filters: Optional[Dict[
 
     stats["total"] = len(results)
     results.sort(key=lambda r: (-r["score"], r["program"].tuition_annual or 1e9))
-    return {"stats": stats, "results": results[:limit]}
+    return {"stats": stats, "results": results[:limit], "alternatives": alternatives}
 
 
 def _points(weight: float, status: str) -> float:
@@ -184,10 +204,27 @@ def _worst(states: List[str]) -> str:
 
 
 # ---------------------------------------------------------------- scholarships
-def match_scholarships(db: Session, student: Dict[str, Any], limit: int = 25) -> List[Dict[str, Any]]:
+def match_scholarships(db: Session, student: Dict[str, Any], limit: int = 25,
+                       scope: Optional[Any] = None) -> List[Dict[str, Any]]:
     rows = db.execute(select(Scholarship).options(
         selectinload(Scholarship.university), selectinload(Scholarship.country)
     ).where(Scholarship.is_published.is_(True))).scalars().all()
+    if scope is not None and not scope.ok:
+        return []
+    if scope is not None and scope.has_destination:
+        # A destination the caller stated must never be silently ignored: this endpoint used to
+        # accept ``country_slugs`` and answer with awards from every country.
+        inside = set(scoping.university_ids(db, scope))
+        destinations_in_scope = set(scoping.destination_country_ids(scope))
+        rows = [s for s in rows
+                if (s.university_id is not None and s.university_id in inside)
+                or (s.university_id is None and s.country_id in destinations_in_scope)]
+    if scope is not None and scope.subject:
+        # An award that names its disciplines is only offered when the requested subject is one of
+        # them; an award that names none is open to any subject and stays eligible.
+        rows = [s for s in rows
+                if not s.disciplines
+                or any(scoping.subject_matches(scope.subject, str(d)) for d in s.disciplines)]
     nationality = (student.get("nationality") or "Bangladesh").lower()
     level = (student.get("target_degree_level") or "").upper()
     out: List[Dict[str, Any]] = []
@@ -234,14 +271,18 @@ def match_scholarships(db: Session, student: Dict[str, Any], limit: int = 25) ->
 # ---------------------------------------------------------------- faculty / research
 def match_faculty(db: Session, interests: List[str], country_id: Optional[int] = None,
                   university_id: Optional[int] = None, field: Optional[str] = None,
-                  limit: int = 20) -> List[Dict[str, Any]]:
+                  limit: int = 20, university_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     stmt = select(Professor).options(
         selectinload(Professor.university).selectinload(University.country),
         selectinload(Professor.department),
         selectinload(Professor.publications))
-    if university_id:
+    if university_ids is not None:
+        # A destination scope: a sovereign country's ids include its regions' institutions, a
+        # region's ids contain only its own.
+        stmt = stmt.where(Professor.university_id.in_(university_ids))
+    elif university_id:
         stmt = stmt.where(Professor.university_id == university_id)
-    if country_id:
+    elif country_id:
         stmt = stmt.join(University).where(University.country_id == country_id)
     rows = list(db.execute(stmt).scalars().unique())
     terms = [t.strip().lower() for t in interests if t and t.strip()]

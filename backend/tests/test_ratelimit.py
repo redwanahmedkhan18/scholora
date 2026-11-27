@@ -69,6 +69,14 @@ def _app() -> FastAPI:
     def countries():
         return []
 
+    @app.post("/api/v1/assistant/session")
+    def assistant_session():
+        return {"ok": True}
+
+    @app.post("/api/v1/assistant/ask")
+    def assistant_ask():
+        return {"ok": True}
+
     return app
 
 
@@ -93,9 +101,35 @@ def test_middleware_emits_headers_and_eventually_429():
     assert blocked.headers.get("Retry-After")
 
 
-def test_separate_clients_have_separate_budgets():
+def test_session_issuance_has_its_own_tight_limit():
+    rule = ratelimit.match_rule("/api/v1/assistant/session", "POST")
+    assert rule is not None and rule.name == "assistant_session"
+    assert rule.limit <= 10 and rule.window <= 60
+    # Normal questions use the conversation rule, not the issuance one.
+    assert ratelimit.match_rule("/api/v1/assistant/ask", "POST").name == "assistant"
+
+
+def test_session_issuance_is_enforced_and_recovers(monkeypatch):
     _reset_cache()
-    client = TestClient(_app())
+    monkeypatch.setattr(settings, "trusted_proxies", "127.0.0.1/32")
+    client = TestClient(_app(), client=("127.0.0.1", 50000))
+    statuses = [client.post("/api/v1/assistant/session").status_code for _ in range(12)]
+    assert statuses[0] == 200
+    assert 429 in statuses
+    assert client.post("/api/v1/assistant/session").headers.get("Retry-After")
+    # A different client IP is unaffected, and clearing the counter restores service.
+    assert client.post("/api/v1/assistant/session",
+                       headers={"X-Forwarded-For": "10.9.9.9"}).status_code == 200
+    _reset_cache()
+    assert client.post("/api/v1/assistant/session").status_code == 200
+    # Issuance limits never throttle ordinary questions.
+    assert client.post("/api/v1/assistant/ask").status_code == 200
+
+
+def test_separate_clients_have_separate_budgets(monkeypatch):
+    _reset_cache()
+    monkeypatch.setattr(settings, "trusted_proxies", "127.0.0.1/32")
+    client = TestClient(_app(), client=("127.0.0.1", 50000))
     rule = ratelimit.match_rule("/api/v1/leads", "POST")
 
     for _ in range(rule.limit + 2):
@@ -103,6 +137,63 @@ def test_separate_clients_have_separate_budgets():
     assert client.post("/api/v1/leads", headers={"X-Forwarded-For": "10.0.0.1"}).status_code == 429
     # A different caller is unaffected.
     assert client.post("/api/v1/leads", headers={"X-Forwarded-For": "10.0.0.2"}).status_code == 200
+
+
+def _request(peer: str, xff: str | None = None, real_ip: str | None = None):
+    from starlette.requests import Request
+
+    headers = []
+    if xff is not None:
+        headers.append((b"x-forwarded-for", xff.encode()))
+    if real_ip is not None:
+        headers.append((b"x-real-ip", real_ip.encode()))
+    return Request({"type": "http", "method": "GET", "path": "/",
+                    "headers": headers, "client": (peer, 50000)})
+
+
+def test_forwarded_headers_are_ignored_without_a_trusted_proxy(monkeypatch):
+    monkeypatch.setattr(settings, "trusted_proxies", "")
+    assert ratelimit.client_key(_request("127.0.0.1", "203.0.113.9")) == "127.0.0.1"
+    assert ratelimit.client_key(_request("127.0.0.1", real_ip="203.0.113.9")) == "127.0.0.1"
+    monkeypatch.setattr(settings, "trusted_proxies", "127.0.0.1/32")
+    assert ratelimit.client_key(_request("127.0.0.1", real_ip="203.0.113.9")) == "127.0.0.1"
+    assert ratelimit.client_key(_request("10.0.0.3", real_ip="203.0.113.9")) == "10.0.0.3"
+
+
+def test_untrusted_immediate_peer_cannot_claim_to_be_a_proxy(monkeypatch):
+    monkeypatch.setattr(settings, "trusted_proxies", "10.0.0.0/8")
+    assert ratelimit.client_key(_request("198.51.100.4", "203.0.113.9")) == "198.51.100.4"
+
+
+def test_forwarded_chain_is_walked_from_the_trusted_side(monkeypatch):
+    monkeypatch.setattr(settings, "trusted_proxies", "10.0.0.0/8, 127.0.0.1/32")
+    assert ratelimit.client_key(
+        _request("10.0.0.3", "203.0.113.9, 10.0.0.2")) == "203.0.113.9"
+    # The nearest untrusted hop wins; an attacker-injected leftmost value is not used.
+    assert ratelimit.client_key(
+        _request("10.0.0.3", "203.0.113.9, 198.51.100.7")) == "198.51.100.7"
+    # A malformed chain fails closed to the direct peer.
+    assert ratelimit.client_key(_request("10.0.0.3", "not-an-ip, 10.0.0.2")) == "10.0.0.3"
+    assert ratelimit.client_key(_request("10.0.0.3", "203.0.113.9,,10.0.0.2")) == "10.0.0.3"
+    # Duplicate X-Forwarded-For headers are ambiguous and fail closed.
+    from starlette.requests import Request
+    duplicated = Request({"type": "http", "method": "GET", "path": "/",
+                          "headers": [(b"x-forwarded-for", b"203.0.113.9"),
+                                      (b"x-forwarded-for", b"198.51.100.7")],
+                          "client": ("10.0.0.3", 50000)})
+    assert ratelimit.client_key(duplicated) == "10.0.0.3"
+
+
+def test_repeated_spoofed_headers_cannot_bypass_issuance(monkeypatch):
+    _reset_cache()
+    monkeypatch.setattr(settings, "trusted_proxies", "")
+    client = TestClient(_app())
+    statuses = [client.post("/api/v1/assistant/session",
+                            headers={"X-Forwarded-For": f"203.0.113.{i}"}).status_code
+                for i in range(12)]
+    assert 429 in statuses
+    assert client.post("/api/v1/assistant/session",
+                       headers={"X-Forwarded-For": "203.0.113.99"}).status_code == 429
 
 
 # ------------------------------------------------------------------- cache

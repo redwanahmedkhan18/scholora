@@ -44,7 +44,7 @@ from app.models.crm import (
     User,
 )
 from app.models.education import Program, University
-from app.services import extraction, retrieval, tasks
+from app.services import extraction, read_audit, retrieval, tasks
 from app.services import notifications as notify
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,18 @@ def _audit(db: Session, user: User, action: str, entity_type: str,
            entity_id: Optional[int] = None, detail: Optional[Dict[str, Any]] = None) -> None:
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action=action,
                     entity_type=entity_type, entity_id=entity_id, detail=detail or {}))
+
+
+def _audit_read(db: Session, user: User, resource: str, operation: str, *,
+                subject_id: Optional[int] = None) -> None:
+    """One event per staff request that exposes student data (W7-T4). Fails closed."""
+    try:
+        read_audit.audit_student_read(db, user, resource=resource, operation=operation,
+                                      subject_id=subject_id)
+    except read_audit.AuditUnavailable:
+        raise HTTPException(
+            503, "This view is unavailable because the access could not be recorded."
+        ) from None
 
 # ====================================================================== MFA
 #
@@ -472,6 +484,9 @@ def counselor_dashboard(db: Session = Depends(get_db), user: User = Depends(requ
                 "university": university.name if university else None,
                 "intake_label": a.intake_label, "updated_at": S._dt(a.updated_at)}
 
+    # Exposes lead names, phones, applications, appointments and pending documents.
+    _audit_read(db, user, "counselor-dashboard", "dashboard")
+
     return {
         "counselor": {"id": user.id, "name": user.full_name, "role": user.role},
         "kpis": {
@@ -548,6 +563,7 @@ def applications_board(
     for status_row in db.execute(select(Application.status, func.count(Application.id))
                                  .group_by(Application.status)).all():
         counts[status_row[0]] = status_row[1]
+    _audit_read(db, user, "applications", "board")
     return {"stages": APPLICATION_STATUSES, "counts": counts, "total": len(items), "items": items}
 
 
@@ -635,6 +651,8 @@ def documents_queue(db: Session = Depends(get_db), user: User = Depends(require_
     for row in db.execute(select(Document.status, func.count(Document.id))
                           .group_by(Document.status)).all():
         counts[row[0]] = row[1]
+    # Student names, portal tokens and a freshly minted signed URL per row.
+    _audit_read(db, user, "documents", "queue")
     return {"statuses": DOC_STATUSES, "counts": counts, "total": len(items), "items": items}
 
 
@@ -688,6 +706,9 @@ def notifications_inbox(db: Session = Depends(get_db), user: User = Depends(requ
     if unread_only:
         stmt = stmt.where(Notification.read_at.is_(None))
     rows = db.execute(stmt.limit(limit)).scalars().all()
+    # Shared (``user_id IS NULL``) notifications include student-triggered ones whose body
+    # carries the student's name, so the inbox is a student-data read.
+    _audit_read(db, user, "notifications", "inbox")
     return {
         "unread": notify.unread_count(db, user_id=user.id),
         "items": [{"id": n.id, "title": n.title, "body": n.body, "trigger": n.trigger,
@@ -821,6 +842,8 @@ def assistant_conversations(db: Session = Depends(get_db), user: User = Depends(
     total = db.execute(select(func.count(AssistantConversation.id))).scalar_one()
     ungrounded = db.execute(select(func.count(AssistantConversation.id))
                             .where(AssistantConversation.grounded.is_(False))).scalar_one()
+    # The student's own words: question and answer text.
+    _audit_read(db, user, "assistant-conversations", "list")
     return {
         "total": total,
         "ungrounded": ungrounded,
