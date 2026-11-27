@@ -132,7 +132,6 @@ export function SourceNote({ provenance, label = "Source" }: { provenance?: Dict
       </div>
       <p className="mt-1">
         Verified {dateLabel(provenance.verified_at)}
-        {provenance.verified_by ? ` by ${provenance.verified_by}` : ""}
         {provenance.review_due_at ? ` · next review ${dateLabel(provenance.review_due_at)}` : ""}
       </p>
     </div>

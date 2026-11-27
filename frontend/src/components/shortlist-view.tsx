@@ -3,14 +3,10 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { LEVEL_LABEL, money } from "@/lib/format";
-import { getProfileToken, syncShortlist } from "@/lib/portal";
+import { getProfileToken, readLocalShortlist, syncShortlist, writeLocalShortlist, clearLocalShortlist } from "@/lib/portal";
 import { track } from "@/lib/track";
 
 type Dict = Record<string, any>;
-
-function read(): Dict[] {
-  try { return JSON.parse(localStorage.getItem("scholara.shortlist") ?? "[]"); } catch { return []; }
-}
 
 export default function ShortlistView() {
   const [items, setItems] = useState<Dict[] | null>(null);
@@ -18,13 +14,20 @@ export default function ShortlistView() {
   const [synced, setSynced] = useState<number | null>(null);
 
   useEffect(() => {
-    setItems(read());
-    setToken(getProfileToken());
-    const on = () => { setItems(read()); setToken(getProfileToken()); };
+    let active = true;
+    const load = async () => {
+      const next = await readLocalShortlist();
+      if (!active) return;
+      setItems(next);
+      setToken(getProfileToken());
+    };
+    void load();
+    const on = () => { void load(); };
     window.addEventListener("scholara:shortlist", on);
     window.addEventListener("scholara:profile", on);
     window.addEventListener("storage", on);
     return () => {
+      active = false;
       window.removeEventListener("scholara:shortlist", on);
       window.removeEventListener("scholara:profile", on);
       window.removeEventListener("storage", on);
@@ -36,16 +39,19 @@ export default function ShortlistView() {
     setSynced(added);
   };
 
-  const remove = (slug: string) => {
-    const next = read().filter((x) => x.slug !== slug);
-    localStorage.setItem("scholara.shortlist", JSON.stringify(next));
+  const remove = async (slug: string) => {
+    const identity = getProfileToken();
+    const next = (await readLocalShortlist(identity)).filter((x) => x.slug !== slug);
+    if (!(await writeLocalShortlist(next, identity)) || getProfileToken() !== identity) return;
     setItems(next);
     window.dispatchEvent(new Event("scholara:shortlist"));
     track("shortlist_remove", { slug });
   };
 
-  const clear = () => {
-    localStorage.setItem("scholara.shortlist", "[]");
+  const clear = async () => {
+    const identity = getProfileToken();
+    await clearLocalShortlist(identity);
+    if (getProfileToken() !== identity) return;
     setItems([]);
     window.dispatchEvent(new Event("scholara:shortlist"));
   };

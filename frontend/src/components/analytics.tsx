@@ -3,7 +3,7 @@
 import Script from "next/script";
 import { usePathname } from "next/navigation";
 import { useEffect } from "react";
-import { captureUtm, sessionId, track } from "@/lib/track";
+import { captureUtm, sanitizeAnalyticsPath, sessionId, track } from "@/lib/track";
 
 type Dict = Record<string, any>;
 
@@ -19,14 +19,23 @@ export default function Analytics({ settings }: { settings: Dict }) {
   const pixel = settings.meta_pixel_id as string | undefined;
   const placeholder = (v?: string) => !v || /X{4,}|0{6,}/.test(v);
 
+  // Never inject GA/GTM/Meta on a private portal route; a tag manager can observe
+  // document.location even when this component makes no explicit call.
+  const privateRoute = sanitizeAnalyticsPath(pathname) === null;
+
   useEffect(() => { captureUtm(); }, []);
 
   useEffect(() => {
+    // Private portal routes are excluded from every analytics destination, including direct
+    // third-party calls that do not pass through track().
+    if (privateRoute) return;
     sessionId();
     track("page_view", { path: pathname });
     window.gtag?.("event", "page_view", { page_path: pathname });
     window.fbq?.("track", "PageView");
-  }, [pathname]);
+  }, [pathname, privateRoute]);
+
+  if (privateRoute) return null;
 
   return (
     <>

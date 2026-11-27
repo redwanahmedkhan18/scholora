@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getProfileToken } from "@/lib/portal";
+import { getProfileToken, readLocalShortlist, writeLocalShortlist } from "@/lib/portal";
 import { track } from "@/lib/track";
 import { contactFromSettings, mailtoHref, safeExternalHref, telHref, whatsappHref } from "@/lib/contact";
 
@@ -42,16 +42,19 @@ export function BottomNav({ settings }: { settings: Dict }) {
   const [token, setToken] = useState<string | null>(null);
 
   useEffect(() => {
-    const read = () => {
-      try { setCount(JSON.parse(localStorage.getItem("scholara.shortlist") ?? "[]").length); }
-      catch { setCount(0); }
+    let active = true;
+    const read = async () => {
+      const items = await readLocalShortlist();
+      if (!active) return;
+      setCount(items.length);
       setToken(getProfileToken());
     };
-    read();
+    void read();
     window.addEventListener("scholara:shortlist", read);
     window.addEventListener("scholara:profile", read);
     window.addEventListener("storage", read);
     return () => {
+      active = false;
       window.removeEventListener("scholara:shortlist", read);
       window.removeEventListener("scholara:profile", read);
       window.removeEventListener("storage", read);
@@ -113,18 +116,29 @@ export function ShortlistButton({ item, className = "" }: { item: Dict; classNam
   const [on, setOn] = useState(false);
 
   useEffect(() => {
-    try {
-      const list = JSON.parse(localStorage.getItem("scholara.shortlist") ?? "[]");
-      setOn(list.some((x: Dict) => x.slug === item.slug));
-    } catch { /* ignore */ }
+    let active = true;
+    const load = () => {
+      void readLocalShortlist().then((list) => {
+        if (active) setOn(list.some((x: Dict) => x.slug === item.slug));
+      });
+    };
+    load();
+    window.addEventListener("scholara:profile", load);
+    window.addEventListener("storage", load);
+    return () => {
+      active = false;
+      window.removeEventListener("scholara:profile", load);
+      window.removeEventListener("storage", load);
+    };
   }, [item.slug]);
 
-  const toggle = () => {
-    let list: Dict[] = [];
-    try { list = JSON.parse(localStorage.getItem("scholara.shortlist") ?? "[]"); } catch { list = []; }
+  const toggle = async () => {
+    const identity = getProfileToken();
+    const list = await readLocalShortlist(identity);
+    if (getProfileToken() !== identity) return;
     const exists = list.some((x) => x.slug === item.slug);
     const next = exists ? list.filter((x) => x.slug !== item.slug) : [...list, item];
-    localStorage.setItem("scholara.shortlist", JSON.stringify(next));
+    if (!(await writeLocalShortlist(next, identity)) || getProfileToken() !== identity) return;
     setOn(!exists);
     window.dispatchEvent(new Event("scholara:shortlist"));
     track(exists ? "shortlist_remove" : "shortlist_add", { slug: item.slug, name: item.name }, exists ? undefined : "AddToWishlist");
