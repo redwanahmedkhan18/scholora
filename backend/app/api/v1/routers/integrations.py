@@ -1,25 +1,24 @@
 """WhatsApp webhook/send, assistant endpoint, Meta Conversions API + ads helpers."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import assistant_sessions as sessions
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import require_role, require_staff
+from app.core.deps import require_internal_caller, require_role, require_staff
 from app.core.privacy import safe_source_url
 from app.core.webhooks import require_meta_signature
 from app.models.content import AdCampaign, SiteSetting
-from app.models.crm import AnalyticsEvent, AssistantSession, AuditLog, StudentProfile, User
+from app.models.crm import AnalyticsEvent, AssistantSession, AuditLog, Lead, StudentProfile, User
 from app.services import assistant, assistant_engine, context_slots, domain_gate, read_audit, whatsapp
 
 router = APIRouter(tags=["integrations"])
@@ -231,12 +230,15 @@ def ask(body: AskIn, request: Request, response: Response, db: Session = Depends
             raise HTTPException(409, "Your profile changed. Start a new assistant session.")
 
     profile_id = row.student_profile_id if row is not None and row.ownership == sessions.PROFILE else None
-    context = dict(body.context or {})
-    # Client context is never identity, and (W5) it is never a student attribute either. Every
-    # key the answer is allowed to depend on is removed here and re-derived on the server, so a
-    # caller cannot seed a slot, a profile fact or a retrieval filter from the request body.
-    for untrusted in ("profile", "research_interests", "country", "degree_level", "subject"):
-        context.pop(untrusted, None)
+    # Client context is never identity, and (W5) it is never a student attribute either. The
+    # answer's context is an *allowlist* built here - the verified profile, then the resolved
+    # session slots - rather than the request body with a few keys removed. A blocklist has to
+    # name every key that matters, and it missed one: `excluded_countries` reached the scope
+    # resolver, so a caller could seed a retrieval filter (and a malformed value - `42`, or a list
+    # holding an integer - raised while building the scope, turning a bad body into a 500 on an
+    # anonymous endpoint). Starting from an empty mapping means the set of things the engine can
+    # depend on is exactly the set of things this function writes, and it cannot grow by accident.
+    context: Dict[str, Any] = {}
     context.update(_profile_context(db, profile_id))
 
     # ---- W5: conversation context ---------------------------------------
@@ -500,46 +502,99 @@ def marketing_links(campaign: Optional[str] = None, db: Session = Depends(get_db
 
 
 class ConversionIn(BaseModel):
+    """One server-side conversion event, for our own server or an operator's runner.
+
+    No personal identifier is accepted, and that is the point of this shape.
+
+    The Conversions API can take hashed e-mail and phone to improve ad matching. Scholara's only
+    consent control is ``consent_contact``, and its wording is "I agree to be contacted about my
+    enquiry on WhatsApp, phone or email" - permission to be *contacted about an enquiry*, not
+    permission to disclose an identifier to an advertising platform for matching. A hash is a
+    pseudonym, not anonymity: Meta matches on it, so sending it is a disclosure the visitor never
+    agreed to. Until a dedicated marketing-matching consent exists (an explicit product and legal
+    decision, recorded in the docs as an open item), this endpoint forwards no identifier at all -
+    neither raw nor hashed. It also cannot be used to relay somebody else's address, because it
+    accepts no address in the first place.
+
+    ``lead_reference`` is our own reference (``SCH-...``), not an identifier: it lets the caller
+    tie the event to a record we already hold, and it is never sent to Meta.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     event_name: str = "Lead"
     event_source_url: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
     value: Optional[float] = None
     currency: str = "BDT"
+    lead_reference: Optional[str] = None
 
 
 @router.post("/marketing/conversion")
-async def server_conversion(body: ConversionIn, db: Session = Depends(get_db)):
-    """Meta Conversions API relay (server-side ad attribution). Hashes PII before sending.
+async def server_conversion(body: ConversionIn, db: Session = Depends(get_db),
+                            _caller: None = Depends(require_internal_caller)):
+    """Meta Conversions API relay (server-side ad attribution), without personal identifiers.
 
-    ``event_source_url`` is client-supplied. It is normalised to a bare path before it is
-    persisted or relayed, so a query string (``?email=...``) or a private portal link cannot
-    leave the platform through the vendor call or land in the analytics table. Hashed
-    ``em``/``ph`` remain the only identifiers that reach Meta.
+    Three boundaries, each enforced here rather than by convention:
+
+    * **Server-to-server only.** The route requires the internal token, so an arbitrary internet
+      client cannot push events - the open-relay and conversion-inflation path is closed, and the
+      caller is identified by the deployment rather than by its payload.
+    * **No identifier leaves the platform.** The payload carries the event name, value, currency,
+      time and a bare landing path, and no ``user_data`` at all. A hash of an address is still that
+      person's data, and nothing the product collects authorizes disclosing it to an ad network.
+    * **A truthful landing page.** ``event_source_url`` is normalised to a bare path before it is
+      persisted or relayed, so a query string (``?email=...``) or a private portal link cannot
+      leave the platform through the vendor call or land in the analytics table.
+
+    Vendor failures are reported as a bare status code. The access token travels as a query
+    parameter, so an exception from the client library could otherwise quote a URL that contains
+    it - the reason the call is wrapped and the response body is not echoed to the caller.
     """
     source_path = safe_source_url(body.event_source_url)
+    lead_id: Optional[int] = None
+    if body.lead_reference:
+        lead = db.execute(select(Lead).where(
+            Lead.reference == body.lead_reference)).scalars().first()
+        if lead is None:
+            # A conversion attributed to a record we do not hold is a bug in the caller, not a
+            # reason to invent one. Refuse before anything is persisted or forwarded.
+            raise HTTPException(422, "That lead reference does not exist.")
+        lead_id = lead.id
+
     db.add(AnalyticsEvent(name=f"conversion_{body.event_name.lower()}", path=source_path,
                           meta={"value": body.value, "currency": body.currency}))
     db.commit()
+
     s = db.get(SiteSetting, 1)
     pixel_id = (s.meta_pixel_id if s else None) or settings.meta_pixel_id
     token = settings.meta_capi_access_token
     if not (pixel_id and token):
-        return {"status": "LOGGED_LOCALLY", "note": "Set META_CAPI_ACCESS_TOKEN and a pixel id to forward to Meta."}
+        return {"status": "LOGGED_LOCALLY",
+                "note": "Set META_CAPI_ACCESS_TOKEN and a pixel id to forward to Meta."}
     import time
 
     import httpx
-    def h(v: Optional[str]) -> Optional[str]:
-        return hashlib.sha256(v.strip().lower().encode()).hexdigest() if v else None
 
     # Omit the URL rather than send a null or the original: a vendor event without a landing
     # page is recoverable (the browser pixel carries it), a leaked capability is not.
     event: Dict[str, Any] = {"event_source_url": source_path} if source_path else {}
-    payload = {"data": [{**event, "event_name": body.event_name, "event_time": int(time.time()),
-                         "action_source": "website",
-                         "user_data": {k: v for k, v in {"em": h(body.email), "ph": h(body.phone)}.items() if v},
-                         "custom_data": {"value": body.value, "currency": body.currency}}]}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{settings.meta_graph_base_url}/{pixel_id}/events",
-                              params={"access_token": token}, json=payload)
-        return {"status": r.status_code, "response": r.json()}
+    payload = {"data": [{
+        **event, "event_name": body.event_name, "event_time": int(time.time()),
+        "action_source": "website",
+        # Deliberately absent: user_data. See the class docstring - no consent covers it.
+        "custom_data": {"value": body.value, "currency": body.currency},
+    }]}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(f"{settings.meta_graph_base_url}/{pixel_id}/events",
+                                  params={"access_token": token}, json=payload)
+    except Exception as exc:                      # noqa: BLE001 - never echo the URL or token
+        logger.warning("conversion relay failed for event=%s (%s)",
+                       body.event_name, type(exc).__name__)
+        return {"status": "RELAY_FAILED"}
+
+    if r.status_code >= 400:
+        # The vendor body can quote the request; keep it out of our response and our log.
+        logger.warning("conversion relay rejected event=%s status=%s lead=%s",
+                       body.event_name, r.status_code, lead_id)
+    return {"status": r.status_code}

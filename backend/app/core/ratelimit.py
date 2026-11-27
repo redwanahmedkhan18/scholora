@@ -50,6 +50,11 @@ RULES: list[Rule] = [
     # its own small bucket: a stolen session must not be able to use the mailbox as a weapon.
     Rule(re.compile(r"/api/v1/admin/config/test/"), 10, 300, ("POST",), "config_test"),
     Rule(re.compile(r"/api/v1/track$"), 600, 3600, ("POST",), "track"),
+    # The conversion relay is server-to-server (it requires the internal token), so this is not
+    # the only control on it - but a dedicated bucket keeps any attempt to guess that token, or a
+    # misconfigured caller looping, away from the 300/60s public budget. First match wins, so it
+    # must sit above the catch-all.
+    Rule(re.compile(r"/api/v1/marketing/conversion$"), 60, 3600, ("POST",), "conversion"),
     Rule(re.compile(r"/api/v1/admin/"), 600, 60, name="admin"),
     Rule(re.compile(r"/api/v1/"), 300, 60, name="public"),
 ]

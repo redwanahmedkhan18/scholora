@@ -522,10 +522,14 @@ def get_profile(token: str, db: Session = Depends(get_db)):
 @router.post("/track")
 def track(body: TrackIn, db: Session = Depends(get_db)):
     # The browser boundary strips these before sending; this is the server-side fail-closed
-    # backstop for a compromised or older client. Behaviour here is unchanged from W4: the
-    # helpers moved to app.core.privacy but their semantics are identical.
-    utm = scrub_analytics_value(dict(body.utm or {}))
-    meta = scrub_analytics_value(dict(body.meta or {}))
+    # backstop for a compromised or older client. ``ignore_case=True`` here (it used to be the
+    # frozen W4 default) because a portal capability is only a capability if the router matches it:
+    # ``/MY/<token>`` is a different path from ``/my/<token>`` to a case-sensitive router and the
+    # same credential to anything that echoes it back, and a bearer token in an analytics row is a
+    # token a staff member or an export can read. The lead and appointment paths already passed
+    # True for the same reason; this closes the remaining writer.
+    utm = scrub_analytics_value(dict(body.utm or {}), ignore_case=True)
+    meta = scrub_analytics_value(dict(body.meta or {}), ignore_case=True)
     db.add(AnalyticsEvent(name=body.name, path=safe_analytics_path(body.path),
                           entity_type=body.entity_type, entity_id=body.entity_id,
                           utm=utm, meta=meta,

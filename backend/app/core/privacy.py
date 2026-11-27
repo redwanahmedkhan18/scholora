@@ -48,13 +48,22 @@ def _is_private_portal_path_ci(path: Optional[str]) -> bool:
 def safe_analytics_path(value: Optional[str]) -> Optional[str]:
     """A storeable path from a client-supplied one: no query string, no fragment, no portal.
 
-    This preserves the exact behaviour of the analytics-ingestion helper shipped with W4. It is
-    a *path* helper; use :func:`safe_source_url` for anything that may be a full URL.
+    Case-insensitive on purpose, which is the one behaviour change from the W4 helper. A capability
+    is only a capability if the router matches the path - but the *token* inside it is sensitive
+    whatever the case, and an analytics row is read by staff and copied into exports. ``/MY/<token>``
+    is therefore treated exactly like ``/my/<token>``: dropped when it is the path, and truncated at
+    the portal segment when the segment is embedded in a longer path.
+
+    It is still a *path* helper; use :func:`safe_source_url` for anything that may be a full URL.
     """
-    if not value:
+    if not isinstance(value, str):
         return None
     path = value.split("?", 1)[0].split("#", 1)[0].strip()
-    if is_private_portal_path(path):
+    if not path:
+        return None
+    # Defence in depth: a public-looking path can still carry a portal segment inside it.
+    path = PORTAL_PATH_PATTERN_CI.sub(_PRIVATE_PREFIX, path)
+    if _is_private_portal_path_ci(path):
         return None
     return path or None
 

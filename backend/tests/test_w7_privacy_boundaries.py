@@ -8,6 +8,7 @@ Nothing here may weaken campaign attribution: ``utm_campaign`` still resolves ``
 """
 from __future__ import annotations
 
+import pytest
 from app.core.privacy import safe_analytics_path, safe_source_url, scrub_analytics_value
 from app.models.content import AdCampaign
 from app.models.crm import AnalyticsEvent, Lead
@@ -63,8 +64,19 @@ def test_safe_analytics_path_retains_the_w4_semantics_exactly():
     assert safe_analytics_path("/programs?utm_source=x#top") == "/programs"
     assert safe_analytics_path("") is None
     assert safe_analytics_path(None) is None
-    # Deliberately unchanged from W4: this helper backs /track, whose behaviour is frozen.
-    assert safe_analytics_path(f"/MY/{SECRET}") == f"/MY/{SECRET}"
+    # Deliberately CHANGED from W4. The frozen semantics kept `/MY/<token>`, and the reason given
+    # for freezing them was that route matching is case-sensitive - but a capability is sensitive
+    # whatever its prefix's case, and an analytics row is read by staff and copied into exports.
+    # The security finding supersedes the compatibility note; the assertion moved with it.
+    assert safe_analytics_path(f"/MY/{SECRET}") is None
+    assert safe_analytics_path("/MY") is None
+    assert safe_analytics_path("/My/AbCdEf") is None
+    # An embedded portal segment is truncated, never stored with its token.
+    assert safe_analytics_path(f"/programs/my/{SECRET}/apply") == "/programs/my"
+    assert safe_analytics_path("/programs/in/my/ABCDEF?x=1") == "/programs/in/my"
+    # A public path is untouched, including one that merely contains the letters.
+    assert safe_analytics_path("/programs") == "/programs"
+    assert safe_analytics_path("/myths") == "/myths"
 
 
 def test_scrub_analytics_value_is_narrow_and_structural():
@@ -165,8 +177,18 @@ def test_lead_nested_utm_portal_paths_are_scrubbed_without_losing_keys(client, a
 
 
 # -------------------------------------------------- /api/v1/marketing/conversion
+# The relay is server-to-server: it requires the internal token and accepts no personal
+# identifier at all (see the handler's docstring for why the existing consent wording cannot
+# cover ad-platform matching). These tests keep their original intent - nothing private may
+# leave the platform - under the stricter contract.
+def _internal_headers() -> dict:
+    from app.core.config import settings
+
+    return {"X-Internal-Token": settings.internal_api_token}
+
+
 def test_conversion_source_url_is_scrubbed_before_persistence(client, api, db):
-    res = client.post(f"{api}/marketing/conversion", json={
+    res = client.post(f"{api}/marketing/conversion", headers=_internal_headers(), json={
         "event_name": "Lead",
         "event_source_url": f"https://scholara.test/my/{SECRET}?email=probe@example.com",
     })
@@ -178,7 +200,7 @@ def test_conversion_source_url_is_scrubbed_before_persistence(client, api, db):
 
 
 def test_conversion_public_url_is_reduced_to_a_path(client, api, db):
-    res = client.post(f"{api}/marketing/conversion", json={
+    res = client.post(f"{api}/marketing/conversion", headers=_internal_headers(), json={
         "event_name": "Purchase", "event_source_url": "https://scholara.test/programs?utm_source=fb",
     })
     assert res.status_code == 200, res.text
@@ -229,11 +251,9 @@ def test_conversion_never_relays_a_raw_or_private_url_to_meta(client, api, monke
     monkeypatch.setattr(settings, "meta_capi_access_token", "test-capi-token", raising=False)
     monkeypatch.setattr(settings, "meta_pixel_id", "1234567890", raising=False)
 
-    res = client.post(f"{api}/marketing/conversion", json={
+    res = client.post(f"{api}/marketing/conversion", headers=_internal_headers(), json={
         "event_name": "Lead",
         "event_source_url": f"https://scholara.test/my/{SECRET}?email=probe@example.com",
-        "email": "probe@example.com",
-        "phone": "+8801700000009",
     })
     assert res.status_code == 200, res.text
     assert captured.get("payload"), "the vendor call did not happen; the assertion would be vacuous"
@@ -242,10 +262,10 @@ def test_conversion_never_relays_a_raw_or_private_url_to_meta(client, api, monke
     assert "event_source_url" not in data, "a private/query-bearing URL must not be relayed"
     blob = repr(captured["payload"])
     assert SECRET not in blob
-    assert "probe@example.com" not in blob and "+8801700000009" not in blob
-    # Only hashed identifiers may identify the person.
-    assert set(data["user_data"]) <= {"em", "ph"}
-    assert len(data["user_data"]["em"]) == 64
+    assert "probe@example.com" not in blob
+    # Stronger than "only hashed identifiers": no identifier of any kind is relayed, because no
+    # consent the product collects authorizes disclosing one to an ad platform.
+    assert "user_data" not in data
 
 
 def test_conversion_relays_only_a_clean_path_for_a_public_url(client, api, monkeypatch):
@@ -278,7 +298,7 @@ def test_conversion_relays_only_a_clean_path_for_a_public_url(client, api, monke
     monkeypatch.setattr(settings, "meta_capi_access_token", "test-capi-token", raising=False)
     monkeypatch.setattr(settings, "meta_pixel_id", "1234567890", raising=False)
 
-    res = client.post(f"{api}/marketing/conversion", json={
+    res = client.post(f"{api}/marketing/conversion", headers=_internal_headers(), json={
         "event_name": "Lead", "event_source_url": "https://scholara.test/programs?utm_source=fb&email=a@b.c",
     })
     assert res.status_code == 200, res.text
@@ -354,3 +374,42 @@ def test_appointment_without_affirmative_consent_is_still_refused(client, api):
     for bad in (None, False, "true"):
         res = _book(client, api, consent_contact=bad, utm={"utm_source": "fb"})
         assert res.status_code == 422, f"consent={bad!r} must be refused, got {res.status_code}"
+
+
+# ------------------------------------------------- L-3: case variants of a capability
+# A portal capability that survives into an analytics row is a credential a staff member or an
+# export can read. The router may care about case; the token does not.
+@pytest.mark.parametrize("path", [
+    f"/my/{SECRET}", f"/MY/{SECRET}", f"/My/{SECRET}", f"/mY/{SECRET}",
+])
+def test_track_never_stores_a_capability_in_any_case(client, api, db, path):
+    res = client.post(f"{api}/track", json={"name": "page_view", "path": path})
+    assert res.status_code == 200, res.text
+    event = db.execute(select(AnalyticsEvent).order_by(AnalyticsEvent.id.desc())).scalars().first()
+    assert event.path is None, event.path
+    assert SECRET not in repr(event.path)
+
+
+@pytest.mark.parametrize("key", ["landing_path", "ref", "referrer", "next"])
+def test_track_never_stores_a_capability_in_utm_or_meta(client, api, db, key):
+    """The field name is the client's choice, so every free-form string is scrubbed."""
+    body = {"name": "page_view", "path": "/programs"}
+    body["utm"] = {key: f"/MY/{SECRET}"}
+    body["meta"] = {key: f"https://scholara.test/mY/{SECRET}?utm_source=x"}
+    res = client.post(f"{api}/track", json=body)
+    assert res.status_code == 200, res.text
+    event = db.execute(select(AnalyticsEvent).order_by(AnalyticsEvent.id.desc())).scalars().first()
+    assert SECRET not in repr(event.utm), event.utm
+    assert SECRET not in repr(event.meta), event.meta
+
+
+def test_track_still_keeps_ordinary_campaign_attribution(client, api, db):
+    """The hardening must not break the feature it protects: real attribution still persists."""
+    res = client.post(f"{api}/track", json={
+        "name": "page_view", "path": "/programs",
+        "utm": {"utm_campaign": "uk_january_intake", "utm_source": "facebook"},
+    })
+    assert res.status_code == 200, res.text
+    event = db.execute(select(AnalyticsEvent).order_by(AnalyticsEvent.id.desc())).scalars().first()
+    assert event.utm["utm_campaign"] == "uk_january_intake"
+    assert event.utm["utm_source"] == "facebook"

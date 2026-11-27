@@ -235,6 +235,23 @@ def normalize_degree(value: Optional[str]) -> Optional[str]:
 
 
 # ------------------------------------------------------------------ resolution
+def _token_list(tokens: Any) -> List[str]:
+    """Coerce an exclusion input into the strings it can safely contain.
+
+    Defence in depth behind the request boundary. ``context["excluded_countries"]`` is
+    server-derived now, but this function used to be handed the raw request body: an integer
+    raised ``TypeError`` and a list holding one raised ``AttributeError`` while the scope was
+    being resolved, which surfaced as a 500 on an anonymous endpoint. A scope resolver is called
+    on the hot path of every question, so it treats an unexpected shape as "no exclusions" and
+    keeps going - it never widens the scope (an exclusion only ever narrows) and it never raises.
+    """
+    if isinstance(tokens, str):
+        return [tokens]
+    if not isinstance(tokens, (list, tuple, set, frozenset)):
+        return []
+    return [item for item in tokens if isinstance(item, str) and item.strip()]
+
+
 def _excluded_ids(db: Session, tokens: Iterable[str]
                   ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Excluded destination rows, split into (country ids, region ids).
@@ -244,7 +261,7 @@ def _excluded_ids(db: Session, tokens: Iterable[str]
     country would only be caught by the country list.
     """
     rows = [row for row in (destinations.resolve_destination(db, token)
-                            for token in tokens or ()) if row is not None]
+                            for token in _token_list(tokens)) if row is not None]
     country_ids, region_ids = _accumulate(db, rows)
     for row in rows:
         if (row.kind or "COUNTRY").upper() == "REGION" and row.id not in country_ids:
