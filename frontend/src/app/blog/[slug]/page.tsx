@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { apiOrNull, getSettings } from "@/lib/api";
 import { dateLabel } from "@/lib/format";
 import { Grid, PostCard } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -80,7 +81,7 @@ export default async function PostPage({ params }: Props) {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
       <header className="bg-gradient-to-br from-brand-950 via-brand-800 to-brand-700 text-white">
         <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6 sm:py-14">
           <nav aria-label="Breadcrumb" className="text-xs text-brand-100">

@@ -7,6 +7,7 @@ import Analytics from "@/components/analytics";
 import { BottomNav, SiteFooter, WhatsAppButton } from "@/components/site-chrome";
 import AssistantWidget from "@/components/assistant";
 import Providers from "@/components/providers";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export async function generateMetadata(): Promise<Metadata> {
   const s = await getSettings();
@@ -78,7 +79,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="en">
       <body className="flex min-h-screen flex-col antialiased">
-        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(org) }} />
+        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(org) }} />
         <a href="#main" className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[60] focus:rounded-lg focus:bg-brand-800 focus:px-4 focus:py-2 focus:text-white">
           Skip to content
         </a>

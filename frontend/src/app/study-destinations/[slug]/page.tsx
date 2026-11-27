@@ -7,6 +7,7 @@ import {
   Breadcrumbs, Disclaimer, EventCard, Grid, ProgramCard, ScholarshipCard,
   Section, StoryCard, UniversityCard,
 } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -48,7 +49,7 @@ export default async function CountryPage({ params }: Props) {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(faqLd) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(faqLd) }} />
 
       <header className="relative overflow-hidden text-white"
         style={{ background: "linear-gradient(135deg,#07183a 0%,#0f3d8a 58%,#1f3fe0 100%)" }}>
