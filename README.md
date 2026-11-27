@@ -278,6 +278,9 @@ that have nothing to do with the code. It is run before a deployment, not here.
 | `tests/test_task2_assistant_sessions.py` | W4 sessions: opaque credential hashed at rest, HttpOnly cookie + CSRF/origin, explicit anonymous/profile ownership, idle/absolute expiry, atomic rotation, restart-safe revocation, cross-profile isolation, explicit A→B profile switching, missing/replaced-token rejection, profile-revocation hook, admin revoke without credential exposure, no-store headers, SID/old-CSRF rejection, post-generation rotation/rebind/revocation discarding the answer, activity refresh, and proof that a legacy client `session_id` grants neither continuity nor profile access |
 | `tests/test_task2_assistant_continuity.py` | Profile-scoped follow-up continuity: A’s previous allowed turn cannot authorize B, anonymous context cannot authorize a profile, profile context cannot authorize anonymous, unknown-ownership legacy rows fail closed, and same-profile follow-ups still work |
 | `tests/test_task2_analytics_privacy.py` | Private portal paths and landing paths are removed at analytics ingestion; public paths remain and query/fragment data is stripped |
+| `tests/test_w12_direct_edit_invalidation.py` | A direct CRUD edit of a verified catalogue figure withdraws the verification: `confidence` becomes `NEEDS_REVIEW`, the reviewer and dates are cleared, the edited field is re-registered as a claim awaiting review, a `CatalogueChange` keeps old and new values with the actor, the public payload reports `verified: false`, an unrelated field cannot re-certify it, and a failed transaction leaves neither the value nor the trust state — across all eight governed resources |
+| `tests/test_marketing_consent.py` | The conversion relay is server-to-server (internal token, dedicated rate limit), accepts no e-mail or phone at all, resolves a lead reference server-side, and never puts a personal identifier or the access token on the wire or in a log — including when the vendor call fails |
+| `tests/test_w6_context_boundary.py` | The assistant request context is an allowlist: malformed `excluded_countries` shapes (an integer, a list holding one, a mapping) cannot 500 the endpoint, cannot seed a retrieval filter, and cannot widen a standing constraint; the scope resolver still honours well-formed exclusions |
 | `tests/test_task2_production_config.py` | Startup production checks: missing/short/published `SECRET_KEY` and `ASSISTANT_SESSION_SECRET`, `APP_ENV`/`ENVIRONMENT` contradiction, legacy/current origin disagreement, wildcard and non-HTTPS production CORS, invalid trusted-proxy CIDRs |
 
 `frontend/tests/privacy-lifecycle.test.ts` mounts the production portal and assistant hooks under jsdom: identity transitions, stale success/error/401/403/409, stale bootstrap/finally, pending portal loads, shortlist sync, BFCache and token-entry consumption.
@@ -467,5 +470,13 @@ Recorded here because they are true of the code as published, not because they a
 - **CI type-checks and tests the frontend, it does not build it.** `npm run build` prerenders pages
   against a live API, so a runner without that API cannot prove it; the build is a pre-deployment
   step.
+- **Ad-platform identifier matching is off, by decision.** The Meta Conversions API relay is
+  server-to-server and sends no e-mail or phone — hashed or otherwise. The only consent the product
+  collects is "contact me about my enquiry on WhatsApp, phone or email", which is permission to be
+  contacted, not permission to disclose an identifier to an advertising platform for matching.
+  Restoring identifier matching needs a dedicated marketing-matching consent (new wording, a
+  recorded flag, and a migration) — an explicit product and legal decision that has not been made.
+  Until then the relay keeps attribution (event, value, currency, landing path) and loses match
+  quality.
 - **Migration filenames in the W-series are forward-dated by plan.** Alembic orders by
   `down_revision`, so the filenames are not chronology.

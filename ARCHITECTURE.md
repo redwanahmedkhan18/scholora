@@ -232,7 +232,18 @@ itself:
 
 An upload can never certify itself: a commit forces `NEEDS_REVIEW` and clears the verification
 dates, trust columns are settable only through the review path (the generic admin CRUD strips
-them), a refusal requires a note, and a reviewer cannot approve their own submission. Decisions
+them), a refusal requires a note, and a reviewer cannot approve their own submission.
+
+**A direct edit invalidates the verification it no longer supports.** The generic admin CRUD writes
+any content column a form posts, so the same rule the importer follows applies there
+(`services/catalogue_writes.py`): when a *factual* field of a governed record changes, the record's
+confidence becomes `NEEDS_REVIEW`, `verified_at` / `verified_by` / `review_due_at` are cleared, the
+edited value is appended to the field register as a claim awaiting review, and a `CatalogueChange`
+keeps the previous value beside the new one with the actor's address. The three writes share one
+transaction, so a value cannot land without its trust state and its history. Presentation, routing
+and exposure columns (slug, SEO text, images, feature flags, ordering, counters) are explicitly not
+claims and never trigger it. The list of governed models is derived from the `VerificationMixin`
+rather than maintained by hand, so a model cannot be governed by accident or forgotten. Decisions
 are compare-and-swap on the state that was reviewed, so two reviewers cannot both "win" one field
 and one change cannot be recorded as both approved and rejected. Version numbers per
 (entity, field) are assigned under a PostgreSQL advisory lock and are unique by index. Staleness
