@@ -19,10 +19,11 @@ and reached a decision, with the reason kept alongside it.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -35,6 +36,8 @@ from app.models.education import (
     Scholarship,
     University,
 )
+
+log = logging.getLogger(__name__)
 
 #: Entity types a reviewer may act on, mapped to their models. A type outside this map is refused
 #: rather than guessed, so a URL parameter can never select an arbitrary table.
@@ -182,23 +185,56 @@ def _same_day_reversal(db: Session, record: DataVerification) -> bool:
 
 def _apply_entity_state(db: Session, entity_type: str, entity_id: int, state: str,
                         actor_email: str) -> None:
+    """Write the derived state onto the entity row.
+
+    Lowering trust is an unconditional write: it can only ever withhold a record, and a concurrent
+    edit that also lowers it is not a conflict. **Promoting** to VERIFIED is different, and this is
+    the one place it can happen outside the review queue. ``state`` was derived from the register a
+    moment ago, and a direct catalogue edit can commit in between - appending a NEEDS_REVIEW row and
+    withdrawing the entity's verification. Writing the stale ``VERIFIED`` onto the entity would put
+    an unreviewed figure back in front of students with a green badge, so the promotion is made
+    conditional *in the statement itself*: it only applies while no register row for this entity
+    disagrees. The database sees the edit; the cached derivation does not.
+    """
     model = ENTITY_MODELS.get(entity_type)
     if model is None:
         return
     entity = db.get(model, entity_id)
     if entity is None or not hasattr(entity, "confidence"):
         return
-    entity.confidence = state
     if state == "VERIFIED":
-        entity.verified_at = datetime.now(timezone.utc)
-        entity.verified_by = actor_email
-    else:
-        # Not verified means not verified: leaving a timestamp behind would satisfy the policy's
-        # date check for a value nobody stands behind.
-        if hasattr(entity, "verified_at"):
-            entity.verified_at = None
-        if hasattr(entity, "verified_by"):
-            entity.verified_by = None
+        promoted = cast(CursorResult, db.execute(
+            update(model)
+            .where(
+                model.id == entity_id,
+                ~exists().where(
+                    DataVerification.entity_type == entity_type,
+                    DataVerification.entity_id == entity_id,
+                    func.upper(DataVerification.status) != "VERIFIED",
+                ),
+            )
+            .values(confidence=state, verified_at=datetime.now(timezone.utc),
+                    verified_by=actor_email)
+            .execution_options(synchronize_session=False)
+        )).rowcount
+        if promoted != 1:
+            # The register moved under this decision: do not certify, and leave the record at
+            # whatever the other writer - an edit awaiting review - has already set.
+            log.info("promotion of %s id=%s withheld: the register changed during the decision",
+                     entity_type, entity_id)
+            db.expire(entity)
+            return
+        db.expire(entity)
+        return
+
+    # Lowering trust: unconditional, because it can only ever withhold a record.
+    entity.confidence = state
+    # Not verified means not verified: leaving a timestamp behind would satisfy the policy's date
+    # check for a value nobody stands behind.
+    if hasattr(entity, "verified_at"):
+        entity.verified_at = None
+    if hasattr(entity, "verified_by"):
+        entity.verified_by = None
 
 
 def assert_review_authority(db: Session, record: DataVerification, actor_email: str) -> None:

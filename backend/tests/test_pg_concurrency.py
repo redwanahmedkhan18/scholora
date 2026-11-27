@@ -720,3 +720,239 @@ def test_two_overlapping_link_sweeps_both_complete(factory, monkeypatch):
     finally:
         check.close()
     assert len(stored) == 2, f"one row per URL however many sweeps ran, got {len(stored)}"
+
+
+# =====================================================================
+# H-1 - a direct catalogue edit under real concurrency
+# =====================================================================
+def _verified_program_row(db: Session, *, tuition: float = 20000.0):
+    """A VERIFIED programme inside the pgcamp schema."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.education import Country, Program, University
+
+    country = db.execute(select(Country).where(
+        Country.slug == "pgcamp-land")).scalars().first()
+    if country is None:
+        country = Country(name="PGCamp Land", slug="pgcamp-land", iso2="PQ", kind="COUNTRY")
+        db.add(country)
+        db.flush()
+    university = db.execute(select(University).where(
+        University.slug == "pgcamp-university")).scalars().first()
+    if university is None:
+        university = University(name="PGCamp University", slug="pgcamp-university",
+                                country_id=country.id, city="Testville",
+                                confidence="NEEDS_REVIEW")
+        db.add(university)
+        db.flush()
+    programme = db.execute(select(Program).where(
+        Program.slug == "pgcamp-msc")).scalars().first()
+    if programme is None:
+        programme = Program(university_id=university.id, name="PGCamp MSc", slug="pgcamp-msc",
+                            degree_level="MASTER", currency="USD")
+        db.add(programme)
+        db.flush()
+    # Each caller needs the same *precondition* - a genuinely verified figure - not a shared row
+    # left in whatever state the previous test put it, so the state is re-established every time.
+    programme.tuition_annual = tuition
+    programme.confidence = "VERIFIED"
+    programme.verified_by = "registrar@pgcamp.test"
+    programme.verified_at = datetime.now(timezone.utc) - timedelta(days=2)
+    programme.review_due_at = datetime.now(timezone.utc) + timedelta(days=200)
+    programme.source_url = "https://pgcamp.test/fees"
+    programme.source_type = "TIER_1_OFFICIAL_UNIVERSITY"
+    # Start every caller from the declared precondition: the record verified, and no leftover
+    # register row from a previous test that would silently change the derived state.
+    from app.models.crm import DataVerification
+
+    db.query(DataVerification).filter(
+        DataVerification.entity_type == "program",
+        DataVerification.entity_id == programme.id).delete(synchronize_session=False)
+    db.commit()
+    return programme.id
+
+
+def test_two_direct_edits_of_one_field_keep_both_changes_and_one_invalidation(factory):
+    """Concurrent CRUD edits must not lose each other's history or leave a verified claim."""
+    from app.models.crm import CatalogueChange
+    from app.models.education import Program
+    from app.services import catalogue_writes
+
+    setup = _session(factory)
+    try:
+        program_id = _verified_program_row(setup)
+    finally:
+        setup.close()
+
+    def editor(index: int):
+        def _run():
+            db = _session(factory)
+            try:
+                row = db.get(Program, program_id)
+                summary = catalogue_writes.apply_direct_edit(
+                    db, model=Program, row=row,
+                    payload={"tuition_annual": 1000.0 + index},
+                    actor=f"editor{index}@pg.test", blocked=catalogue_writes.TRUST_FIELDS)
+                db.commit()
+                return summary["invalidated"]
+            finally:
+                db.close()
+        return _run
+
+    results = run_parallel([editor(1), editor(2)])
+    for result in results:
+        assert not isinstance(result, Exception), f"an editor raised: {result!r}"
+
+    check = _session(factory)
+    try:
+        row = check.get(Program, program_id)
+        assert row.confidence == "NEEDS_REVIEW"
+        assert row.verified_at is None and row.verified_by is None
+        changes = check.execute(
+            select(CatalogueChange).where(
+                CatalogueChange.entity_type == "program",
+                CatalogueChange.entity_id == program_id,
+                CatalogueChange.field_name == "tuition_annual",
+            ).order_by(CatalogueChange.version)).scalars().all()
+        # Both edits are recorded, each with its own version: an advisory lock serialises the
+        # sequence so neither writer silently overwrites the other's history.
+        assert len(changes) == 2, [c.version for c in changes]
+        assert [c.version for c in changes] == [1, 2]
+        assert {c.new_value for c in changes} == {"1001.0", "1002.0"}
+        assert all(c.actor for c in changes)
+    finally:
+        check.close()
+
+
+def test_a_commit_after_invalidation_cannot_restore_the_verified_claim(factory):
+    """A stale writer holding a VERIFIED row must not resurrect it after the edit committed."""
+    from app.models.education import Program
+    from app.services import catalogue_writes
+
+    setup = _session(factory)
+    try:
+        program_id = _verified_program_row(setup, tuition=30000.0)
+    finally:
+        setup.close()
+
+    # A reader loads the record first - it still looks VERIFIED in its own transaction.
+    stale = _session(factory)
+    editor = _session(factory)
+    try:
+        stale_program = stale.get(Program, program_id)
+        assert stale_program.confidence == "VERIFIED"
+
+        live = editor.get(Program, program_id)
+        catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=live, payload={"tuition_annual": 42.0},
+            actor="editor@pg.test", blocked=catalogue_writes.TRUST_FIELDS)
+        editor.commit()
+    finally:
+        editor.close()
+
+    try:
+        # The stale session re-reads before writing: the database, not its cached copy, decides.
+        stale.refresh(stale_program)
+        assert stale_program.confidence == "NEEDS_REVIEW", (
+            "an editor must not be able to re-publish a figure another edit already withdrew")
+        assert stale_program.tuition_annual == 42.0
+    finally:
+        stale.close()
+
+
+def test_a_stale_promotion_cannot_re_certify_an_edit_that_already_committed(factory):
+    """The race the guarded promotion closes, made deterministic.
+
+    A reviewer's decision derives the entity state from the register, and a direct catalogue edit
+    can commit between that derivation and the write. The edit appends a NEEDS_REVIEW register row
+    and withdraws the entity's verification; a stale ``VERIFIED`` written afterwards would put the
+    unreviewed figure back in front of students. The promotion is conditional in the statement, so
+    the database - which can see the edit - refuses it.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    setup = _session(factory)
+    try:
+        program_id = _verified_program_row(setup, tuition=25000.0)
+        setup.add(DataVerification(
+            entity_type="program", entity_id=program_id, field_name="tuition_annual",
+            field_value="25000.0", status="VERIFIED",
+            verified_by="registrar@pgcamp.test", source_url="https://pgcamp.test/fees",
+            source_type="TIER_1_OFFICIAL_UNIVERSITY",
+            verified_at=datetime.now(timezone.utc) - timedelta(days=2)))
+        setup.commit()
+    finally:
+        setup.close()
+
+    reviewer = _session(factory)
+    try:
+        # 1. The reviewer derives "everything is verified" from what it can see right now.
+        assert review.recompute_entity_confidence(reviewer, "program", program_id) == "VERIFIED"
+
+        # 2. An edit commits in another transaction while that decision is in flight.
+        editor = _session(factory)
+        try:
+            row = editor.get(Program, program_id)
+            catalogue_writes.apply_direct_edit(
+                editor, model=Program, row=row, payload={"tuition_annual": 1.0},
+                actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+            editor.commit()
+        finally:
+            editor.close()
+
+        # 3. The reviewer writes its stale verdict. The database refuses it.
+        review._apply_entity_state(reviewer, "program", program_id, "VERIFIED",
+                                   "reviewer@pgcamp.test")
+        reviewer.commit()
+
+        final = _session(factory)
+        try:
+            row = final.get(Program, program_id)
+            assert row.confidence != "VERIFIED", (
+                "a stale promotion re-certified a value the register says is awaiting review")
+            assert row.tuition_annual == 1.0
+            assert row.verified_by is None or row.verified_by == "registrar@pgcamp.test"
+        finally:
+            final.close()
+    finally:
+        reviewer.close()
+
+
+def test_a_promotion_still_applies_when_the_register_agrees(factory):
+    """The guard must not block the normal case it exists to protect."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import review
+
+    setup = _session(factory)
+    try:
+        program_id = _verified_program_row(setup, tuition=18000.0)
+        setup.query(DataVerification).filter(
+            DataVerification.entity_type == "program",
+            DataVerification.entity_id == program_id).delete(synchronize_session=False)
+        setup.add(DataVerification(
+            entity_type="program", entity_id=program_id, field_name="tuition_annual",
+            field_value="18000.0", status="VERIFIED",
+            verified_by="registrar@pgcamp.test", source_url="https://pgcamp.test/fees",
+            source_type="TIER_1_OFFICIAL_UNIVERSITY",
+            verified_at=datetime.now(timezone.utc) - timedelta(days=1)))
+        setup.commit()
+        programme = setup.get(Program, program_id)
+        programme.confidence = "NEEDS_REVIEW"
+        programme.verified_by = None
+        setup.commit()
+        assert review.recompute_entity_confidence(setup, "program", program_id) == "VERIFIED"
+        review._apply_entity_state(setup, "program", program_id, "VERIFIED",
+                                   "reviewer@pgcamp.test")
+        setup.commit()
+        fresh = setup.get(Program, program_id)
+        assert fresh.confidence == "VERIFIED", "an agreeing register must still promote the record"
+        assert fresh.verified_by == "reviewer@pgcamp.test"
+    finally:
+        setup.close()

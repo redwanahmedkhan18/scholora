@@ -71,7 +71,7 @@ from app.models.education import (
     UniversityPartnership,
     UniversityRanking,
 )
-from app.services import erasure, read_audit
+from app.services import catalogue_writes, erasure, read_audit
 
 router = APIRouter(tags=["admin"])
 
@@ -699,11 +699,28 @@ def update_row(resource: str, row_id: int, payload: Dict[str, Any], db: Session 
         row.password_hash = hash_password(_checked_password(payload.pop("password")))
     _assert_trust_authority(resource, user)
     blocked = TRUST_COLUMNS | REVIEW_STATE_COLUMNS.get(resource, frozenset())
-    for k, v in payload.items():
-        if hasattr(row, k) and k not in ("id", "created_at") and k not in blocked:
-            setattr(row, k, v)
+    detail: Dict[str, Any] = {"fields": list(payload)}
+    if catalogue_writes.governs(model):
+        # A catalogue record carries a verification claim, and this generic form is not the review
+        # workflow. One function applies the values *and* invalidates a verification the edit no
+        # longer supports, in this request's single transaction: confidence becomes NEEDS_REVIEW,
+        # the reviewer and dates are cleared, the edited field is re-registered as a claim
+        # awaiting review, and a CatalogueChange keeps the previous value beside the new one.
+        # See app/services/catalogue_writes.py for why that is the importer's rule, not a new one.
+        edit = catalogue_writes.apply_direct_edit(
+            db, model=model, row=row, payload=payload, actor=user.email, blocked=blocked)
+        detail["invalidated_verification"] = edit["invalidated"]
+        if edit["invalidated"]:
+            # Field names and the previous state only - never the values, which may be student-
+            # facing content and do not belong in an audit line.
+            detail["material_fields"] = edit["material_fields"]
+            detail["previous_confidence"] = edit["previous_confidence"]
+    else:
+        for k, v in payload.items():
+            if hasattr(row, k) and k not in ("id", "created_at") and k not in blocked:
+                setattr(row, k, v)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="UPDATE",
-                    entity_type=resource, entity_id=row_id, detail={"fields": list(payload)}))
+                    entity_type=resource, entity_id=row_id, detail=detail))
     db.commit()
     db.refresh(row)
     return _row_to_dict(row)
