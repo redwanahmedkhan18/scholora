@@ -31,6 +31,7 @@ from app.models.education import Country, Program, University
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from skip_policy import skip_pg_only
 from task2_helpers import new_session, utc
 
 OFFICIAL = "TIER_1_OFFICIAL_UNIVERSITY"
@@ -174,7 +175,7 @@ def test_pg_governed_endpoint_answers_422_and_writes_nothing(client, api, payloa
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this is the PostgreSQL behaviour that produced the 500")
+            skip_pg_only("this is the PostgreSQL behaviour that produced the 500")
         headers = _staff()
         university, program = _program(db)
         db.commit()
@@ -225,7 +226,7 @@ def test_pg_valid_governed_edit_still_works_after_a_refusal(client, api):
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this is the PostgreSQL behaviour that produced the 500")
+            skip_pg_only("this is the PostgreSQL behaviour that produced the 500")
         headers = _staff()
         university, program = _program(db)
         db.commit()
@@ -268,11 +269,11 @@ def test_pg_non_governed_endpoint_keeps_its_behaviour(client, api):
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this is the PostgreSQL behaviour that produced the 500")
+            skip_pg_only("this is the PostgreSQL behaviour that produced the 500")
         headers = _staff()
         faq = db.scalar(select(Faq))
         if faq is None:
-            pytest.skip("the seeded catalogue has no FAQ to edit")
+            skip_pg_only("the seeded catalogue has no FAQ to edit")
         response = client.put(f"{api}/admin/faqs/{faq.id}", headers=headers,
                               json={"position": "not-an-int"})
         assert response.status_code == 422, response.text
@@ -324,7 +325,7 @@ def test_values_that_could_never_be_served_are_refused(client, api, payload):
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this is the PostgreSQL behaviour that stored the value")
+            skip_pg_only("this is the PostgreSQL behaviour that stored the value")
         headers = _staff()
         university, program = _program(db)
         db.commit()
@@ -369,7 +370,7 @@ def test_legitimate_shapes_are_still_accepted(client, api, payload):
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this is the PostgreSQL behaviour that stored the value")
+            skip_pg_only("this is the PostgreSQL behaviour that stored the value")
         headers = _staff()
         university, program = _program(db)
         db.commit()

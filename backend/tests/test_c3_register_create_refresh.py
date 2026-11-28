@@ -27,6 +27,7 @@ from app.models.education import Country, Program, University
 from app.services import review
 from sqlalchemy import select
 
+from skip_policy import skip_pg_only
 from task2_helpers import new_session, utc
 
 OFFICIAL = "TIER_1_OFFICIAL_UNIVERSITY"
@@ -333,7 +334,7 @@ def test_pg_create_and_refresh_are_atomic(client, api):
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this proves PostgreSQL transaction behaviour")
+            skip_pg_only("this proves PostgreSQL transaction behaviour")
         headers = _staff()
         university, program = _program(db)
         db.commit()

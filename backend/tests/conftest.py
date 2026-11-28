@@ -34,6 +34,71 @@ _REQUIRE_REDIS = _required("SCHOLARA_REQUIRE_REDIS_TESTS")
 _MARKERS = {"pg": _REQUIRE_PG, "redis_live": _REQUIRE_REDIS}
 _SKIPPED_REQUIRED: list[str] = []
 
+# ---------------------------------------------------------------------------------------
+# Structured skip reasons
+#
+# A skip is only legitimate when it names the service that is genuinely absent *and* the test
+# carries the marker for that service. Both halves are needed, so a reason string that merely
+# mentions PostgreSQL cannot smuggle an unrelated test past the gate:
+#
+#   * the reason begins with one of the prefixes in tests/skip_policy.py, and
+#   * the skipping test is marked with the matching marker, and
+#   * the current profile does not require that service.
+#
+# The canonical definitions live in skip_policy so a test module and this file cannot drift.
+from skip_policy import PREFIXES as _PREFIXES  # noqa: E402  (same directory, after pytest import)
+
+# ---------------------------------------------------------------------------------------
+# The machine-readable outcome report
+#
+# ``-rs`` prints skips as prose, and prose is a bad thing to make a policy decision about: a
+# reason may wrap across lines, and the printed form does not carry the markers. When
+# SCHOLARA_PYTEST_JSON names a path, this writes one JSON object describing every test's
+# outcome and markers, which is what scripts/ci/pytest_gate.py reads when it is available.
+_REPORT_PATH = os.environ.get("SCHOLARA_PYTEST_JSON", "").strip()
+_OUTCOMES: dict[str, dict[str, object]] = {}
+
+
+def _skip_reason(report) -> str:
+    """The human-readable skip reason, without pytest's container repr around it.
+
+    pytest reports a skip either as ``(path, lineno, "Skipped: reason")`` or as a plain string.
+    Stringifying the tuple gives ``('path', 33, 'Skipped: reason')``, so slicing on ``": "`` leaves
+    a stray quote. The reason is then normalised by dropping pytest's own ``Skipped: `` label, so
+    what remains is exactly what the test passed to ``pytest.skip``.
+    """
+    longrepr = getattr(report, "longrepr", None)
+    if isinstance(longrepr, tuple) and len(longrepr) == 3:
+        text = str(longrepr[2])
+    elif longrepr is None:
+        return ""
+    else:
+        raw = str(longrepr)
+        head, sep, tail = raw.partition(": ")
+        text = tail if sep else raw
+    label = "Skipped: "
+    if text.startswith(label):
+        text = text[len(label):]
+    return text.strip()
+
+
+def _record_outcome(report) -> None:
+    if not _REPORT_PATH:
+        return
+    entry = _OUTCOMES.setdefault(report.nodeid, {"nodeid": report.nodeid, "outcomes": {}})
+    outcomes = entry["outcomes"]
+    assert isinstance(outcomes, dict)
+    if report.skipped:
+        outcomes[report.when] = "skipped"
+        entry["reason"] = _skip_reason(report)
+        entry["skip_phase"] = report.when
+    elif report.failed:
+        outcomes[report.when] = "failed"
+    elif report.passed:
+        outcomes[report.when] = "passed"
+    if getattr(report, "wasxfail", None) is not None:
+        entry["xfail"] = str(report.wasxfail)
+
 TMP_DIR = Path(tempfile.mkdtemp(prefix="scholara-tests-"))
 DB_PATH = TMP_DIR / "test.db"
 
@@ -223,6 +288,7 @@ def pytest_runtest_logreport(report):
     fixture or a test body calling ``pytest.skip`` reports the skip during call or teardown, and
     that is the case a naive setup-only check misses.
     """
+    _record_outcome(report)
     if not report.skipped:
         return
     keywords = getattr(report, "keywords", {})
@@ -232,7 +298,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Turn a silent skip into a failed job."""
+    """Write the structured report, then turn a silent skip into a failed job."""
+    _write_report(session)
     if not _SKIPPED_REQUIRED:
         return
     session.exitstatus = 1
@@ -242,3 +309,46 @@ def pytest_sessionfinish(session, exitstatus):
         print(f"  - {nodeid}")
     print("A job that verifies a service may not pass by skipping its tests for it.")
     print("=" * 78)
+
+
+def _write_report(session) -> None:
+    """Write the JSON the CI gate reads. Never let this change the run's verdict."""
+    if not _REPORT_PATH:
+        return
+    import json
+
+    marker_index: dict[str, list[str]] = {}
+    for item in getattr(session, "items", []):
+        present = [name for name in ("pg", "redis_live", "smtp_live") if name in item.keywords]
+        marker_index[item.nodeid] = present
+
+    tests = []
+    for nodeid, entry in _OUTCOMES.items():
+        outcomes = entry.get("outcomes") or {}
+        assert isinstance(outcomes, dict)
+        # A skip in any phase decides the outcome; otherwise a later phase's failure wins.
+        if "skipped" in outcomes.values():
+            outcome = "skipped"
+        elif "failed" in outcomes.values():
+            outcome = "failed"
+        else:
+            outcome = "passed"
+        tests.append({
+            "nodeid": nodeid,
+            "markers": marker_index.get(nodeid, []),
+            "outcome": outcome,
+            "reason": entry.get("reason", ""),
+            "skip_phase": entry.get("skip_phase"),
+            "xfail": entry.get("xfail"),
+        })
+    tests.sort(key=lambda row: str(row["nodeid"]))
+    payload = {
+        "schema": 1,
+        "skip_prefixes": dict(_PREFIXES),
+        "tests": tests,
+    }
+    try:
+        with open(_REPORT_PATH, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=1, sort_keys=True)
+    except OSError as exc:  # pragma: no cover - a broken path is a CI mistake, not a test
+        print(f"warning: could not write SCHOLARA_PYTEST_JSON to {_REPORT_PATH}: {exc}")

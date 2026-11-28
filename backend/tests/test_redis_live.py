@@ -21,13 +21,16 @@ import pytest
 from app.core import cache as cache_module
 from app.core.cache import Cache
 
+from skip_policy import REDIS_ONLY_PREFIX
+
 REDIS_URL = os.environ.get("SCHOLARA_REDIS_URL", "").strip()
 
 pytestmark = [
     pytest.mark.redis_live,
     pytest.mark.skipif(
         not REDIS_URL,
-        reason="SCHOLARA_REDIS_URL is not set: live Redis verification did not run",
+        reason=REDIS_ONLY_PREFIX + "SCHOLARA_REDIS_URL is not set: "
+        "live Redis verification did not run",
     ),
 ]
 

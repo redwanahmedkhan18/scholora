@@ -81,10 +81,11 @@ env:
   # commits are not re-litigated on every run (see README.md: the history is declared, the policy
   # is enforced from here on). A push event raises the baseline to the commit it replaced.
   POLICY_BASELINE: 1c0f59f5f62062c82213f6f34bc6852e40a385c2
-  # The recovered generation's Alembic head, and the head published main is at. Both are asserted,
-  # not assumed: a migration added without updating this file fails the PostgreSQL job, which is
-  # the intended reminder to record the new head deliberately.
-  RECOVERED_ALEMBIC_HEAD: a3b4c5d6e7f8
+  # The Alembic head this release is supposed to be at, and the head published main is at. Both
+  # are asserted, not assumed: a migration added without updating this file fails the PostgreSQL
+  # job, which is the intended reminder to record the new head deliberately. Campaign 3 added
+  # b4c5d6e7f8a9 on top of a3b4c5d6e7f8, so the expected head moved forward with it.
+  EXPECTED_ALEMBIC_HEAD: b4c5d6e7f8a9
   PUBLISHED_ALEMBIC_BASELINE: a7b8c9d0e1f2
 
 jobs:
@@ -128,6 +129,11 @@ jobs:
 
       - name: Test suite (SQLite)
         working-directory: backend
+        env:
+          # A machine-readable record of every test's outcome and markers. The gate cross-checks
+          # each skip against the marker of the test that skipped, so a reason string alone can
+          # never widen the policy.
+          SCHOLARA_PYTEST_JSON: sqlite.json
         run: |
           set -uo pipefail
           status=0
@@ -135,9 +141,14 @@ jobs:
           # every one of them to be a live-service test that another job runs for real.
           python -m pytest -rs > sqlite.log 2>&1 || status=$?
           tail -n 60 sqlite.log
+          # sqlite requires no service, so a pg or redis_live test may skip - and only those, and
+          # only with the canonical skip prefix. The --min-marked floors prove the two service
+          # suites were collected here rather than filtered out.
           python ../scripts/ci/pytest_gate.py sqlite.log \
-            --allow-skip-env SCHOLARA_PG_URL \
-            --allow-skip-env SCHOLARA_REDIS_URL \
+            --profile sqlite \
+            --report sqlite.json \
+            --min-marked pg=40 \
+            --min-marked redis_live=9 \
             --min-passed 1000
           # The gate is the assertion; this keeps pytest's own exit code from being lost.
           test "$status" -eq 0
@@ -208,24 +219,31 @@ jobs:
           DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
         run: |
           set -euo pipefail
+          # The graph is read from the revision files, not from a grep of `alembic history`: a
+          # grep can only ask whether an id appears somewhere, which a squashed, duplicated or
+          # disconnected history survives. This asserts the shape - one head, one root, the exact
+          # head, the published baseline reachable from it, and every recovered revision present.
+          # backend/tests/test_ci_gates.py drives the same check against mutated graphs.
+          python scripts/check_migration_graph.py \
+            --versions alembic/versions \
+            --expect-head "${EXPECTED_ALEMBIC_HEAD}" \
+            --baseline "${PUBLISHED_ALEMBIC_BASELINE}" \
+            --require b8c9d0e1f2a3 \
+            --require c9d0e1f2a3b4 \
+            --require d7e8f9a0b1c2 \
+            --require d9e0f1a2b3c4 \
+            --require e1f2a3b4c5d6 \
+            --require f2a3b4c5d6e7 \
+            --require a3b4c5d6e7f8 \
+            --require "${EXPECTED_ALEMBIC_HEAD}"
+          # The script reads files. Alembic's own view must agree, so ask it too: if the files
+          # and the installed metadata ever disagree, this is where that shows up.
           heads="$(python -m alembic heads)"
           printf '%s\n' "$heads"
           test "$(printf '%s\n' "$heads" | grep -c '(head)')" -eq 1 \
-            || { echo "::error::the migration graph has more than one head"; exit 1; }
-          head="$(printf '%s\n' "$heads" | awk 'NR==1 {print $1}')"
-          test "$head" = "${RECOVERED_ALEMBIC_HEAD}" \
-            || { echo "::error::the head is ${head}, not the recovered head ${RECOVERED_ALEMBIC_HEAD}"; exit 1; }
-          # Every recovered revision must still be in the chain, not merely reachable from it: a
-          # squashed or dropped revision would leave a single head and pass the check above.
-          history="$(python -m alembic history)"
-          for revision in b8c9d0e1f2a3 c9d0e1f2a3b4 d7e8f9a0b1c2 d9e0f1a2b3c4 \
-                          e1f2a3b4c5d6 f2a3b4c5d6e7 a3b4c5d6e7f8; do
-            printf '%s\n' "$history" | grep -q "$revision" \
-              || { echo "::error::recovered revision ${revision} is missing from the chain"; exit 1; }
-          done
-          printf '%s\n' "$history" | grep -q "${PUBLISHED_ALEMBIC_BASELINE}" \
-            || { echo "::error::the published baseline ${PUBLISHED_ALEMBIC_BASELINE} is not in the chain"; exit 1; }
-          echo "one head (${head}); the published baseline and all seven recovered revisions are present"
+            || { echo "::error::alembic reports more than one head"; exit 1; }
+          test "$(printf '%s\n' "$heads" | awk 'NR==1 {print $1}')" = "${EXPECTED_ALEMBIC_HEAD}" \
+            || { echo "::error::alembic disagrees with EXPECTED_ALEMBIC_HEAD"; exit 1; }
 
       - name: The migration database really is empty before the migration
         working-directory: backend
@@ -257,7 +275,7 @@ jobs:
         working-directory: backend
         env:
           DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
-          EXPECTED_HEAD: ${{ env.RECOVERED_ALEMBIC_HEAD }}
+          EXPECTED_HEAD: ${{ env.EXPECTED_ALEMBIC_HEAD }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -329,7 +347,7 @@ jobs:
         env:
           DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
           BASELINE: ${{ env.PUBLISHED_ALEMBIC_BASELINE }}
-          EXPECTED_HEAD: ${{ env.RECOVERED_ALEMBIC_HEAD }}
+          EXPECTED_HEAD: ${{ env.EXPECTED_ALEMBIC_HEAD }}
         run: |
           set -euo pipefail
           # Exactly the seven recovered revisions are reversed here, so each one's downgrade() is
@@ -414,15 +432,19 @@ jobs:
           # in the suite run below as well, so this is the same server and the same database.
           SCHOLARA_PG_URL: ${{ env.SUITE_DATABASE_URL }}
           SCHOLARA_REQUIRE_PG_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: postgres-suite.json
         run: |
           set -uo pipefail
           status=0
           python -m pytest -rs > postgres-suite.log 2>&1 || status=$?
           tail -n 60 postgres-suite.log
-          # Only the Redis-cache tests may skip here: this job has no Redis, and backend-redis runs
-          # them under the same no-skip guard. Anything else skipping is a failure.
+          # This profile REQUIRES pg, so any skipped pg test is a failure here - and only the
+          # Redis-cache tests may skip, because this job has no Redis and backend-redis runs them
+          # under the same no-skip guard. The floor proves the pg tests were collected, not filtered.
           python ../scripts/ci/pytest_gate.py postgres-suite.log \
-            --allow-skip-env SCHOLARA_REDIS_URL \
+            --profile postgres \
+            --report postgres-suite.json \
+            --min-marked pg=40 \
             --min-passed 1000
           test "$status" -eq 0
 
@@ -431,6 +453,7 @@ jobs:
         env:
           SCHOLARA_PG_URL: ${{ env.SUITE_DATABASE_URL }}
           SCHOLARA_REQUIRE_PG_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: pg-concurrency.json
         run: |
           set -uo pipefail
           # A suite that is not discovered is not a green suite: a renamed file, a marker
@@ -450,7 +473,11 @@ jobs:
           tail -n 30 pg-concurrency.log
           # --min-passed is the collected count, so a test that is collected and then skips or
           # vanishes fails the step instead of shrinking the run.
-          python ../scripts/ci/pytest_gate.py pg-concurrency.log --min-passed "${collected}"
+          # strict: this step exists to execute these tests, so not one of them may skip.
+          python ../scripts/ci/pytest_gate.py pg-concurrency.log \
+            --profile strict \
+            --report pg-concurrency.json \
+            --min-passed "${collected}"
           test "$status" -eq 0
 
   backend-redis:
@@ -545,16 +572,19 @@ jobs:
         working-directory: backend
         env:
           SCHOLARA_REQUIRE_REDIS_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: redis-suite.json
         run: |
           set -uo pipefail
           status=0
           python -m pytest -rs > redis-suite.log 2>&1 || status=$?
           tail -n 60 redis-suite.log
-          # Only the PostgreSQL tests may skip here: this job has no PostgreSQL, and
-          # backend-postgres runs them under the same no-skip guard. A Redis test that skips, or a
-          # skip for any other reason, is a failure.
+          # This profile REQUIRES redis_live, so any skipped Redis test is a failure here - and
+          # only the PostgreSQL tests may skip, because this job has no PostgreSQL and
+          # backend-postgres runs them under the same no-skip guard.
           python ../scripts/ci/pytest_gate.py redis-suite.log \
-            --allow-skip-env SCHOLARA_PG_URL \
+            --profile redis \
+            --report redis-suite.json \
+            --min-marked redis_live=9 \
             --min-passed 1000
           test "$status" -eq 0
 
@@ -562,6 +592,7 @@ jobs:
         working-directory: backend
         env:
           SCHOLARA_REQUIRE_REDIS_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: redis-live.json
         run: |
           set -uo pipefail
           # See the note in backend-postgres: pytest.ini's addopts already carries `-q`, so a
@@ -575,7 +606,11 @@ jobs:
           status=0
           python -m pytest tests/test_redis_live.py -rs > redis-live.log 2>&1 || status=$?
           tail -n 30 redis-live.log
-          python ../scripts/ci/pytest_gate.py redis-live.log --min-passed "${collected}"
+          # strict: this step exists to execute these tests, so not one of them may skip.
+          python ../scripts/ci/pytest_gate.py redis-live.log \
+            --profile strict \
+            --report redis-live.json \
+            --min-passed "${collected}"
           test "$status" -eq 0
 
   frontend:
@@ -712,7 +747,7 @@ jobs:
           printf 'SKIPPED [1] tests/test_x.py:5: not implemented yet\n40 passed, 1 skipped in 1.00s\n' > "$work/bad.log"
           set +e
           python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/bad.log" \
-            --allow-skip-env SCHOLARA_REDIS_URL --min-passed 10 2>&1
+            --profile sqlite --min-passed 10 2>&1
           status=$?
           set -e
           if [ "$status" -eq 0 ]; then
@@ -722,11 +757,23 @@ jobs:
           # And a collection that silently yields nothing must not pass either.
           printf '0 passed in 0.01s\n' > "$work/empty.log"
           set +e
-          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/empty.log" --min-passed 16 2>&1
+          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/empty.log" \
+            --profile strict --min-passed 16 2>&1
           status=$?
           set -e
           if [ "$status" -eq 0 ]; then
             echo "::error::the pytest gate accepted a run with no passing tests"
             exit 1
           fi
-          echo "mutation test ok: the pytest gate rejects both failure modes"
+          # A skip line the parser cannot read must not quietly remove itself from the policy.
+          printf 'SKIPPED [1] tests/test_x.py: in the wrong shape\n40 passed, 1 skipped in 1.00s\n' > "$work/unparsed.log"
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/unparsed.log" \
+            --profile sqlite --min-passed 10 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the pytest gate ignored a skip line it could not parse"
+            exit 1
+          fi
+          echo "mutation test ok: the pytest gate rejects all three failure modes"

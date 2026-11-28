@@ -30,6 +30,7 @@ from app.models.education import Country, Program, University
 from app.services import catalogue_changes, catalogue_writes, review
 from sqlalchemy import select
 
+from skip_policy import skip_pg_only
 from task2_helpers import new_session, utc
 
 SOURCE = "https://c2-10.example.edu/official"
@@ -521,7 +522,7 @@ def test_pg_evidence_column_is_unbounded_text():
 
     url = os.environ.get("SCHOLARA_PG_URL")
     if not url:
-        pytest.skip("SCHOLARA_PG_URL is not set")
+        skip_pg_only("SCHOLARA_PG_URL is not set")
     from sqlalchemy import create_engine
 
     engine = create_engine(url)
@@ -533,7 +534,7 @@ def test_pg_evidence_column_is_unbounded_text():
                 "WHERE table_name = 'data_verifications' AND column_name = 'field_value'"
             )).first()
             if row is None:
-                pytest.skip("the PostgreSQL database has not been migrated")
+                skip_pg_only("the PostgreSQL database has not been migrated")
             assert row[0] == "text"
             assert row[1] is None, "the evidence column must not impose a length"
     finally:
@@ -545,7 +546,7 @@ def test_pg_stores_evidence_far_beyond_the_old_limit():
     db = new_session()
     try:
         if db.get_bind().dialect.name != "postgresql":
-            pytest.skip("this test proves PostgreSQL storage")
+            skip_pg_only("this test proves PostgreSQL storage")
         university, program = _pod(db)
         _consistent_register(db, program)
         db.commit()

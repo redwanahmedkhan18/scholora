@@ -28,6 +28,8 @@ import pytest
 from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from skip_policy import PG_ONLY_PREFIX
+
 PG_URL = os.environ.get("SCHOLARA_PG_URL", "").strip()
 
 #: The `pg` marker is what makes a skip detectable: `SCHOLARA_REQUIRE_PG_TESTS=1` (set by the
@@ -37,7 +39,8 @@ pytestmark = [
     pytest.mark.pg,
     pytest.mark.skipif(
         not PG_URL,
-        reason="SCHOLARA_PG_URL is not set: PostgreSQL concurrency verification did not run",
+        reason=PG_ONLY_PREFIX + "SCHOLARA_PG_URL is not set: "
+        "PostgreSQL concurrency verification did not run",
     ),
 ]
 
