@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { SITE_URL, apiOrNull, getSettings } from "@/lib/api";
+import { apiOrNull, getSettings, publishedOrigin } from "@/lib/api";
 
 type Dict = Record<string, any>;
 
@@ -7,7 +7,7 @@ export const revalidate = 3600;
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const [settings, data] = await Promise.all([getSettings(), apiOrNull<Dict>("/sitemap-data", 600)]);
-  const base = (settings.site_url || SITE_URL).replace(/\/$/, "");
+  const base = publishedOrigin(settings).replace(/\/$/, "");
   const now = new Date();
 
   const statics: MetadataRoute.Sitemap = [

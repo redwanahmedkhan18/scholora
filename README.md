@@ -341,7 +341,8 @@ dashboard. Every one of them has a working default except where marked.
 | `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`, `PUBLIC_SITE_URL` | Browser origins allowed to call the API; `https://` only in production |
 | `INTERNAL_API_TOKEN` | Shared with the Next.js build so server-side rendering is not rate-limited |
 | `INTERNAL_API_URL` | **Required by the frontend build**: absolute origin of the API |
-| `NEXT_PUBLIC_SITE_URL` | Public origin used for canonical URLs and the sitemap. Falls back to the Vercel deployment URL; a production build fails rather than emitting `localhost` links |
+| `NEXT_SITE_URL` | **The canonical production site origin** — e.g. `https://scholora-6ela.vercel.app`. Feeds canonical tags, Open Graph, JSON-LD, `robots.txt` and `sitemap.xml` through a single `SITE_URL`. Server-only (no `NEXT_PUBLIC_` prefix) because only server code reads it. Falls back to the Vercel deployment URL, then to `localhost` in development only; **a production build fails rather than publishing localhost canonicals**. Changing it requires a new deployment — the value is read at build time |
+| `NEXT_PUBLIC_SITE_URL` | **Deprecated alias** for the above, honoured so an existing deployment does not silently lose its origin. `NEXT_SITE_URL` always wins when both are set; migrate to `NEXT_SITE_URL` |
 | `ALLOW_LOCAL_API` | Opt-out, only for a deliberate production-mode build against a local API. A production build against `127.0.0.1` otherwise fails on purpose |
 | `API_WARMUP_TIMEOUT_SECONDS` | Total budget for the prebuild readiness check, default `240` |
 | `SCHOLARA_REQUIRE_SITEMAP_DATA` | `1` makes an empty catalogue fail the build instead of only warning |
@@ -442,6 +443,35 @@ The repository's own error messages used to recommend the misspelled host — wh
 could end up pointed at a dead address — so they now say `https://your-service.onrender.com` and
 tell the operator to copy the origin from the Render dashboard instead of trusting an example.
 `scholara.onrender.com`, a third hostname, serves an unrelated static "Login Page".
+
+**The canonical site origin.** One variable controls every canonical URL the site emits —
+canonical tags, Open Graph, JSON-LD, `robots.txt` and `sitemap.xml`:
+
+```
+NEXT_SITE_URL = https://scholora-6ela.vercel.app
+```
+
+It has no `NEXT_PUBLIC_` prefix on purpose: only server code (the root layout's metadata, the
+sitemap and robots routes) reads it, so it never needs to reach a browser bundle. Resolution runs
+`NEXT_SITE_URL` → deprecated `NEXT_PUBLIC_SITE_URL` → Vercel's own deployment URL → `localhost`
+(development only). In a production build with none of the first three available it **throws**
+rather than publishing `localhost` canonicals — a `localhost` canonical is indexed and invisible,
+which is worse than a failed build. The value is read at **build time**, so changing it requires a
+new deployment; the existing artifact keeps its old origin until then.
+
+The admin-editable **`seo.site_url` setting does not override this in production**. It used to:
+the production database carried `seo.site_url = http://localhost:3000`, which outranked every
+environment variable and published 209 localhost sitemap entries, 6 localhost canonical strings
+on a single programme page and 14 on the homepage — while every page still returned `200`. The
+setting is now a **development-only fallback**, and its copy inside the serialised page payload is
+normalised too, so a stale database row cannot leak into generated pages. The admin SEO field is a
+deliberate exception: it loads the stored value directly, because it is the editor for that value —
+so it will still show `http://localhost:3000` until someone corrects it there. Change the
+deployment origin with `NEXT_SITE_URL`, and treat the database value as data to be reconciled.
+
+A missing or misspelled site-origin variable is a silent failure by nature: the site still returns
+`200`, pages still render, and only the sitemap and metadata are wrong. Verify after deploying with
+`curl -s https://<domain>/sitemap.xml | grep -c localhost` — the answer must be `0`.
 
 **Provider facts this repository still cannot confirm.** The plan and instance type of the Render
 service, whether the value currently set in Vercel matches the origin above, the Supabase backup

@@ -189,15 +189,33 @@ function resolveApiBase() {
 /**
  * The public site origin used for canonical URLs, Open Graph tags, robots and the sitemap.
  *
- * It must never be a localhost address in production, but unlike the API origin it does not
- * have to be supplied by hand on Vercel: Vercel injects the deployment's own domain
- * (`VERCEL_PROJECT_PRODUCTION_URL` / `VERCEL_URL`), which is exactly the right answer when a
- * custom domain has not been attached yet.
+ * `NEXT_SITE_URL` is the authoritative variable. It deliberately has **no** `NEXT_PUBLIC_`
+ * prefix: this value is only ever read in server contexts (the root layout's metadata, the
+ * sitemap and robots routes), so there is no reason to inline it into a browser bundle. Every
+ * other site-origin consumer - canonical tags, Open Graph, JSON-LD - reads the single `SITE_URL`
+ * this produces, so there is exactly one resolution path in the project.
+ *
+ * Precedence, highest first:
+ *   1. NEXT_SITE_URL              canonical; required in production
+ *   2. NEXT_PUBLIC_SITE_URL       deprecated alias, honoured so an existing deployment keeps
+ *                                 working; never overrides NEXT_SITE_URL
+ *   3. VERCEL_PROJECT_PRODUCTION_URL / VERCEL_URL   Vercel's own domain, a safety net for a
+ *                                 project with no custom domain attached
+ *   4. DEV_SITE_URL (localhost)   development only
+ *
+ * In a production build with none of 1-3 available this throws rather than emitting localhost
+ * canonical URLs, which would be worse than failing the build: a `localhost` canonical is
+ * published, indexed and invisible.
  * @returns {string}
  */
 function resolveSiteUrl() {
-  var explicit = unquote(env("NEXT_PUBLIC_SITE_URL"));
-  if (explicit) return validateOrigin(explicit, "NEXT_PUBLIC_SITE_URL");
+  var canonical = unquote(env("NEXT_SITE_URL"));
+  if (canonical) return validateOrigin(canonical, "NEXT_SITE_URL");
+
+  // Deprecated: kept only so a deployment that still sets the older name does not silently
+  // lose its origin. NEXT_SITE_URL above always wins when both are present.
+  var legacy = unquote(env("NEXT_PUBLIC_SITE_URL"));
+  if (legacy) return validateOrigin(legacy, "NEXT_PUBLIC_SITE_URL");
 
   var vercelHost =
     unquote(env("VERCEL_PROJECT_PRODUCTION_URL")) || unquote(env("VERCEL_URL"));
@@ -207,18 +225,42 @@ function resolveSiteUrl() {
 
   if (isProductionBuild() && !localApiAllowed()) {
     throw new Error(
-      "[scholara] NEXT_PUBLIC_SITE_URL is not set and no Vercel deployment URL was found. " +
+      "[scholara] NEXT_SITE_URL is not set and no Vercel deployment URL was found. " +
         "Canonical URLs, Open Graph tags and the sitemap would all be published as " +
-        "localhost. Set NEXT_PUBLIC_SITE_URL to the production site origin (not a localhost " +
-        "address).",
+        "localhost. Set NEXT_SITE_URL in the Vercel project to the production site origin " +
+        "(not a localhost address), e.g. NEXT_SITE_URL=https://your-site.vercel.app.",
     );
   }
   return DEV_SITE_URL;
 }
 
+/**
+ * The origin the site actually publishes, for canonical tags, Open Graph, JSON-LD, robots and
+ * the sitemap.
+ *
+ * `NEXT_SITE_URL` (via `resolveSiteUrl`) is **authoritative** in a production build. The
+ * admin-editable `seo.site_url` setting is only a fallback, and only outside production -
+ * because a row in the production database containing `seo.site_url = http://localhost:3000`
+ * silently overrode every environment variable: 209 localhost sitemap entries, 6 localhost
+ * canonical strings on one programme page, 14 on the homepage, every page still returning
+ * `200`. A database value must not be able to do that.
+ *
+ * Development keeps honouring the setting, where "localhost" is the correct answer.
+ *
+ * @param {Record<string, unknown> | null | undefined} settings flattened site settings
+ * @returns {string}
+ */
+function resolvePublishedOrigin(settings) {
+  if (isProductionBuild()) return resolveSiteUrl();
+  var configured =
+    settings && typeof settings.site_url === "string" ? settings.site_url.trim() : "";
+  return configured || resolveSiteUrl();
+}
+
 module.exports = {
   resolveApiBase: resolveApiBase,
   resolveSiteUrl: resolveSiteUrl,
+  resolvePublishedOrigin: resolvePublishedOrigin,
   isServer: isServer,
   isProductionBuild: isProductionBuild,
 };

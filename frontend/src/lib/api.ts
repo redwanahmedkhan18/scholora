@@ -8,12 +8,24 @@
  * build a missing or loopback INTERNAL_API_URL therefore throws here, at import time,
  * instead of quietly fetching the build container's own port and publishing empty pages.
  */
-import { isServer, resolveApiBase, resolveSiteUrl } from "../../config/api-base";
+import { isServer, resolveApiBase, resolvePublishedOrigin, resolveSiteUrl } from "../../config/api-base";
 
 const BASE = resolveApiBase();
 
 /** Canonical public origin (sitemap, robots, Open Graph). Never localhost in production. */
 export const SITE_URL = resolveSiteUrl();
+
+/**
+ * The origin the site publishes: canonical tags, Open Graph, JSON-LD, robots and the sitemap.
+ *
+ * `NEXT_SITE_URL` is authoritative in production; the admin-editable `seo.site_url` setting is
+ * only a development fallback, so a database row can never point production canonicals at
+ * `localhost`. The rule itself lives in `config/api-base.js` (`resolvePublishedOrigin`) so it
+ * can be tested without a Next runtime.
+ */
+export function publishedOrigin(settings: Dict = {}): string {
+  return resolvePublishedOrigin(settings);
+}
 
 export type Dict = Record<string, any>;
 
@@ -142,6 +154,11 @@ function flattenSettings(raw: Dict): Dict {
 
   return {
     ...s,
+    // The raw settings are spread above, which carries the database's own `seo` object into every
+    // serialised page payload. Normalise its copy of the origin too, so a stale
+    // `seo.site_url = http://localhost:3000` cannot be echoed into production HTML - or round-trip
+    // back into the database through the admin form.
+    seo: { ...seo, site_url: publishedOrigin({ site_url: seo.site_url }) },
     whatsapp_enabled: wa.enabled ?? true,
     whatsapp_number: wa.number ?? null,
     whatsapp_default_message: wa.default_message ?? "",
@@ -172,7 +189,9 @@ function flattenSettings(raw: Dict): Dict {
     default_seo_title: seo.default_title ?? s.brand_name,
     default_seo_description: seo.default_description ?? s.tagline,
     default_og_image: seo.default_og_image ?? null,
-    site_url: seo.site_url ?? SITE_URL,
+    // Normalised here so EVERY consumer (JSON-LD on the homepage, events, blog, admin) gets the
+    // same authoritative origin, instead of each page trusting an admin-editable database value.
+    site_url: publishedOrigin({ site_url: seo.site_url }),
     organization_type: seo.organization_type ?? "EducationalOrganization",
     founding_year: seo.founding_year ?? null,
 

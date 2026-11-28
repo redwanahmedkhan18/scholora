@@ -614,6 +614,42 @@ verified read-only on 2026-11-28: `/api/health` → `{"status":"ok","app":"Schol
 `/api/v1/api/v1/...`. `config/api-base.js` no longer prints a concrete hostname in its error
 text, precisely so a stale example cannot send an operator to a dead address again.
 
+### 12.2 The site-origin contract
+
+```
+NEXT_SITE_URL  ──►  resolveSiteUrl()  ──►  SITE_URL  ─┬─►  sitemap.xml
+(server-only)                                        ├─►  <link rel="canonical"> / metadataBase
+                                                     ├─►  Open Graph url
+                                                     ├─►  JSON-LD url
+                                                     └─►  robots.txt
+```
+
+One variable, one resolution function, one exported constant, five consumers — all in
+`config/api-base.js` and `src/lib/api.ts`. That shape is deliberate: when the origin was wrong
+(the deployment read `NEXT_PUBLIC_SITE_URL`, which production did not set, so the build fell
+through to `http://localhost:3000`), every one of those five surfaces broke simultaneously and
+silently — 209 sitemap entries, 6 localhost strings on a single programme page, 14 on the
+homepage. Nothing returned a non-200 status.
+
+`NEXT_SITE_URL` is authoritative and has **no `NEXT_PUBLIC_` prefix**, because only server code
+reads it; a private value must not be inlined into a browser bundle. Precedence is
+`NEXT_SITE_URL` → deprecated `NEXT_PUBLIC_SITE_URL` → `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL`
+→ `DEV_SITE_URL`. In a production build with no origin available `resolveSiteUrl()` throws, because
+a published `localhost` canonical is invisible to search engines — a worse outcome than a failed
+build. `tests/site-url.test.ts` pins the precedence, the validation, the slash normalisation, the
+fail-closed behaviour, and the fact that exactly one implementation exists and no client component
+imports it.
+
+The admin-editable `seo.site_url` setting is **not** part of that precedence in production. It was
+the second half of the localhost defect: `flattenSettings` mapped `site_url: seo.site_url ??
+SITE_URL`, and every consumer preferred `settings.site_url`, so a single database row outranked the
+whole environment contract. `resolvePublishedOrigin()` now makes the environment win in production
+and leaves the setting as a development fallback; `flattenSettings` also normalises the copy of
+`site_url` inside the raw `seo` object that the `...s` spread serialises into every page payload.
+
+Because the value is read during prerendering, a change only takes effect on the **next
+deployment**; the previously built artifact keeps whatever origin it was built with.
+
 Keeping this in `scripts/api-readiness.mjs` with an injectable clock and `fetch` is deliberate:
 it lets `tests/api-readiness.test.ts` pin every row above — plus the ambiguous cap, the deadline
 bound and the credential redaction — in milliseconds, with no network and no real waiting.

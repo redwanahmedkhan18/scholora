@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import { SITE_URL, apiOrNull, getSettings } from "@/lib/api";
+import { apiOrNull, getSettings, publishedOrigin } from "@/lib/api";
 import { contactFromSettings, safeExternalHref } from "@/lib/contact";
 import SiteHeader from "@/components/site-header";
 import Analytics from "@/components/analytics";
@@ -14,7 +14,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const title = s.default_seo_title ?? "Scholara | Study Abroad Consultancy in Uttara, Dhaka";
   const description = s.default_seo_description ?? "Verified university, programme, scholarship and faculty data for Bangladeshi students.";
   return {
-    metadataBase: new URL(s.site_url || SITE_URL),
+    metadataBase: new URL(publishedOrigin(s)),
     title: { default: title, template: `%s | ${s.brand_name ?? "Scholara"}` },
     description,
     applicationName: s.brand_name ?? "Scholara",
@@ -27,7 +27,7 @@ export async function generateMetadata(): Promise<Metadata> {
     alternates: { canonical: "/" },
     openGraph: {
       type: "website", siteName: s.brand_name ?? "Scholara", title, description,
-      locale: "en_US", url: s.site_url || SITE_URL,
+      locale: "en_US", url: publishedOrigin(s),
     },
     twitter: { card: "summary_large_image", title, description },
     robots: { index: true, follow: true, googleBot: { index: true, follow: true, "max-image-preview": "large", "max-snippet": -1 } },
@@ -57,7 +57,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     "@type": settings.organization_type || "EducationalOrganization",
     name: settings.brand_name ?? "Scholara",
     description: settings.about_short,
-    url: settings.site_url || SITE_URL,
+    url: publishedOrigin(settings),
     foundingDate: settings.founding_year ? String(settings.founding_year) : undefined,
     address: {
       "@type": "PostalAddress",
