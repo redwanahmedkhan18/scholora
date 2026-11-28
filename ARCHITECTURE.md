@@ -562,3 +562,64 @@ read them; it did observe the documented API origin answering `404` and the depl
 `/api/*` proxy returning its own 404 page, so the published site had no reachable backend at that
 moment. Those remain owner actions, not repository facts — do not treat the diagram above as
 proof that any hosted component is running.
+
+### 12.1 The build-time readiness contract
+
+Static rendering makes the build a *consumer* of production data, which is the one place where
+the frontend and backend are not independent. `npm run prebuild` therefore sits between Vercel's
+`npm install` and `next build`, and the build does not start until the API can serve data.
+
+```
+Vercel build
+  npm ci
+  npm run prebuild  →  frontend/scripts/warm-api.mjs
+                         resolveApiBase()               config/api-base.js (one implementation)
+                         waitForApi()                   scripts/api-readiness.mjs (classifier + backoff)
+                         GET {origin}/api/v1/sitemap-data
+                         ├─ ready      → exit 0, next build prerenders with live data
+                         ├─ transient  → retry with backoff until the budget ends, then exit 1
+                         └─ permanent  → exit 1 immediately, naming the evidence
+  next build        →  ISR pages, sitemap.xml from the same endpoint
+```
+
+The classifier is the part that matters. A build machine cannot distinguish "the service is
+booting" from "the URL is wrong" by waiting, so it decides from the *shape of the answer and the
+platform's own headers* instead, and only retries what waiting can fix:
+
+| Observation | Kind | Why |
+| --- | --- | --- |
+| connection refused / timeout / DNS | transient | a stopped or booting instance |
+| `429`, `502`, `503`, `504`, other `5xx` | transient | gateway or startup |
+| `404` with `x-render-routing: no-server` | **permanent, conclusive** | Render itself reports that no service is attached; a sleeping instance still has a server, so this is not a cold start |
+| `404` with JSON body | permanent | the API answered; the route or version is wrong |
+| `404`, no JSON, no Render marker (or Render service headers present) | **ambiguous**, capped at 3 requests / 20 s | the build cannot tell whether a service exists, and must not guess |
+| `401`, `403`, `400`, `422` | permanent | the API answered; the request is wrong |
+| `2xx` that is not JSON | permanent | this host is not the API |
+| bad JSON, missing or non-list keys | permanent | wrong endpoint or API version |
+
+The `x-render-routing` row is what separates a guess from a fact. It was established by
+comparison, not assumption: `scholara-cfch.onrender.com` (with an "a") and a randomly chosen,
+certainly nonexistent `*.onrender.com` hostname both answer `404 / text/plain / 10 bytes /
+x-render-routing: no-server` in ~0.4 s, identical to the byte; a live Render service answers with
+`rndr-id` and `x-render-origin-server`. Ambiguous answers get their own short clock so they can
+never run down the 240 s cold-start window, and their diagnostic states plainly that the cause is
+unknown rather than naming one.
+
+**The canonical origin** is `https://scholora-cfch.onrender.com` — one letter away from the dead
+hostname above: `scholora`, with an "o", matching the repository name. Identity and contract were
+verified read-only on 2026-11-28: `/api/health` → `{"status":"ok","app":"Scholara",
+"environment":"production"}`, `/api/health/ready` → database and cache both `ok`, and
+`/api/v1/sitemap-data` → all ten lists populated. `INTERNAL_API_URL` takes the **origin only**;
+`backendUrl()` in `src/lib/api.ts` appends `/api/v1`, so a suffix in the variable would produce
+`/api/v1/api/v1/...`. `config/api-base.js` no longer prints a concrete hostname in its error
+text, precisely so a stale example cannot send an operator to a dead address again.
+
+Keeping this in `scripts/api-readiness.mjs` with an injectable clock and `fetch` is deliberate:
+it lets `tests/api-readiness.test.ts` pin every row above — plus the ambiguous cap, the deadline
+bound and the credential redaction — in milliseconds, with no network and no real waiting.
+
+The same rule the app applies at request time applies here: **an unavailable dependency is an
+outage, not an absence of content.** `src/lib/api.ts` already refuses to read a plain-text edge
+`404` as "this resource does not exist" and throws instead, because that answer would be frozen
+into a static not-found page. The prebuild applies the same judgement one step earlier and
+refuses to start a build it cannot feed.

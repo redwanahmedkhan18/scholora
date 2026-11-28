@@ -341,11 +341,111 @@ dashboard. Every one of them has a working default except where marked.
 | `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`, `PUBLIC_SITE_URL` | Browser origins allowed to call the API; `https://` only in production |
 | `INTERNAL_API_TOKEN` | Shared with the Next.js build so server-side rendering is not rate-limited |
 | `INTERNAL_API_URL` | **Required by the frontend build**: absolute origin of the API |
+| `NEXT_PUBLIC_SITE_URL` | Public origin used for canonical URLs and the sitemap. Falls back to the Vercel deployment URL; a production build fails rather than emitting `localhost` links |
+| `ALLOW_LOCAL_API` | Opt-out, only for a deliberate production-mode build against a local API. A production build against `127.0.0.1` otherwise fails on purpose |
+| `API_WARMUP_TIMEOUT_SECONDS` | Total budget for the prebuild readiness check, default `240` |
+| `SCHOLARA_REQUIRE_SITEMAP_DATA` | `1` makes an empty catalogue fail the build instead of only warning |
 | `STORAGE_BACKEND`, `STORAGE_DIR`, `S3_BUCKET`, `S3_*` | Private document storage. `local` means the container's own disk — see *Known limitations* |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS`, `SMTP_SSL` | Outbound email. Refuses to send credentials over a plaintext connection |
 | `LLM_PROVIDER_ORDER`, `XAI_API_KEY`, `MISTRAL_API_KEY`, `GEMINI_API_KEY` | Optional assistant prose. Without a key the assistant still answers, from verified data |
 | `WHATSAPP_*`, `META_*`, `FACEBOOK_*`, `GA4_*`, `GOOGLE_*` | Optional marketing and messaging integrations |
 | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_CONNECT_TIMEOUT`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE` | Connection-pool sizing for a small managed database |
+
+### Deployment, and the build-time data check
+
+**Topology.** The frontend is Next.js on Vercel (`npm run build`, ISR, `/api/*` proxied to the
+API). The backend is FastAPI on Render (`uvicorn`, plus Celery worker and a single beat
+instance). The database is Supabase PostgreSQL 16 with pgvector over the Session Pooler. Only
+three things cross the boundary: an HTTP origin (`INTERNAL_API_URL`), a shared token
+(`INTERNAL_API_TOKEN`), and the browser's own `CORS_ORIGINS` allowance.
+
+**The build reads live data, so the API must be awake before `next build` runs.** Every page is
+first rendered during the build and then revalidated in the background. `npm run prebuild`
+(`frontend/scripts/warm-api.mjs`) therefore polls `GET /api/v1/sitemap-data` on the configured
+origin until it answers, and only then lets `next build` start. This exists because a Render
+instance stops when idle and takes tens of seconds to accept connections again; without the
+wait, a build that happens to run first fails on what is purely a cold start.
+
+**Waiting is bounded, and the three failure kinds are treated differently.** There are three,
+not two, and the difference matters most for `404`:
+
+* *Transient* — a refused or timed-out connection, DNS failure, `429`, `502`, `503`, `504` — is
+  retried with exponential backoff (1.5 s doubling to a 15 s cap, ±15% jitter, 25 s per attempt)
+  until the budget runs out.
+* *Permanent, conclusive* — Render states the routing outcome in a response header. When it sends
+  `x-render-routing: no-server`, no service is attached to that hostname. A sleeping instance
+  still has a server, so this is **not** a cold start: the build stops after one request with the
+  evidence. A JSON `404`, `401`/`403`, a `2xx` that is not JSON, malformed JSON, or a JSON body
+  missing the contracted lists are permanent in the same way.
+* *Ambiguous* — a `404` with no JSON body and no Render marker. The build cannot tell whether a
+  service exists behind the host, so it says so. It retries briefly (at most three requests and
+  20 s, never the cold-start budget), then reports the answer as ambiguous with the checks an
+  operator should run. It is never described as asleep, and never as definitively gone.
+
+The original version retried *every* `404` for the whole budget and then blamed a cold start,
+which was both self-contradictory and wrong on the evidence.
+
+**It never fabricates data.** A build that cannot see the database fails instead of publishing
+pages that claim the site has no universities. An API that is reachable but returns a
+completely empty catalogue is reported as a loud warning, because that can be a legitimately
+empty environment; set `SCHOLARA_REQUIRE_SITEMAP_DATA=1` to make it fatal. Log lines are
+redacted: credentials in a URL and the whole query string are stripped before printing, and
+`INTERNAL_API_TOKEN` is never logged.
+
+**`/api/v1/sitemap-data` contract.** A JSON object whose keys are `countries`, `universities`,
+`programs`, `scholarships`, `faculty`, `faculties`, `services`, `success_stories`, `events`,
+`posts`, each a list of `{slug, updated}` (`universities` rows also carry `country`), ordered by
+slug so a rebuild is byte-stable. A database failure is `503` with `Retry-After`, never an
+empty `200`. `backend/tests/test_sitemap_and_cors.py` pins exactly this.
+
+**Health endpoints.** `/api/health/live` touches nothing (use it as Render's health check, so a
+dependency blip cannot cause a restart loop); `/api/health/ready` reports whether the database,
+cache and broker answer, by name.
+
+**Verifying a production build locally.** Start the API, then:
+
+```bash
+cd backend && alembic upgrade head && uvicorn app.main:app --port 8010   # terminal 1
+cd frontend && INTERNAL_API_URL=http://127.0.0.1:8010 ALLOW_LOCAL_API=true npm run build
+```
+
+Expect the `[warm-api]` line to list non-zero per-list counts, then a completed prerender and
+`sitemap.xml` containing the catalogue URLs. A stale database is easy to hit: the bundled
+`backend/data/scholara.db` is a demo file, so migrate a **copy** rather than the tracked one.
+
+**Verifying a deployment.** Confirm `GET <origin>/api/health/live` is `200`, that
+`GET <origin>/api/v1/sitemap-data` returns JSON with populated lists, and that the deployed
+`/sitemap.xml` contains programme and university URLs rather than only the static routes. Then
+open one `/universities/{country}/{slug}` page and check it renders content — a build that
+succeeds while the API is unreachable would otherwise be invisible.
+
+**The verified backend origin.** The production Scholara API is
+
+```
+https://scholora-cfch.onrender.com          ← `scholora`, with an "o"
+```
+
+and `INTERNAL_API_URL` in Vercel must be exactly that — **the origin alone**, scheme + host, with
+**no `/api/v1` suffix** (the client appends `/api/v1` itself) and no trailing slash (a trailing
+slash is tolerated and stripped). Verified read-only on 2026-11-28: `/api/health` returns
+`{"status":"ok","app":"Scholara","environment":"production"}`, `/api/health/ready` reports the
+database and cache both healthy, and `/api/v1/sitemap-data` returns all ten lists populated
+(14 countries, 23 universities, 55 programmes, 15 scholarships). Responses carry Render's
+`rndr-id` and `x-render-origin-server: uvicorn`, so a real service is answering.
+
+**One character matters.** `scholara-cfch.onrender.com` — spelled with an **a** — is a *different*
+hostname with **no service attached**. It answers `404`, `text/plain`, 10 bytes, with Render's own
+`x-render-routing: no-server` header in ~0.4 s, which is byte-for-byte identical to a randomly
+chosen `*.onrender.com` hostname that certainly has no service. That is not a sleeping instance
+(a sleeping one still has a server, and answers `502`/`503` or takes tens of seconds to wake).
+The repository's own error messages used to recommend the misspelled host — which is how a build
+could end up pointed at a dead address — so they now say `https://your-service.onrender.com` and
+tell the operator to copy the origin from the Render dashboard instead of trusting an example.
+`scholara.onrender.com`, a third hostname, serves an unrelated static "Login Page".
+
+**Provider facts this repository still cannot confirm.** The plan and instance type of the Render
+service, whether the value currently set in Vercel matches the origin above, the Supabase backup
+schedule, and the value of any secret. Everything else in this section was verified directly.
 
 ### Signing in to the admin
 

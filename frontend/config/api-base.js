@@ -132,7 +132,7 @@ function validateOrigin(value, source) {
 }
 
 /**
- * The backend origin, e.g. `https://scholara-cfch.onrender.com`.
+ * The backend origin, e.g. `https://<service>.onrender.com`.
  * Returns "" in the browser so a stray client import fails with a clear message instead of
  * silently issuing requests to an address it cannot know.
  * @returns {string}
@@ -149,9 +149,10 @@ function resolveApiBase() {
       throw new Error(
         "[scholara] INTERNAL_API_URL is not set. Server-side rendering cannot reach the " +
           "FastAPI backend, so this build would publish empty pages. Set it in the Vercel " +
-          "project (Settings -> Environment Variables) to the Render API origin, e.g. " +
-          "INTERNAL_API_URL=https://scholara-cfch.onrender.com. For a local production-mode " +
-          "build against a local API, set ALLOW_LOCAL_API=true as well.",
+          "project (Settings -> Environment Variables) to the API origin alone - scheme, host " +
+          "and port, with no /api/v1 suffix - copied from the Render dashboard for this " +
+          "service, e.g. INTERNAL_API_URL=https://your-service.onrender.com. For a local " +
+          "production-mode build against a local API, set ALLOW_LOCAL_API=true as well.",
       );
     }
     return DEV_API_BASE;
