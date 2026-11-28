@@ -8,6 +8,16 @@ type Dict = Record<string, any>;
 
 const READONLY = new Set(["id", "created_at", "updated_at", "slug", "impressions", "clicks", "reference"]);
 
+/**
+ * Resources whose rows are decisions rather than content (F-2, F-4).
+ *
+ * The verification register is the evidence an entity's trust is derived from, so its rows cannot
+ * be edited or deleted from a generic table: the API answers 405 for both, and this list keeps the
+ * screen from offering an action that cannot succeed. Withdrawal is a transition with a reason and
+ * an actor, and it lives in the review queue where the decision is made.
+ */
+const DECISION_ONLY = new Set(["verifications"]);
+
 function cellText(v: any): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "boolean") return v ? "Yes" : "No";
@@ -118,10 +128,18 @@ export default function ResourceManager({ resource }: { resource: string }) {
                   </td>
                 ))}
                 <td className="whitespace-nowrap px-3 py-2.5">
-                  <button type="button" onClick={() => { setCreating(false); setEditing(r); }}
-                    className="rounded-lg bg-brand-50 px-2.5 py-1 text-xs font-bold text-brand-800">Edit</button>
-                  <button type="button" onClick={() => remove(r)}
-                    className="ml-1.5 rounded-lg border border-slate-300 px-2.5 py-1 text-xs font-semibold text-slate-600">Delete</button>
+                  {DECISION_ONLY.has(resource) ? (
+                    <span className="text-xs text-slate-500" title="Registered claims are decided, withdrawn or appended — never edited or deleted.">
+                      Review workflow
+                    </span>
+                  ) : (
+                    <>
+                      <button type="button" onClick={() => { setCreating(false); setEditing(r); }}
+                        className="rounded-lg bg-brand-50 px-2.5 py-1 text-xs font-bold text-brand-800">Edit</button>
+                      <button type="button" onClick={() => remove(r)}
+                        className="ml-1.5 rounded-lg border border-slate-300 px-2.5 py-1 text-xs font-semibold text-slate-600">Delete</button>
+                    </>
+                  )}
                 </td>
               </tr>
             ))}

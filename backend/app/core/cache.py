@@ -89,12 +89,15 @@ class _MemoryBackend:
 class Cache:
     """Thin facade so callers never branch on which backend is live."""
 
-    def __init__(self) -> None:
+    def __init__(self, url: Optional[str] = None) -> None:
+        # ``url`` exists so a caller - a test, or a tool that needs an isolated namespace - can
+        # address a specific server without mutating process-wide settings. Default stays the
+        # configured REDIS_URL, so nothing else changes.
         self._memory = _MemoryBackend()
         self._client = None
         self.backend = "memory"
         self._prefix = settings.cache_key_prefix or ""
-        self._raw_url = (settings.redis_url or "").strip()
+        self._raw_url = (settings.redis_url if url is None else url or "").strip()
         self._last_error: Optional[str] = None
         self._url_summary = redis_summary(self._raw_url) if self._raw_url else None
 

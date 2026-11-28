@@ -19,10 +19,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import httpx
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core import net_guard
 from app.models.crm import DataVerification, SourceCheck
 
 log = logging.getLogger(__name__)
@@ -55,47 +56,53 @@ def _classify(status: int) -> tuple[str, str]:
         return UNREACHABLE, f"server error ({status}); try again later"
     return BLOCKED, f"unexpected response ({status}); check by hand"
 
-_TIMEOUT = httpx.Timeout(12.0, connect=6.0)
-_HEADERS = {"User-Agent": "ScholaraSourceChecker/1.0 (+citation verification)"}
+_TIMEOUT_SECONDS = 12.0
+_CONNECT_TIMEOUT_SECONDS = 6.0
+_SAFETY_CODES_UNREACHABLE = {"DNS_ERROR", "NETWORK_ERROR", "TIMEOUT"}
 
 
 # --------------------------------------------------------------------- checking
-def check_url(url: str, client: Optional[httpx.Client] = None) -> Dict[str, Any]:
+def check_url(url: str, client: Optional[object] = None) -> Dict[str, Any]:
     """
-    Resolve one citation URL. Never raises.
+    Resolve one citation URL through the W11 URL guard. Never raises.
 
     A HEAD is tried first because it is cheap, then a GET, because a surprising number of
     institutional sites reject HEAD with 403/405 while serving GET perfectly well. Calling
     such a page "broken" on the strength of a HEAD would be wrong.
+
+    A URL refused by the safety policy (private address, metadata host, unsafe redirect,
+    credentials, bad scheme) is reported as BLOCKED with a reason, not UNREACHABLE: the
+    citation may be real, but this process must not fetch it.
     """
-    owned = client is None
-    client = client or httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_HEADERS)
+    _ = client
     try:
-        response = None
-        try:
-            response = client.head(url)
-            if response.status_code in (403, 404, 405, 501):
-                response = client.get(url)
-        except httpx.HTTPError:
-            response = client.get(url)
+        response = net_guard.fetch(
+            url, method="HEAD", timeout=_TIMEOUT_SECONDS,
+            connect_timeout=_CONNECT_TIMEOUT_SECONDS, max_bytes=4096,
+        )
+        if response.status_code in (403, 404, 405, 501):
+            response = net_guard.fetch(
+                url, method="GET", timeout=_TIMEOUT_SECONDS,
+                connect_timeout=_CONNECT_TIMEOUT_SECONDS, max_bytes=4096,
+            )
 
         status = response.status_code
         state, note = _classify(status)
         result = {"state": state, "http_status": status,
-                  "final_url": str(response.url)[:600], "note": note}
-        if str(response.url).rstrip("/") != url.rstrip("/"):
+                  "final_url": response.url[:600], "note": note}
+        if response.url.rstrip("/") != url.rstrip("/"):
             result["note"] = (note + "; redirected").strip("; ")
         return result
 
+    except net_guard.UrlSafetyError as exc:
+        if exc.code in _SAFETY_CODES_UNREACHABLE:
+            return {"state": UNREACHABLE, "http_status": None, "final_url": None,
+                    "note": f"could not check: {exc.code}"[:300]}
+        return {"state": BLOCKED, "http_status": None, "final_url": None,
+                "note": f"blocked by URL safety policy: {exc.code}; check it by hand"[:300]}
     except Exception as exc:                                            # noqa: BLE001
-        # Could not reach it. That is a statement about us, not about the page: no
-        # network egress, DNS failure, TLS problem, timeout. Saying BROKEN here would
-        # condemn every citation on the platform the first time a firewall got in the way.
         return {"state": UNREACHABLE, "http_status": None, "final_url": None,
                 "note": f"could not check: {type(exc).__name__}"[:300]}
-    finally:
-        if owned:
-            client.close()
 
 
 def sweep(db: Session, limit: int = 100, only_unchecked: bool = False) -> Dict[str, Any]:
@@ -112,20 +119,30 @@ def sweep(db: Session, limit: int = 100, only_unchecked: bool = False) -> Dict[s
     urls = urls[:limit]
 
     tally = {OK: 0, BROKEN: 0, BLOCKED: 0, UNREACHABLE: 0}
-    with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_HEADERS) as client:
-        for url, _count in urls:
-            outcome = check_url(url, client=client)
-            record = existing.get(url)
-            if record is None:
-                record = SourceCheck(url=url[:600])
-                db.add(record)
-                existing[url] = record
-            record.state = outcome["state"]
-            record.http_status = outcome["http_status"]
-            record.final_url = outcome["final_url"]
-            record.note = outcome["note"] or None
-            record.checked_at = datetime.now(timezone.utc)
-            tally[outcome["state"]] = tally.get(outcome["state"], 0) + 1
+    for url, _count in urls:
+        outcome = check_url(url)
+        record = existing.get(url)
+        if record is None:
+            # Two sweeps can overlap (a second worker, a redelivered task, a rolling deploy). Both
+            # see no row for a URL and both insert one; the unique index then rejects the loser
+            # and the whole task fails. A savepoint makes the loser adopt the winner's row
+            # instead, which is the outcome the second sweep wanted anyway: update what exists.
+            try:
+                with db.begin_nested():
+                    record = SourceCheck(url=url[:600])
+                    db.add(record)
+                    db.flush()
+            except IntegrityError:
+                record = db.scalar(select(SourceCheck).where(SourceCheck.url == url[:600]))
+                if record is None:            # the row vanished between the two statements
+                    continue
+            existing[url] = record
+        record.state = outcome["state"]
+        record.http_status = outcome["http_status"]
+        record.final_url = outcome["final_url"]
+        record.note = outcome["note"] or None
+        record.checked_at = datetime.now(timezone.utc)
+        tally[outcome["state"]] = tally.get(outcome["state"], 0) + 1
 
     db.commit()
     return {"checked": len(urls), **tally,
@@ -186,19 +203,42 @@ def source_queue(db: Session, state: Optional[str] = None,
     return out
 
 
-def verify_source(db: Session, *, source_url: str, verifier: str,
+def verify_source(db: Session, *, source_url: str, verifier: str, actor_email: str,
+                  actor_name: Optional[str] = None,
                   fields: Optional[List[int]] = None,
                   note: str = "") -> Dict[str, Any]:
     """
     Record that a named human opened this page and confirmed the claims citing it.
 
-    `verifier` is required and is stored verbatim. The whole provenance model rests on a
-    person being answerable for the word VERIFIED, so there is no system default here and
-    no way to reach this code path from an automated job.
+    The whole provenance model rests on a person being answerable for the word VERIFIED, so
+    attribution is not a form field - it is the account that made the decision (F-2).
+
+    This used to take the reviewer's name from the request body and store it verbatim, which meant
+    any review-rank caller could put a colleague's name on a decision that colleague never made:
+    the register named a reviewer who had not seen the page. Two things follow and are enforced
+    here rather than in the router:
+
+    * **The decision belongs to the signed-in account.** ``verifier`` is still required - there is
+      no system default, and an automated job can never reach VERIFIED - but it must be the acting
+      account's own name or address, and ``verified_by`` records the account, not the typed text.
+    * **It obeys the review workflow's other rules.** The uploader of a record may not confirm it,
+      and the entity's derived trust state is refreshed for every entity touched, so a page-level
+      confirmation can neither self-certify an import nor leave the record's state stale.
     """
     verifier = (verifier or "").strip()
     if not verifier:
         raise ValueError("a verifier name is required - VERIFIED must be attributable")
+    actor = (actor_email or "").strip()
+    if not actor:
+        raise ValueError("a signed-in reviewer is required - VERIFIED must be attributable")
+    accepted = {actor.lower()}
+    if actor_name:
+        accepted.add(actor_name.strip().lower())
+    if verifier.lower() not in accepted:
+        raise ValueError(
+            "VERIFIED is recorded against the account that made the decision; enter your own "
+            "name, or sign in as the reviewer whose name you are using"
+        )
 
     stmt = select(DataVerification).where(DataVerification.source_url == source_url)
     if fields:
@@ -207,12 +247,35 @@ def verify_source(db: Session, *, source_url: str, verifier: str,
     if not records:
         raise ValueError("no claims cite that source URL")
 
+    # Refuse the whole batch before changing any of it: the uploader of a record may not confirm
+    # its own data, and a half-applied batch would leave some fields certified and others not.
+    from app.services import importer
+    for record in records:
+        if importer.batches_uploaded_by(db, entity_type=record.entity_type,
+                                        entity_id=record.entity_id, email=actor):
+            raise ValueError(
+                "one of these records was uploaded by the same account; a second reviewer must "
+                "approve it"
+            )
+
     now = datetime.now(timezone.utc)
+    touched: set[tuple[str, int]] = set()
     for record in records:
         record.status = "VERIFIED"
         record.verified_at = now
-        record.verified_by = verifier[:160]
+        record.verified_by = actor[:160]
+        if record.entity_id is not None:
+            touched.add((record.entity_type, record.entity_id))
+
+    # A register mutation refreshes the entity it describes, in this transaction. Necessary because
+    # the entity's state is *derived*: without it a page-level confirmation would leave a fully
+    # verified record unverified, and callers would learn to "fix" that by writing confidence
+    # directly - the bypass this campaign exists to close.
+    from app.services import review
+    db.flush()
+    states = {f"{etype}:{eid}": review.refresh_entity_state(db, etype, eid, actor)
+              for etype, eid in sorted(touched)}
 
     db.commit()
-    return {"source_url": source_url, "verified": len(records), "verified_by": verifier,
-            "verified_at": now.isoformat(), "note": note}
+    return {"source_url": source_url, "verified": len(records), "verified_by": actor,
+            "verified_at": now.isoformat(), "note": note, "entity_states": states}

@@ -1,5 +1,6 @@
 import type { NextConfig } from "next";
 import { resolveApiBase } from "./config/api-base";
+import { buildCsp } from "./config/csp";
 
 /**
  * The browser NEVER talks to the FastAPI port directly (it is not reachable from the
@@ -34,6 +35,13 @@ const nextConfig: NextConfig = {
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           { key: "X-DNS-Prefetch-Control", value: "on" },
+          // Defence in depth for the blog body (F-1). The fix itself is that `lib/markdown`
+          // renders a parsed tree instead of building markup, so this header is not what makes
+          // the page safe - see config/csp.js for what it does and does not cover.
+          {
+            key: "Content-Security-Policy",
+            value: buildCsp({ isDev: process.env.NODE_ENV !== "production" }),
+          },
         ],
       },
     ];

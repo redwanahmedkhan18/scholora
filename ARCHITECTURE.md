@@ -7,12 +7,6 @@ Single organisation (Uttara, Dhaka). Not SaaS, not multi-tenant.
 > `RUNNING.md` (how to run it). Every table and column, every endpoint, the full trust rules and
 > the gap audit live in the local `docs/` working copy, which is deliberately not published; this
 > file is the published description of the system and does not depend on it.
->
-> **Scope of this commit.** This file describes the platform as a whole. The commit that publishes
-> it contains the security work only — MFA, the password policy, transactional email and contact
-> routing. Scope resolution, catalogue integrity and change review, privacy erasure and the
-> outbox, the PostgreSQL concurrency suite and the Celery delivery hardening were developed later
-> and are marked **(working copy)** where they appear. Counts below are for the published tree.
 
 ---
 
@@ -54,7 +48,7 @@ would buy nothing but operational overhead and distributed-transaction bugs.
               ┌─────────▼──┐  ┌─────▼─────┐  ┌─▼──────────────┐
               │ PostgreSQL │  │   Redis   │  │ Celery workers │
               │ + pgvector │  │ cache /   │  │ + beat         │
-              │ 47 tables  │  │ ratelimit │  │ 6 scheduled    │
+              │ 50 tables  │  │ ratelimit │  │ 7 scheduled    │
               └────────────┘  │ / broker  │  │ jobs           │
                               └───────────┘  └────────────────┘
                                      │
@@ -78,24 +72,21 @@ accounts.
 ```
 backend/app/
 ├── main.py                 app assembly, CORS, /api/health, router mounting
-├── core/          (16)     cross-cutting concerns, no business logic
+├── core/          (14)     cross-cutting concerns, no business logic
 │   ├── config.py           Pydantic settings + meta_graph_base_url
 │   ├── runtime.py          DB overlay over env (_DynamicSettings, 21 keys/5 groups)
 │   ├── database.py         engine, SessionLocal, Base
 │   ├── security.py         password hashing, JWT
-│   ├── passwords.py        the staff-password policy, applied at every write path
 │   ├── deps.py             current_user, require_role, require_staff
-│   ├── mfa.py              TOTP for staff roles, single-use step and recovery codes
+│   ├── mfa.py              TOTP for staff roles
 │   ├── ratelimit.py        fixed-window limiter, first-match-wins rules
 │   ├── cache.py            Redis helpers, graceful no-Redis fallback
 │   ├── storage.py          private docs, short-lived signed URLs
 │   ├── webhooks.py         signature validation
-│   ├── validation.py       phone / email / URL normalisation shared by API and CLI
-│   ├── connectivity.py     deployment URL normalisation (rediss://, TLS)
 │   ├── llm.py              provider failover: grok → mistral → gemini
 │   ├── embeddings.py       hosted → local LSA → hashing
 │   └── local_semantic.py   TF-IDF + TruncatedSVD, no API key
-├── models/        (4)      SQLAlchemy; 47 application tables (+ alembic_version)
+├── models/        (5)      SQLAlchemy; 50 application tables
 │   ├── base.py             JSONType, VerificationMixin, SeoMixin, ALL vocabularies
 │   ├── education.py        Country, University, Faculty, Department, Program,
 │   │                       ProgramRequirement, ProgramIntake, Scholarship,
@@ -103,7 +94,7 @@ backend/app/
 │   ├── content.py          HomepageSlide, Service, SuccessStory, Event, BlogPost, FAQ …
 │   └── crm.py              User, Lead, Application, Document, Appointment,
 │                           DataVerification, SourceCheck, KnowledgeChunk, AuditLog …
-├── services/      (19)     the actual business logic
+├── services/      (18)     the actual business logic
 │   ├── eligibility.py      5 verdicts, never a probability
 │   ├── matching.py         programme scoring + faculty research matching
 │   ├── costing.py / fx.py  personalised cost of attendance
@@ -111,17 +102,15 @@ backend/app/
 │   ├── rotation.py         homepage slide scheduling/priority
 │   ├── retrieval.py        BM25 + dense fusion, confidence-weighted
 │   ├── assistant*.py       RAG assistant with tool-calling + guardrails
-│   ├── email.py / email_templates.py  SMTP transport, retry, delivery log
 │   ├── importer.py         8 entity types, staging + CONFLICT detection
 │   ├── extraction.py       live reading of university websites
 │   ├── source_verification.py  link classification + verification queue
-│   ├── reference_data.py   replay the reference CSVs idempotently
 │   ├── readiness.py        go-live checklist
 │   ├── whatsapp.py / notifications.py
 │   └── tasks.py            Celery jobs
 └── api/
     ├── serializers.py      shaping + field-level visibility rules
-    └── v1/routers/ (7)     public · actions · student · integrations ·
+    └── v1/routers/ (6)     public · actions · student · integrations ·
                             admin · admin_extra · admin_platform
 ```
 
@@ -150,9 +139,9 @@ frontend/src/
 │   ├── programs/…  scholarships/…  phd/…  faculty/…  success-stories/…
 │   ├── search · compare · shortlist · brochure · profile-assessment
 │   ├── my/…                              student portal
-│   └── admin/      15 screens (CMS, leads, data workbench, marketing,
+│   └── admin/      16 screens (CMS, leads, data workbench, marketing,
 │                   platform settings, readiness, extraction)
-└── components/     28, incl. home-experience.tsx (30-second rotation engine)
+└── components/     27, incl. home-experience.tsx (30-second rotation engine)
                     and site-chrome.tsx (mobile bottom nav + WhatsApp FAB)
 ```
 
@@ -163,6 +152,39 @@ network, and hard-coding an internal host is the classic way a preview or a stag
 deploy breaks.
 
 ISR revalidation: homepage 30 s, settings 300 s, vocabularies 3600 s.
+
+### Stored Markdown is rendered as elements, never as markup
+
+The blog body is staff-authored Markdown and is rendered by `src/lib/markdown.ts`: it parses the
+text into a tree of blocks and inline spans, and React turns that tree into elements. There is no
+`dangerouslySetInnerHTML` for user content anywhere in the application — the only sinks left are
+`jsonLdScript()` (§5.2) — so there is no attribute context for authored text to escape into and no
+`href` that React did not build.
+
+This replaced a renderer that escaped `& < >` and then rewrote `[text](url)` into an `<a href="…">`
+string. Quotes were not escaped and the destination was not checked, so a `javascript:` link
+produced a working one and a `"` in a destination closed the attribute and opened an event handler.
+Any COUNSELOR can author a post, the blog is public, and the back office shares the origin with its
+JWT in `localStorage` — one hover was a path from a content role to a staff session.
+
+Two rules make a destination a URL or nothing (`safeHref`): `http:`, `https:`, `mailto:`, `tel:` and
+same-site relative paths are allowed; everything else — `javascript:`, `data:`, `vbscript:`, `file:`,
+protocol-relative, an HTML character reference, a percent-encoded colon — is refused, and a refused
+destination degrades to its own link text rather than being rewritten. Scheme detection normalises
+the way a browser does (control characters and whitespace removed, case folded) and allowed absolute
+URLs are re-serialised by the platform parser, so the stored value is the browser's own canonical
+form. Nothing is truncated. The parser is single-pass and linear: an earlier version was quadratic,
+and 180 KB of emphasis spans cost ~12 s of CPU per render.
+
+**The CSP is defence in depth, and its limits are stated rather than implied** (`config/csp.js`,
+applied in `next.config.ts`). `script-src` must include `'unsafe-inline'`: Next's App Router ships
+its hydration payload in inline `__next_f.push(...)` scripts, and the optional GA4/GTM/Meta bootstrap
+is inline too, while the pages are static/ISR and so cannot carry a per-request nonce. This policy
+is therefore **not** claimed to stop an injected inline script. What it does enforce:
+`script-src-attr 'none'` (every inline event-handler attribute is blocked, which is the attribute
+vector a future rendering mistake would reintroduce), `object-src 'none'`, `base-uri 'self'`,
+`form-action 'self'`, `frame-ancestors 'none'`, no `'unsafe-eval'` in production, and allowlisted
+analytics origins rather than `*`.
 
 ### The 30-second homepage
 
@@ -182,9 +204,7 @@ This is the part that distinguishes the platform from a brochure site.
 `DataVerification` records, per field: `entity_type`, `entity_id`, `field_name`,
 `field_value`, `source_url`, `source_type` (TIER_1…TIER_7), `retrieved_at`,
 `verified_at`, `verified_by`, `review_due_at`, `status`, `conflict_with`.
-The table starts almost empty: the demo seed writes **3** rows, the importer writes more, and
-`verification_sweep` + `check_source_links` keep them honest. The wider working copy carries an
-enriched dataset; nothing in the code depends on its size.
+Currently **4,551 rows over 104 cited URLs**.
 
 Confidence states: `VERIFIED` · `NEEDS_REVIEW` · `OUTDATED` · `CONFLICTING` ·
 `UNVERIFIED`. Conflicting sources are **surfaced, never silently overwritten** — the
@@ -232,29 +252,126 @@ requests are spaced; output is always `UNVERIFIED` and nothing auto-writes.
 
 ---
 
-### 5.6 The verification register (and what is not here yet)
+### 5.6 Catalogue integrity, review and change history
 
-**Implemented in this commit.** One row per field in `models.crm.DataVerification` carries the
-status, the source and the reviewer, and the entity's confidence is read from that register rather
-than asserted on the entity itself. `admin_platform` exposes the queue
-(`GET /admin/verification/queue`), the resolve action and the source register
-(`GET /admin/verification/sources`, `check`, `verify`), and the `verifications` resource is
-listed in the admin CRUD. Two consequences are enforced today: a value cannot reach `VERIFIED`
-without a source URL and a verification date, and `CONFLICTING` rows are surfaced for a human
-instead of being overwritten — the importer's `CONFLICT` verdict defaults to `SKIP`.
+Three layers, each answering a different question, and none of them able to promote a figure by
+itself:
 
-**Not in this commit (working copy).** Three capabilities were built afterwards and are absent
-from this tree, so do not look for them here:
-
-| Capability | What it adds | Where it would live |
+| Layer | Question it answers | Where |
 | --- | --- | --- |
-| Integrity audit | 14 inconsistency categories (missing source, expired verification, thin coverage, duplicates) with an explicit cap | `services/catalogue_integrity.py` |
-| Change history | One row per material change, recorded at *staging*, with approval as compare-and-swap and per-(entity, field) version numbering | `models.crm.CatalogueChange` |
-| Scope resolution | One immutable `Scope` per question, failing closed on ambiguous or unsupported constraints | `services/scoping.py`, W5 context slots |
+| Integrity audit | *What is inconsistent right now?* 14 categories — missing source, expired verification, conflict, thin coverage, duplicate — reported with an explicit cap, never silently truncated | `services/catalogue_integrity.py` |
+| Verification register | *Who says this value is right, and when?* One row per field with status, source and reviewer; the entity's confidence is **derived** from that register rather than asserted | `models.crm.DataVerification` |
+| Change history | *What changed, and was it approved?* One row per material change, recorded when an import is **staged** so a conflict is visible before it is applied | `models.crm.CatalogueChange` |
 
-What exists in this commit instead: the verification queue plus the review endpoints above, and
-the importer's staging/`CONFLICT` machinery, which is what keeps an upload from certifying
-itself today.
+An upload can never certify itself: a commit forces `NEEDS_REVIEW` and clears the verification
+dates, trust columns are settable only through the review path (the generic admin CRUD strips
+them), a refusal requires a note, and a reviewer cannot approve their own submission.
+
+**A direct edit invalidates the verification it no longer supports.** The generic admin CRUD writes
+any content column a form posts, so the same rule the importer follows applies there
+(`services/catalogue_writes.py`): when a *factual* field of a governed record changes, the record's
+confidence becomes `NEEDS_REVIEW`, `verified_at` / `verified_by` / `review_due_at` are cleared, the
+edited value is appended to the field register as a claim awaiting review, and a `CatalogueChange`
+keeps the previous value beside the new one with the actor's address. The three writes share one
+transaction, so a value cannot land without its trust state and its history. Presentation, routing
+and exposure columns (slug, SEO text, images, feature flags, ordering, counters) are explicitly not
+claims and never trigger it. The list of governed models is derived from the `VerificationMixin`
+rather than maintained by hand, so a model cannot be governed by accident or forgotten. Decisions
+are compare-and-swap on the state that was reviewed, so two reviewers cannot both "win" one field
+and one change cannot be recorded as both approved and rejected. Version numbers per
+(entity, field) are assigned under a PostgreSQL advisory lock and are unique by index. Staleness
+(`CURRENT` / `REVIEW_OVERDUE` / `STALE` / `UNKNOWN`) is reported, and `UNKNOWN` is a state — a
+missing freshness window is never treated as fresh.
+
+**The register is evidence, so it is append-only and the derivation fails closed.** A register row
+is what an entity's state is derived *from*, which means the row may not be removed: deleting the
+one row still saying `NEEDS_REVIEW` used to leave a register in which every remaining row said
+`VERIFIED`, and the derivation duly promoted a fee nobody had reviewed while naming a reviewer who
+had never seen it. Four rules close that:
+
+1. **No row can be deleted through the application.** `DELETE` and `PUT` on `verifications` return
+   405 and name the supported transitions; `review.delete_field` refuses as well, so a future
+   caller that reaches for a delete cannot succeed quietly.
+2. **Withdrawal is a transition.** `POST /admin/verification/{id}/withdraw` requires a reason,
+   keeps the row and its recorded evidence, sets `WITHDRAWN`, clears the verification stamp, and
+   can only ever lower trust. The actor and the reason land in `audit_logs`.
+3. **The derivation reads the newest row per field and withholds on three conditions:** an
+   undecided `CatalogueChange` for the entity, any field whose current row is not `VERIFIED`, and a
+   `VERIFIED` row whose recorded evidence no longer matches the stored value (an approval certifies
+   the value it saw, not whatever is stored now).
+4. **Every register mutation refreshes the entity** in the same transaction
+   (`review.refresh_entity_state`), including a page-level source confirmation and a claim created
+   through `POST /admin/verifications`: that path re-derives the entity after flushing the new row,
+   so the record can never describe the register as it was before the insert. A created row is
+   always `NEEDS_REVIEW` and creation can therefore only lower trust.
+
+**Evidence is stored in full, and withholding says why.** The evidence column held 400 characters
+and every writer clipped to fit it, so a claim about a longer value — a programme `overview`, a
+serialised `other_fees` map — recorded a prefix. The derivation compares the recorded value with the
+value actually stored, so that prefix never matched, and the record could never be promoted: the
+reviewer approved the field, was told it was `VERIFIED`, and the record stayed withheld for ever
+with nothing explaining it and no evidence that could agree because the column could not hold it
+(C2-10). Two changes fix it:
+
+* **The column is `Text`** (`alembic` revision `b4c5d6e7f8a9`, a pure widening) and no writer clips,
+  so the register holds the value it attests to and the comparison is made against the full stored
+  value. A fixed larger limit was rejected: the columns being attested are themselves unbounded, so
+  any cap moves the same defect to a different threshold.
+* **A withholding is explained** (`review.explain_entity_state`, returned as `derivation` by the
+  entity detail, the field decision and the withdrawal): a reason code (`no_register`,
+  `fields_not_verified`, `conflicting`, `outdated`, `pending_change`, `evidence_mismatch`,
+  `evidence_truncated`, `record_missing`), a sentence, the fields involved, and the supported
+  recovery where one exists. None of it describes the schema or discloses a value.
+
+Claims written before the widening hold a clipped value whose remainder exists nowhere. They are
+reported as `evidence_truncated` — *unanswerable*, not disagreeing — and the recovery is to
+register the field again from the current source and decide that claim; the new row supersedes the clipped
+one for its field. A recorded value that is not a prefix of the stored value is a genuine
+`evidence_mismatch`.
+
+That detection is a **heuristic, not proof**: a recorded value of exactly 400 characters whose
+normalised form is a prefix of a longer stored value is treated as a clip, and a genuine
+400-character value that happens to be a prefix of the stored value is indistinguishable from one.
+There is therefore no "confirmed truncation" state — a pair that is legitimately 400 characters
+long and equal to the stored value is compared normally and agrees, and anything the heuristic
+flags is withheld with wording that says the evidence *looks like* a truncated copy rather than
+asserting what happened to it. Withholding is the same in both readings, and the same recovery
+resolves both.
+
+**A value the database refuses is a 422, in layers that are not equally portable.** Three things
+happen, and only the first is backend-independent:
+
+1. **Shape validation before the write** (`admin._reject_unrepresentable`) runs on every backend:
+   non-finite floats (including inside a JSON column), a container aimed at a scalar column, a
+   fractional number aimed at an integer column, and a boolean aimed at a numeric column are all
+   refused with 422 and nothing written.
+2. **Database refusals are mapped** (`admin._refuse_client_values`, `_client_value_error`) around the
+   whole governed write, including the `flush()` calls inside
+   `catalogue_writes.apply_direct_edit` that used to escape as a 500. The classification is narrow:
+   a `DataError` (SQLSTATE class `22`), an out-of-range number, a driver refusal to *adapt* the
+   Python value (client-side, no SQLSTATE) or a type mismatch (`42804`). It is **PostgreSQL
+   behaviour**: those error classes come from the server rejecting a value against a declared
+   column type.
+3. **SQLite does not enforce column types.** Its driver stores whatever it is given, so
+   `{"duration_months": "twelve"}` is a 422 on PostgreSQL and a 200 that stores the text `twelve`
+   on SQLite. The value-mapping tests are therefore marked PostgreSQL-only, and a green SQLite run
+   says nothing about them. Production runs PostgreSQL; SQLite is the zero-setup engine the rest of
+   the suite uses.
+
+An operational error, an integrity error and any other programming error returned *by the server*
+keep their own behaviour on both backends — a database outage is a 503, a duplicate key is a
+conflict, and neither is mislabelled as the caller's typo.
+
+Three shapes are refused before the write because accepting them would corrupt the record rather
+than the answer: `NaN`/`Infinity` (JSON has no such literal, but Python's reader accepts it and
+`double precision` stores it — after which every response for that record fails), a container aimed
+at a scalar column (the driver stored `["USD"]` as the text `{USD}`), and a fractional number aimed
+at an integer column (PostgreSQL rounds `1.5` to `2`). A value that is merely *formatted* differently
+— a numeric string, an integral float, a JSON column's mapping — is still accepted.
+
+Attribution follows the account, not a text field: `verified_by` is written from the authenticated
+reviewer, a caller cannot name a colleague as the decider, and the uploader of a record cannot
+confirm it on any path — including `POST /admin/verification/sources/verify`.
 
 ## 6. Retrieval
 
@@ -270,17 +387,14 @@ tokenize → embed → BM25 lexical → dense top-max(limit*5, 25)
 Weighting by confidence means a well-sourced document outranks a shakier one at equal
 textual relevance — the retrieval layer enforces the trust policy rather than ignoring it.
 
-**Narrowing happens at the edges, not in a resolver.** `retrieval.search()` takes an optional
-`entity_types` filter, a limit and the fusion weights; it has no notion of a destination, a
-region, a budget or an intake year. Structured narrowing is done by the calling endpoint, which
-already knows what the student asked for — `/search`, `/programs`, `/scholarships` and the
-eligibility endpoints filter their own SQL — and the assistant passes the entity types it decided
-to consult. A dedicated scope resolver that turns a free-text question into one immutable,
-fail-closed `Scope` (destination, region, university, subject, degree level, budget, intake year,
-with exclusions winning over inclusions) is **not part of this commit**; it was built later in the
-working copy together with the W5 context slots that carry it across turns. Until then, an
-ambiguous question is answered from a broader retrieval rather than being pinned to a wrong
-subset, and the assistant's guardrails still prevent a fabricated figure.
+**Scope before scoring.** A question is first resolved into one immutable `Scope`
+(`services/scoping.py`): destination, region, university, subject, degree level, budget, intake
+year. `RESOLVED` narrows the query; `NEEDS_CLARIFICATION`, `UNSUPPORTED` and `CONTRADICTORY` fail
+closed — the assistant asks a targeted question or returns an honest empty answer, never an
+unfiltered result. The scope is applied in SQL by per-model adapters (one per schema, because the
+five catalogues do not share a shape), and it is carried across turns by the W5 context slots,
+where the server owns the value and a client cannot set it. Exclusions always win over inclusions,
+and an unresolved mandatory constraint is never dropped to make a query succeed.
 
 **Embeddings** fall back in three stages: hosted provider → local LSA → hashing.
 The local tier (`core/local_semantic.py`) is TF-IDF + TruncatedSVD fitted on the corpus
@@ -304,38 +418,33 @@ Celery with a Redis broker. Six scheduled jobs:
 | `scholara.data_quality_digest` | counts by confidence state for the data manager |
 | `scholara.reindex_knowledge` | refit LSA + rebuild the vector index |
 | `scholara.campaign_metrics` | marketing attribution roll-up |
-
-(Working copy: a seventh job, `scholara.process_pending_deletions`, drains the erasure object
-outbox every five minutes. Erasure and its outbox are not part of this commit.)
+| `scholara.process_pending_deletions` | drain the erasure object-deletion outbox (every 5 minutes) |
 
 Every job returns a dict containing `{"job": "<name>"}` so results are identifiable in
 the result backend.
 
-**(Working copy) Delivery is at-least-once, and the jobs are written for it.** In the working copy
-the worker acknowledges a message only after the task finishes (`task_acks_late`), requeues it when
-a worker dies (`task_reject_on_worker_lost`), and the broker restores an unfinished message after
-`visibility_timeout` (1,800 s) — deliberately longer than the 900 s hard time limit, so recovery
-can never hand a *running* task to a second worker. Idempotency is therefore a requirement, not a
-preference: the outbox drain claims rows with `SELECT … FOR UPDATE SKIP
+**Delivery is at-least-once, and the jobs are written for it.** The worker acknowledges a message
+only after the task finishes (`task_acks_late`), requeues it when a worker dies
+(`task_reject_on_worker_lost`), and the broker restores an unfinished message after
+`visibility_timeout` (1,800 s) — which is deliberately longer than the 900 s hard time limit, so
+recovery can never hand a *running* task to a second worker. Idempotency is therefore a
+requirement, not a preference: the outbox drain claims rows with `SELECT … FOR UPDATE SKIP
 LOCKED`, the verification sweep claims the records it flips with `UPDATE … RETURNING`, reminders
 and the digest de-duplicate per entity per day, and the link checker adopts an existing row when
-two sweeps race to insert it. **This commit runs the default ack-on-receipt configuration**; none
-of those guarantees apply until the hardening lands.
+two sweeps race to insert it.
 
-**Time limits need a prefork pool (working copy).** The 780 s soft and 900 s hard limits are
-enforced by Celery only through a prefork worker; under `--pool=threads` a hung task runs until the
-process is restarted. `RUNNING.md` therefore specifies `--pool=prefork`, and the deployment
-documentation previously specified `--pool=threads` — a discrepancy recorded in the audit and left
-for the owner to settle, because changing a service's pool is a deployment decision. This commit
-configures no time limits.
+**Time limits need a prefork pool.** The 780 s soft and 900 s hard limits are enforced by Celery
+only through a prefork worker; under `--pool=threads` a hung task runs until the process is
+restarted. `RUNNING.md` therefore specifies `--pool=prefork`, and the deployment documentation
+previously specified `--pool=threads` — a discrepancy recorded in the audit and left for the owner
+to settle, because changing a service's pool is a deployment decision.
 
 ---
 
 ## 8. Security
 
 - HTTPS everywhere; RBAC via `require_role(minimum)` against `ROLE_HIERARCHY`
-  (STUDENT 10 → COUNSELOR 50 → APPLICATION_OFFICER 55 → DATA_MANAGER 60 →
-  SENIOR_COUNSELOR 70 → ADMIN 100).
+  (STUDENT → COUNSELOR → SENIOR_COUNSELOR → DATA_MANAGER → ADMIN).
 - **MFA (TOTP) enforced** for configured staff roles.
 - Documents stored privately; access only through **300-second signed URLs**. Uploads
   capped at 15 MB with magic-byte sniffing, not extension trust.
@@ -343,6 +452,10 @@ configures no time limits.
 - Rate limiting, first match wins: login 10/5 min · leads 8/h · appointments 6/h ·
   assistant 30/h · brochure 20/h · engines 60/h · documents 40/h · track 600/h ·
   admin 600/min · public 300/min.
+- The internal token exempts **reads only** (`GET`/`HEAD`/`OPTIONS`). It used to exempt every
+  method, which made one secret mean both "do not throttle the build" and "unthrottle the
+  conversion relay, lead capture and the assistant": 65 token-bearing conversion calls produced no
+  429 against a rule allowing 60 an hour. Writes are now throttled like any other write.
 - Audit log on privileged mutations.
 - Secrets held in runtime settings are **Fernet-encrypted** from `SECRET_KEY` and
   returned masked by the API.
@@ -374,23 +487,23 @@ verifiability.
 
 | | count |
 |---|---:|
-| Tables | 47 application tables (+ `alembic_version`) |
-| API paths / operations | 119 / 127 |
+| Tables | 51 |
+| API paths / operations | 131 / 140 |
 | Routers | 7 |
-| Alembic revisions | 9 |
-| Backend tests | 464 (SQLite) |
-| Frontend tests | 28 |
-| Frontend source files | 86 |
+| Alembic revisions | 17 |
+| Backend tests | 1,185 (SQLite, 50 skipped) / 1,235 (PostgreSQL with Redis required, none skipped) |
+| Frontend tests | 99 |
+| Frontend source files | 93 |
 
 Content depends on which dataset is loaded, so it is not a property of the code:
 
 | Dataset | What it contributes |
 | --- | --- |
-| Demo seed (`app/seed_data.py`) | 14 countries, 23 universities, 55 programmes, 120 intakes, 15 scholarships, 10 faculty, 3 verification rows |
+| Demo seed (`app/seed_data.py`) | 14 countries, 23 universities, 23 programmes, 120 intakes, 15 scholarships, 10 faculty |
 | Reference CSVs (`backend/data/reference/`) | 91 universities, 110 programmes, 149 intakes, 13 scholarships, 30 professors, 5 countries |
 
 Provenance rows, knowledge chunks and indexed embeddings are produced by the importer and the
-reindex job, so their counts change with every import and every reindex.
+reindex job, so their counts change with every import and with `POLICY_MAX_AGE_DAYS`.
 
 **Known thin spots** (tracked in the local gap audit): 16 universities have no programmes
 attached; 13 countries have no faculty; the citation-depth queue from §11 is unworked.
@@ -405,7 +518,7 @@ with two backends: `local` (files under `STORAGE_DIR`, mode `0600`, with a key-t
 expiry — so a link can be shared for minutes and then stops working; tampering and expiry both
 raise rather than degrade.
 
-**Deletion is an outbox, not a hope (working copy).** Erasing a profile revokes its sessions first, deletes its
+**Deletion is an outbox, not a hope.** Erasing a profile revokes its sessions first, deletes its
 dependent rows leaf-first inside one transaction, and writes the storage keys it must destroy into
 `pending_object_deletions` *in that same transaction*. The objects are then deleted and each key is
 removed from the outbox only after the backend confirms the object is gone. A backend that cannot

@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useRef, useState } from "react";
 import { money } from "@/lib/format";
 import {
-  DOC_LABELS, STATUS_LABELS, portalFetch, setProfileToken, statusTone, syncShortlist,
+  DOC_LABELS, STATUS_LABELS, portalFetch, statusTone,
 } from "@/lib/portal";
+import { usePortalSession } from "@/lib/use-portal-session";
 import { track } from "@/lib/track";
 
 type Dict = Record<string, any>;
@@ -13,27 +15,15 @@ type Dict = Record<string, any>;
 const TABS = ["Overview", "Applications", "Documents", "Shortlist", "Updates"] as const;
 type Tab = typeof TABS[number];
 
-export default function PortalView({ token }: { token: string }) {
-  const [data, setData] = useState<Dict | null>(null);
-  const [error, setError] = useState("");
+export default function PortalView({ token, consumeToken = false }:
+  { token: string; consumeToken?: boolean }) {
+  const router = useRouter();
   const [tab, setTab] = useState<Tab>("Overview");
-
-  const load = useCallback(async () => {
-    try {
-      const res = await portalFetch<Dict>(`/portal/${token}`);
-      setData(res);
-      setProfileToken(token, res?.profile?.full_name);
-      setError("");
-    } catch (e: any) {
-      setError(e?.message ?? "We could not load this portal.");
-    }
-  }, [token]);
-
-  useEffect(() => {
-    void load();
-    // Any shortlist saved while browsing anonymously is pushed up on first visit.
-    void syncShortlist(token).then((added) => { if (added) void load(); });
-  }, [load, token]);
+  const onTokenConsumed = useCallback(() => router.replace("/my"), [router]);
+  const onSignedOut = useCallback(() => router.replace("/"), [router]);
+  const { data, error, load, signOut } = usePortalSession(token, {
+    consumeToken, onTokenConsumed, onSignedOut,
+  });
 
   if (error) {
     return (
@@ -61,6 +51,10 @@ export default function PortalView({ token }: { token: string }) {
             {[data.profile.target_degree_level, data.profile.target_discipline, data.profile.target_intake]
               .filter(Boolean).join(" · ") || "Tell your counselor your target intake to sharpen your plan."}
           </p>
+          <button type="button" onClick={signOut}
+            className="mt-3 rounded-lg bg-white/10 px-3 py-1.5 text-xs font-bold text-white ring-1 ring-white/20 hover:bg-white/20">
+            Sign out
+          </button>
         </div>
         <div className="grid grid-cols-2 divide-x divide-slate-200 border-t border-slate-200 sm:grid-cols-4">
           <Kpi value={c.applications} label="Applications" />

@@ -9,6 +9,7 @@ import {
   CountryCard, EventCard, FacultyCard, Grid, PostCard, ProgramCard,
   ScholarshipCard, Section, ServiceCard, StoryCard, UniversityCard,
 } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 60;
 
@@ -50,7 +51,7 @@ export default async function HomePage() {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(website) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(website) }} />
 
       {/* §5 rotating hero + country-linked rail, all client-side after first load */}
       <HomeExperience data={data} />

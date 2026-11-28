@@ -118,6 +118,9 @@ class LocalBackend:
         if path.exists():
             path.unlink()
 
+    def exists(self, key: str) -> bool:
+        return self._path(key).exists()
+
 
 class S3Backend:  # pragma: no cover - needs real credentials
     name = "s3"
@@ -142,6 +145,19 @@ class S3Backend:  # pragma: no cover - needs real credentials
 
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception as exc:
+            # Distinguish "absent" from "could not ask". Only an explicit missing-object answer
+            # is proof of deletion; anything else (auth, transport, throttling) must not be read
+            # as success, or an erasure could clear its queue row without deleting anything.
+            code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise StorageError(f"Could not confirm object state: {type(exc).__name__}") from exc
 
 
 def _make_backend():
@@ -195,3 +211,33 @@ def remove(key: str) -> None:
         backend.delete(key)
     except Exception:
         pass
+
+
+def exists(key: str) -> bool:
+    """Whether the object is still stored. Never raises: an unreadable backend is 'unknown',
+    which the deletion outbox records as a failure rather than silently accepting."""
+    try:
+        return bool(backend.exists(key))
+    except Exception:
+        return False
+
+
+def remove_verified(key: str) -> None:
+    """Delete an object and confirm it is gone; raise ``StorageError`` if it is not.
+
+    ``remove`` is deliberately best-effort for user-initiated deletes, where a storage hiccup
+    must not block a request. Erasure is different: claiming a document was destroyed while its
+    bytes are still readable is a false privacy statement, so this variant refuses to guess.
+    Deletion is idempotent - an absent object counts as success.
+    """
+    try:
+        backend.delete(key)
+    except Exception as exc:  # normalize every adapter failure to one type
+        raise StorageError(f"Could not delete the stored object: {type(exc).__name__}") from exc
+    try:
+        still_there = backend.exists(key)
+    except Exception as exc:
+        # The backend could not tell us. Treat that as unconfirmed, never as success.
+        raise StorageError(f"Could not confirm the object was deleted: {type(exc).__name__}") from exc
+    if still_there:
+        raise StorageError("The stored object is still present after deletion")

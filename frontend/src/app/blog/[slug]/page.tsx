@@ -4,6 +4,8 @@ import { notFound } from "next/navigation";
 import { apiOrNull, getSettings } from "@/lib/api";
 import { dateLabel } from "@/lib/format";
 import { Grid, PostCard } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
+import { MarkdownBody } from "@/lib/markdown";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -27,42 +29,15 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-/** Minimal, dependency-free markdown rendering for the stored article body. */
-function renderBody(md: string): string {
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const inline = (s: string) =>
-    esc(s)
-      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*(.+?)\*/g, "<em>$1</em>")
-      .replace(/`(.+?)`/g, "<code>$1</code>")
-      .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" class="text-brand-800 underline underline-offset-2">$1</a>');
-
-  const out: string[] = [];
-  let list: "ul" | "ol" | null = null;
-  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
-
-  md.split("\n").forEach((raw) => {
-    const line = raw.trimEnd();
-    if (!line.trim()) { closeList(); return; }
-    let m;
-    if ((m = line.match(/^###\s+(.*)$/))) { closeList(); out.push(`<h3>${inline(m[1])}</h3>`); return; }
-    if ((m = line.match(/^##\s+(.*)$/))) { closeList(); out.push(`<h2>${inline(m[1])}</h2>`); return; }
-    if ((m = line.match(/^>\s?(.*)$/))) { closeList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); return; }
-    if ((m = line.match(/^\d+\.\s+(.*)$/))) {
-      if (list !== "ol") { closeList(); out.push("<ol>"); list = "ol"; }
-      out.push(`<li>${inline(m[1])}</li>`); return;
-    }
-    if ((m = line.match(/^[-*]\s+(.*)$/))) {
-      if (list !== "ul") { closeList(); out.push("<ul>"); list = "ul"; }
-      out.push(`<li>${inline(m[1])}</li>`); return;
-    }
-    closeList();
-    out.push(`<p>${inline(line)}</p>`);
-  });
-  closeList();
-  return out.join("\n");
-}
-
+/**
+ * The post body is rendered from a parsed tree by `@/lib/markdown`, not from an HTML string.
+ *
+ * There is deliberately no renderer function here and no `dangerouslySetInnerHTML` for `p.body`:
+ * the body is staff-authored Markdown, and the only reason a staff-authored field was ever safe to
+ * put through innerHTML is that nobody had tried to break it (F-1). `MarkdownBody` cannot emit an
+ * element or an attribute that React did not build, so a `javascript:` destination or an
+ * attribute-breakout payload arrives as text.
+ */
 export default async function PostPage({ params }: Props) {
   const { slug } = await params;
   const [data, settings] = await Promise.all([apiOrNull<Dict>(`/blog/${slug}`, 300), getSettings()]);
@@ -80,7 +55,7 @@ export default async function PostPage({ params }: Props) {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
       <header className="bg-gradient-to-br from-brand-950 via-brand-800 to-brand-700 text-white">
         <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6 sm:py-14">
           <nav aria-label="Breadcrumb" className="text-xs text-brand-100">
@@ -96,7 +71,7 @@ export default async function PostPage({ params }: Props) {
 
       <article className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
         <p className="text-lg leading-relaxed text-slate-700">{p.excerpt}</p>
-        <div className="prose-body mt-6 text-slate-700" dangerouslySetInnerHTML={{ __html: renderBody(p.body ?? "") }} />
+        <MarkdownBody source={p.body ?? ""} />
 
         {(p.tags ?? []).length > 0 && (
           <div className="mt-8 flex flex-wrap gap-1.5">

@@ -421,11 +421,39 @@ def test_a_well_behaved_model_is_used_and_attributed(client, api, db, fake_provi
     settings.llm_provider_order = "mistral"
     _Handler.reply = GOOD_REPLY
 
-    result = engine.ask(db, "What is the tuition for the MSc in Artificial Intelligence?")
-    assert result["mode"] == "llm"
-    assert result["provider"] == "mistral"
-    assert result["model"] == "mistral-large-latest"
-    assert GOOD_REPLY in result["answer"]
+    # W3 checks every factual sentence against the verified evidence for the turn. The seeded
+    # corpus is DEMO, which can never support a fact, so this test supplies a real verified
+    # record whose passage contains both the fee and the date GOOD_REPLY states.
+    from app.services import retrieval
+
+    from task2_helpers import cleanup, make_program, make_university, new_session
+
+    own = new_session()
+    university = programme = None
+    try:
+        university = make_university(own, slug="llm-good-uni")
+        programme = make_program(
+            own, university, slug="llm-good-programme",
+            name="MSc Artificial Intelligence Tuition Probe", tuition=28000.0,
+        )
+        programme.overview = ("Verified on 12 March 2026. Annual tuition is 28,000 USD "
+                             "for the MSc Artificial Intelligence Tuition Probe.")
+        own.commit()
+        retrieval.rebuild_index(own)
+
+        result = engine.ask(db, "What is the tuition for the MSc Artificial Intelligence "
+                                 "Tuition Probe?")
+        assert result["mode"] == "llm"
+        assert result["provider"] == "mistral"
+        assert result["model"] == "mistral-large-latest"
+        assert GOOD_REPLY in result["answer"]
+    finally:
+        cleanup(own, programme, university)
+        from app.models.crm import KnowledgeChunk
+        own.query(KnowledgeChunk).filter(
+            KnowledgeChunk.slug.like("llm-good-%")).delete(synchronize_session=False)
+        own.commit()
+        own.close()
 
 
 def test_the_answer_records_which_provider_served_it(client, api, db):

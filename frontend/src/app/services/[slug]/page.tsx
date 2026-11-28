@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { apiOrNull } from "@/lib/api";
 import { Grid, ServiceCard } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -42,7 +43,7 @@ export default async function ServicePage({ params }: Props) {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(faqLd) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(faqLd) }} />
       <header className="bg-gradient-to-br from-brand-950 via-brand-800 to-brand-700 text-white">
         <div className="mx-auto max-w-5xl px-4 py-10 sm:px-6 sm:py-14">
           <nav aria-label="Breadcrumb" className="text-xs text-brand-100">

@@ -156,14 +156,41 @@ def test_a_rate_limited_provider_is_treated_as_a_failure_not_a_reply(harness, mo
 
 
 # --------------------------------------------------------------- Conversions API
-def test_capi_hashes_personal_data_before_it_leaves_the_server(harness, monkeypatch, client):
+def _internal() -> dict:
+    from app.core.config import settings
+
+    return {"X-Internal-Token": settings.internal_api_token}
+
+
+def test_capi_refuses_to_carry_a_personal_identifier(harness, monkeypatch, client):
     """
-    The Conversions API carries a student's email and phone to Meta. Sending either in
-    the clear would be a privacy breach that no amount of later configuration undoes, so
-    this asserts on the exact bytes we put on the wire: the SHA-256 digests must be
-    present and the raw values must appear nowhere at all.
+    The Conversions API can improve ad matching with hashed e-mail and phone. Scholara's only
+    consent ("contact me about my enquiry on WhatsApp, phone or email") does not cover disclosing
+    an identifier to an advertising platform, so the relay accepts none: a caller that tries is
+    refused before anything is persisted or forwarded, and nothing reaches the vendor.
+
+    This replaces a test that asserted the digests were correct. A hash is a pseudonym, not
+    anonymity - Meta matches on it - so the boundary moved one step earlier, and the assertion
+    moved with it rather than being relaxed.
     """
-    import hashlib
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "meta_graph_base_url", "http://conformance", raising=False)
+    monkeypatch.setattr(settings, "meta_pixel_id", "PIXEL123", raising=False)
+    monkeypatch.setattr(settings, "meta_capi_access_token", VALID_TOKEN, raising=False)
+
+    response = client.post("/api/v1/marketing/conversion", headers=_internal(), json={
+        "event_name": "Lead", "email": "Rahim.Ahmed@Example.COM", "phone": "+8801711111111",
+        "event_source_url": "https://scholara.com.bd/contact", "value": 0, "currency": "BDT",
+    })
+    assert response.status_code == 422, response.text
+    assert not [r for r in RECEIVED if r["kind"] == "capi_events"], (
+        "an identifier-bearing request must not reach the vendor at all")
+
+
+def test_capi_relay_keeps_identifiers_out_of_the_wire_payload(harness, monkeypatch, client):
+    """The event that *is* relayed carries no user_data and no personal value anywhere."""
     import json as _json
 
     from app.core.config import get_settings
@@ -173,29 +200,32 @@ def test_capi_hashes_personal_data_before_it_leaves_the_server(harness, monkeypa
     monkeypatch.setattr(settings, "meta_pixel_id", "PIXEL123", raising=False)
     monkeypatch.setattr(settings, "meta_capi_access_token", VALID_TOKEN, raising=False)
 
-    email, phone = "Rahim.Ahmed@Example.COM", "+8801711111111"
-    response = client.post("/api/v1/marketing/conversion", json={
-        "event_name": "Lead", "email": email, "phone": phone,
-        "event_source_url": "https://scholara.com.bd/contact",
+    response = client.post("/api/v1/marketing/conversion", headers=_internal(), json={
+        "event_name": "Lead", "event_source_url": "https://scholara.com.bd/contact",
         "value": 0, "currency": "BDT",
     })
     assert response.status_code == 200
 
     sent = [r for r in RECEIVED if r["kind"] == "capi_events"]
     assert sent, "the conversion never reached the endpoint"
+    body = sent[0]["body"]["data"][0]
+    assert "user_data" not in body, "no personal identifier may be relayed"
     raw = _json.dumps(sent[0]["body"])
+    for needle in ("@", "+880", "user_data", "email", "phone"):
+        assert needle not in raw, f"the wire payload contains {needle!r}"
+    assert body["event_name"] == "Lead"
 
-    assert email not in raw and email.lower() not in raw, "a raw email was sent to Meta"
-    assert phone not in raw, "a raw phone number was sent to Meta"
 
-    user_data = sent[0]["body"]["data"][0]["user_data"]
-    assert user_data["em"] == hashlib.sha256(email.strip().lower().encode()).hexdigest()
-    assert user_data["ph"] == hashlib.sha256(phone.strip().lower().encode()).hexdigest()
+def test_capi_requires_the_internal_token(harness, client):
+    """Server-to-server only: an anonymous client cannot push conversion events."""
+    response = client.post("/api/v1/marketing/conversion", json={"event_name": "Lead"})
+    assert response.status_code == 403
+    assert not [r for r in RECEIVED if r["kind"] == "capi_events"]
 
 
 def test_capi_without_credentials_logs_locally_instead_of_failing(harness, client):
     """No pixel configured must degrade quietly - a lead is never lost to a missing token."""
-    response = client.post("/api/v1/marketing/conversion", json={
-        "event_name": "Lead", "email": "a@b.com", "event_source_url": "https://x", "value": 0})
+    response = client.post("/api/v1/marketing/conversion", headers=_internal(), json={
+        "event_name": "Lead", "event_source_url": "https://x", "value": 0})
     assert response.status_code == 200
     assert response.json()["status"] in {"LOGGED_LOCALLY", 200}

@@ -652,8 +652,15 @@ def run(reset: bool = True) -> dict:
     ])
     db.commit()
 
+    # The approved destination set is data, not seed content: Saudi Arabia, Italy, Spain and the
+    # Scotland region are inserted idempotently, and institutions in Scottish cities are linked
+    # to the region. Re-running this after an editorial edit changes nothing.
+    from app.services import destinations as destinations_service
+
+    destinations_service.ensure_destinations(db)
+
     counts = {
-        "countries": len(D.COUNTRIES),
+        "countries": len(db.execute(select(Country)).scalars().all()),
         "universities": len(D.UNIVERSITIES),
         "departments": len(db.execute(select(Department)).scalars().all()),
         "programs": len(db.execute(select(Program)).scalars().all()),

@@ -401,3 +401,57 @@ def test_database_unavailable_handler_is_generic_and_retryable():
     assert "Database temporarily unavailable" in body
     assert "leaky-secret" not in body
     assert "password" not in body
+
+
+def test_the_public_readiness_payload_carries_no_infrastructure_identifiers(client):
+    """`/api/health/ready` is unauthenticated: it may answer "ready", not "here is my topology".
+
+    The detailed report (driver, host, port, database, pooler flags) is what an operator needs and
+    what an attacker would like: it names the pooler and the cache host to aim at.
+    """
+    res = client.get("/api/health/ready")
+    assert res.status_code in (200, 503)
+    body = res.text
+    # "database" is a legitimate *check name*; what must not appear is any field naming the
+    # infrastructure behind it.
+    for leaked in ("host", "port", "driver", "sslmode", "pooler", "scheme", "tls", "db"):
+        assert f'"{leaked}":' not in body, f"the public readiness payload exposes {leaked!r}"
+    payload = res.json()
+    assert set(payload) == {"status", "ready", "environment", "checks"}
+    for name, check in payload["checks"].items():
+        assert set(check) <= {"ok", "required", "latency_ms", "error"}, (name, check)
+
+
+def test_readiness_still_reports_which_dependency_failed(client, monkeypatch):
+    monkeypatch.setattr(
+        connectivity, "check_redis_url",
+        lambda *a, **k: {"ok": False, "required": True, "error": "ConnectionError",
+                         "latency_ms": 1.0, "host": "should-not-appear.invalid"},
+    )
+    res = client.get("/api/health/ready")
+    assert res.status_code == 503
+    body = res.json()
+    assert body["ready"] is False
+    assert body["checks"]["cache"]["ok"] is False
+    assert body["checks"]["cache"]["error"] == "ConnectionError"
+    assert "should-not-appear.invalid" not in res.text
+
+
+def test_every_response_carries_a_correlation_id(client):
+    """A user can quote one id and an operator can find the matching log line."""
+    generated = client.get("/api/health/live")
+    assert generated.headers.get("X-Request-ID"), "a response without an id cannot be traced"
+    assert len(generated.headers["X-Request-ID"]) >= 16
+
+    echoed = client.get("/api/health/live", headers={"X-Request-ID": "build-1234-abcd"})
+    assert echoed.headers["X-Request-ID"] == "build-1234-abcd", (
+        "a proxy's id must be kept so a trace spans both services")
+
+
+def test_a_hostile_request_id_is_replaced_not_echoed(client):
+    """The header lands in logs and in the response; it must not carry arbitrary text."""
+    for hostile in ("../../etc/passwd", "id with spaces", "x" * 200, "line\nbreak"):
+        res = client.get("/api/health/live", headers={"X-Request-ID": hostile})
+        value = res.headers["X-Request-ID"]
+        assert value != hostile
+        assert len(value) <= 64 and "\n" not in value

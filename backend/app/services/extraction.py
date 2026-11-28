@@ -42,11 +42,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
 
-import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core import llm
+from app.core import llm, net_guard
 from app.models.education import Country, University
 
 log = logging.getLogger(__name__)
@@ -189,7 +188,9 @@ def resolve(db: Session, *, name: str, country: str,
     to make this feature start reading the wrong institution's website and reporting it
     with total confidence.
     """
-    q = select(University).join(Country)
+    # `universities` now has two foreign keys into `countries` (country_id and region_id), so
+    # the join target must be named explicitly. Only country_id is the ownership link here.
+    q = select(University).join(Country, University.country_id == Country.id)
     if country.strip():
         c = _norm(country)
         q = q.where(func.lower(Country.name).contains(c) |
@@ -260,17 +261,19 @@ class Robots:
         parsed = urlparse(url)
         root = f"{parsed.scheme}://{parsed.netloc}"
         if root not in self._cache:
-            rp: Optional[urllib.robotparser.RobotFileParser] = urllib.robotparser.RobotFileParser()
+            parsed_robots: Optional[urllib.robotparser.RobotFileParser] = None
             try:
-                with httpx.Client(timeout=8.0, headers=HEADERS, follow_redirects=True) as c:
-                    r = c.get(urljoin(root, "/robots.txt"))
+                robots_url = urljoin(root, "/robots.txt")
+                r = net_guard.fetch(robots_url, max_bytes=500_000, timeout=8.0,
+                                    allowed_content_types=("text/plain", "text/html"))
                 if r.status_code == 200 and len(r.text) < 500_000:
-                    rp.parse(r.text.splitlines())        # type: ignore[union-attr]
-                else:
-                    rp = None
+                    parsed_robots = urllib.robotparser.RobotFileParser()
+                    parsed_robots.parse(r.text.splitlines())
+            except net_guard.UrlSafetyError as exc:
+                net_guard.log_refusal(root, exc)
             except Exception:                            # noqa: BLE001
-                rp = None
-            self._cache[root] = rp
+                pass
+            self._cache[root] = parsed_robots
         rp = self._cache[root]
         if rp is None:
             return True
@@ -294,26 +297,30 @@ class Page:
 
 
 def fetch_page(url: str, robots: Optional[Robots] = None,
-               client: Optional[httpx.Client] = None) -> Page:
+               client: Optional[Any] = None) -> Page:
+    """Fetch one page through the W11 guard.
+
+    ``client`` is accepted for call-site compatibility but is not used: the guard owns the
+    connection so that hostname validation and the IP actually connected to cannot diverge.
+    """
+    _ = client
     robots = robots or Robots()
     if not robots.allows(url):
         return Page(url, "BLOCKED_BY_ROBOTS")
-    owned = client is None
-    client = client or httpx.Client(timeout=TIMEOUT, headers=HEADERS, follow_redirects=True)
     try:
-        r = client.get(url)
-        if r.status_code >= 400:
-            return Page(url, f"HTTP_{r.status_code}")
-        ctype = r.headers.get("content-type", "")
-        if "html" not in ctype and "text" not in ctype:
-            return Page(url, f"SKIPPED_{ctype.split(';')[0] or 'unknown'}")
-        html = r.text[:MAX_PAGE_BYTES]
-        return Page(url, "OK", page_title(html), strip_html(html), html)
+        r = net_guard.fetch(
+            url, timeout=TIMEOUT, max_bytes=MAX_PAGE_BYTES,
+            allowed_content_types=("text/html", "application/xhtml+xml", "text/plain", "text/"),
+        )
+    except net_guard.UrlSafetyError as exc:
+        net_guard.log_refusal(url, exc)
+        return Page(url, f"BLOCKED_{exc.code}")
     except Exception as exc:                             # noqa: BLE001
         return Page(url, f"ERROR_{type(exc).__name__}")
-    finally:
-        if owned:
-            client.close()
+    if r.status_code >= 400:
+        return Page(url, f"HTTP_{r.status_code}")
+    html = r.text[:MAX_PAGE_BYTES]
+    return Page(url, "OK", page_title(html), strip_html(html), html)
 
 
 def links(html: str, base_url: str) -> List[Tuple[str, str]]:
@@ -382,7 +389,7 @@ def hub_score(url: str, anchor: str) -> int:
 
 def discover(base_url: str, intents: Sequence[str], *, max_pages: int = MAX_PAGES,
              robots: Optional[Robots] = None,
-             client: Optional[httpx.Client] = None) -> List[Page]:
+             client: Optional[Any] = None) -> List[Page]:
     """
     Breadth-first to depth 2, within a page budget.
 
@@ -390,49 +397,44 @@ def discover(base_url: str, intents: Sequence[str], *, max_pages: int = MAX_PAGE
     reach the answer. Level 2 follows intent matches only - by then we are on the
     "Study" page and the "Fees and funding" link really is there.
     """
+    _ = client
     robots = robots or Robots()
-    owned = client is None
-    client = client or httpx.Client(timeout=TIMEOUT, headers=HEADERS, follow_redirects=True)
-    try:
-        root = fetch_page(base_url, robots, client)
-        pages = [root]
-        if not root.ok:
-            return pages
-        visited = {base_url.split("?")[0].rstrip("/")}
+    root = fetch_page(base_url, robots)
+    pages = [root]
+    if not root.ok:
+        return pages
+    visited = {base_url.split("?")[0].rstrip("/")}
 
-        def take(page: Page, level: int, budget: int) -> List[Page]:
-            got: List[Page] = []
-            if not page.ok or budget <= 0:
-                return got
-            cands = []
-            for url, anchor in links(page.html, page.url):
-                key = url.split("?")[0].rstrip("/")
-                if key in visited:
-                    continue
-                direct = score_link(url, anchor, intents)
-                combined = direct + (hub_score(url, anchor) if level == 1 else 0)
-                if combined > 0:
-                    cands.append((combined, direct, url))
-            cands.sort(key=lambda t: -t[0])
-            for _c, _d, url in cands[:budget]:
-                key = url.split("?")[0].rstrip("/")
-                if key in visited:
-                    continue
-                visited.add(key)
-                time.sleep(POLITE_DELAY)
-                got.append(fetch_page(url, robots, client))
+    def take(page: Page, level: int, budget: int) -> List[Page]:
+        got: List[Page] = []
+        if not page.ok or budget <= 0:
             return got
+        cands = []
+        for url, anchor in links(page.html, page.url):
+            key = url.split("?")[0].rstrip("/")
+            if key in visited:
+                continue
+            direct = score_link(url, anchor, intents)
+            combined = direct + (hub_score(url, anchor) if level == 1 else 0)
+            if combined > 0:
+                cands.append((combined, direct, url))
+        cands.sort(key=lambda t: -t[0])
+        for _c, _d, url in cands[:budget]:
+            key = url.split("?")[0].rstrip("/")
+            if key in visited:
+                continue
+            visited.add(key)
+            time.sleep(POLITE_DELAY)
+            got.append(fetch_page(url, robots))
+        return got
 
-        level1 = take(root, 1, min(3, max_pages - len(pages)))
-        pages.extend(level1)
-        for parent in level1:
-            if len(pages) >= max_pages:
-                break
-            pages.extend(take(parent, 2, max_pages - len(pages)))
-        return pages[:max_pages]
-    finally:
-        if owned:
-            client.close()
+    level1 = take(root, 1, min(3, max_pages - len(pages)))
+    pages.extend(level1)
+    for parent in level1:
+        if len(pages) >= max_pages:
+            break
+        pages.extend(take(parent, 2, max_pages - len(pages)))
+    return pages[:max_pages]
 
 
 # ------------------------------------------------------------------------ extraction

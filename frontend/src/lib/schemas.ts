@@ -50,6 +50,8 @@ export const degreeLevelSchema = z.enum(DEGREE_LEVELS);
 
 /* ------------------------------------------------------------------- lead */
 
+const CONTACT_CONSENT_MESSAGE = "We need your permission before a counselor can contact you.";
+
 export const leadSchema = z.object({
   full_name: fullNameSchema,
   phone: phoneSchema,
@@ -59,8 +61,11 @@ export const leadSchema = z.object({
   interest_subject: z.string().trim().max(160).optional(),
   intake: z.string().trim().optional(),
   message: z.string().trim().max(2000, "Please keep the message under 2000 characters.").optional(),
-  consent_contact: z.literal(true, {
-    message: "We need your permission before a counselor can contact you.",
+  // Must be affirmatively true. `boolean().refine` (not `literal(true)`) so form state can start
+  // unchecked while the submitted value still has to be true; the API enforces the same rule,
+  // so this is a usability check, never the boundary.
+  consent_contact: z.boolean().refine((v) => v === true, {
+    message: CONTACT_CONSENT_MESSAGE,
   }),
 });
 
@@ -93,6 +98,12 @@ export const appointmentSchema = z.object({
   scheduled_time: z.string().min(1, "Pick a time slot."),
   mode: z.string().trim().min(1, "Choose how you would like to meet."),
   notes: z.string().trim().max(1000).optional(),
+  // Must be affirmatively true. `boolean().refine` (not `literal(true)`) so form state can start
+  // unchecked while the submitted value still has to be true; the API enforces the same rule,
+  // so this is a usability check, never the boundary.
+  consent_contact: z.boolean().refine((v) => v === true, {
+    message: CONTACT_CONSENT_MESSAGE,
+  }),
 });
 
 export type AppointmentValues = z.input<typeof appointmentSchema>;
@@ -105,6 +116,13 @@ export const eventRegistrationSchema = z.object({
   email: optionalEmailSchema,
   preferred_country: z.string().trim().optional(),
   degree_level: z.string().trim().optional(),
+  // Registering is a contact request: we message the registrant a reminder.
+  // Must be affirmatively true. `boolean().refine` (not `literal(true)`) so form state can start
+  // unchecked while the submitted value still has to be true; the API enforces the same rule,
+  // so this is a usability check, never the boundary.
+  consent_contact: z.boolean().refine((v) => v === true, {
+    message: CONTACT_CONSENT_MESSAGE,
+  }),
 });
 
 export type EventRegistrationValues = z.input<typeof eventRegistrationSchema>;
