@@ -2,43 +2,17 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getProfileToken } from "@/lib/portal";
-import { sessionId, track, whatsappHref } from "@/lib/track";
+import { useEffect, useRef, useState } from "react";
+import { useAssistantConversation } from "@/lib/use-assistant-conversation";
+import type { Turn } from "@/lib/assistant-lifecycle";
+import { track, whatsappHref } from "@/lib/track";
 
 type Dict = Record<string, any>;
-
-type Turn = {
-  role: "user" | "assistant";
-  text: string;
-  sources?: Dict[];
-  suggestions?: string[];
-  grounded?: boolean;
-  escalated?: boolean;
-  pending?: boolean;
-};
-
-const OPENING: Turn = {
-  role: "assistant",
-  grounded: true,
-  text:
-    "I answer from Scholara's verified database only — universities, programmes, entry requirements, " +
-    "real costs, intakes, scholarships and PhD supervisors. If we have not verified something, I will " +
-    "say so instead of guessing.",
-  suggestions: [
-    "Masters in computer science with IELTS 6.5",
-    "What does a year in Canada actually cost?",
-    "Fully funded PhD supervisors in machine learning",
-    "Which countries suit a 25 lakh taka budget?",
-  ],
-};
 
 export default function AssistantWidget({ settings }: { settings: Dict }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
-  const [turns, setTurns] = useState<Turn[]>([OPENING]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
+  const { turns, input, setInput, busy, send } = useAssistantConversation(pathname);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -55,49 +29,6 @@ export default function AssistantWidget({ settings }: { settings: Dict }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-
-  const send = useCallback(async (question: string) => {
-    const q = question.trim();
-    if (!q || busy) return;
-    setInput("");
-    setBusy(true);
-    setTurns((t) => [...t, { role: "user", text: q }, { role: "assistant", text: "", pending: true }]);
-    track("assistant_ask", { question: q.slice(0, 120), path: pathname });
-
-    try {
-      const res = await fetch("/api/v1/assistant/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: q,
-          session_id: sessionId(),
-          profile_token: getProfileToken(),
-          context: { path: pathname },
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail ?? "The assistant is unavailable.");
-      setTurns((t) => [
-        ...t.slice(0, -1),
-        {
-          role: "assistant", text: data.answer ?? "", sources: data.sources ?? [],
-          suggestions: data.suggestions ?? [], grounded: data.grounded, escalated: data.escalated,
-        },
-      ]);
-    } catch (e: any) {
-      setTurns((t) => [
-        ...t.slice(0, -1),
-        {
-          role: "assistant", grounded: false,
-          text: e?.message?.includes("Too many")
-            ? "You have asked a lot of questions in a short time. Give it a minute, or message a counselor on WhatsApp."
-            : "I could not reach the answer service just now. Please try again, or message a counselor on WhatsApp.",
-        },
-      ]);
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, pathname]);
 
   if (pathname.startsWith("/admin") || pathname.startsWith("/brochure")) return null;
 

@@ -8,7 +8,8 @@ from app.models.content import (  # noqa: F401
 )
 from app.models.crm import (  # noqa: F401
     AnalyticsEvent, Application, ApplicationStatusHistory, Appointment, AuditLog, Brochure,
-    DataVerification, Document, Lead, Notification, SearchQueryLog, StudentProfile, User,
+    DataVerification, Document, Lead, Notification, PendingObjectDeletion, SearchQueryLog,
+    StudentProfile, User,
     WhatsAppContact, WhatsAppConversation, WhatsAppMessage,
 )
 from app.models.education import (  # noqa: F401

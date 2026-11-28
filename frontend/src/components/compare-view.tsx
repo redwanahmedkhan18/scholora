@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { LEVEL_LABEL, money, months } from "@/lib/format";
+import { readLocalShortlist } from "@/lib/portal";
 import { track } from "@/lib/track";
 
 type Dict = Record<string, any>;
@@ -14,12 +15,22 @@ export default function CompareView({ initialSlugs }: { initialSlugs: string[] }
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (initialSlugs.length === 0) {
-      try {
-        const saved: Dict[] = JSON.parse(localStorage.getItem("scholara.shortlist") ?? "[]");
+    if (initialSlugs.length !== 0) return;
+    let active = true;
+    const load = () => {
+      void readLocalShortlist().then((saved) => {
+        if (!active) return;
         setSlugs(saved.filter((x) => x.type === "program").map((x) => x.slug).slice(0, 4));
-      } catch { /* ignore */ }
-    }
+      });
+    };
+    load();
+    window.addEventListener("scholara:profile", load);
+    window.addEventListener("storage", load);
+    return () => {
+      active = false;
+      window.removeEventListener("scholara:profile", load);
+      window.removeEventListener("storage", load);
+    };
   }, [initialSlugs]);
 
   useEffect(() => {

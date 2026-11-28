@@ -3,26 +3,52 @@ from __future__ import annotations
 
 import secrets
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api import serializers as S
 from app.core.database import get_db
+from app.core.privacy import safe_analytics_path, safe_source_url, scrub_analytics_value
 from app.models.content import AdCampaign, Event, EventRegistration, SiteSetting
-from app.models.crm import AnalyticsEvent, Appointment, Brochure, Lead, Notification, SearchQueryLog, StudentProfile
-from app.models.education import Country, Program, University
+from app.models.crm import (
+    ANALYTICS_EVENT_NAME_MAX,
+    AnalyticsEvent,
+    Appointment,
+    Brochure,
+    Lead,
+    Notification,
+    SearchQueryLog,
+    StudentProfile,
+)
+from app.models.education import Program, University
 from app.services import brochure as brochure_service
-from app.services import costing, matching, whatsapp
+from app.services import costing, destinations, matching, scoping, whatsapp
 from app.services.eligibility import evaluate
 
 router = APIRouter(tags=["actions"])
 
 
 # ------------------------------------------------------------------ schemas
+# ------------------------------------------------------------------ schemas
+#: Contact consent. A counselor may only be asked to call or message someone who explicitly
+#: said yes, so the value is required, must be a real boolean (``strict`` refuses the string
+#: "true", the number 1 and null), and must be affirmative. Omitting the field is a 422, not a
+#: silent grant: the field has no default on purpose.
+AffirmativeConsent = Annotated[bool, Field(strict=True)]
+
+CONSENT_REQUIRED_MESSAGE = "We need your permission before a counselor can contact you."
+
+
+def _require_affirmative_consent(value: bool) -> bool:
+    if value is not True:
+        raise ValueError(CONSENT_REQUIRED_MESSAGE)
+    return value
+
+
 class ProfileIn(BaseModel):
     # Reject unknown fields instead of ignoring them. Pydantic's default is to drop what
     # it does not recognise, which here meant a caller sending the obvious-looking
@@ -87,8 +113,13 @@ class LeadIn(BaseModel):
     channel_detail: Optional[str] = None
     utm: Dict[str, Any] = Field(default_factory=dict)
     page_path: Optional[str] = None
-    consent_contact: bool = True
+    consent_contact: AffirmativeConsent
     profile: Optional[ProfileIn] = None
+
+    @field_validator("consent_contact")
+    @classmethod
+    def _consent_is_affirmative(cls, value: bool) -> bool:
+        return _require_affirmative_consent(value)
 
 
 class AppointmentIn(BaseModel):
@@ -102,6 +133,12 @@ class AppointmentIn(BaseModel):
     mode: Optional[str] = None
     notes: Optional[str] = None
     utm: Dict[str, Any] = Field(default_factory=dict)
+    consent_contact: AffirmativeConsent
+
+    @field_validator("consent_contact")
+    @classmethod
+    def _consent_is_affirmative(cls, value: bool) -> bool:
+        return _require_affirmative_consent(value)
 
 
 class EligibilityIn(BaseModel):
@@ -134,10 +171,28 @@ class EventRegIn(BaseModel):
     email: Optional[str] = None
     preferred_country: Optional[str] = None
     degree_level: Optional[str] = None
+    consent_contact: AffirmativeConsent
+
+    @field_validator("consent_contact")
+    @classmethod
+    def _consent_is_affirmative(cls, value: bool) -> bool:
+        return _require_affirmative_consent(value)
 
 
 class TrackIn(BaseModel):
-    name: str
+    """One browser analytics event.
+
+    ``name`` is bounded by the column it is stored in (F-5): ``analytics_events.name`` is
+    ``VARCHAR(80)`` on PostgreSQL and unconstrained on SQLite, so an unbounded name was a 200 in
+    the test suite and a 500 in production. The same limit is used by the conversion relay, from
+    one constant, so app and database cannot disagree. It names the pattern too: an event name is
+    an identifier our own reports group by, not free text.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=ANALYTICS_EVENT_NAME_MAX,
+                      pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     path: Optional[str] = None
     entity_type: Optional[str] = None
     entity_id: Optional[int] = None
@@ -196,6 +251,28 @@ def check_eligibility(body: EligibilityIn, db: Session = Depends(get_db)):
     return {"program": S.program(p, full=True), "eligibility": result, "cost": cost}
 
 
+_EMPTY_MATCH_STATS = {"total": 0, "within_budget": 0, "academic_ok": 0, "with_scholarship": 0,
+                       "intake_available": 0, "research_aligned": 0}
+
+
+def _match_scope(db: Session, body: MatchIn):
+    """The one scope for a matching request: destination, degree and subject, or ``None``.
+
+    ``None`` means nothing was stated, so the profile's own preferences lead - that is not an
+    unresolved scope. An unknown destination slug returns a scope that cannot be executed, which
+    every caller turns into an empty result rather than an unrestricted one.
+    """
+    if not body.country_slugs:
+        return None
+    resolved = [destinations.resolve_destination(db, slug) for slug in body.country_slugs]
+    if any(row is None for row in resolved):
+        return scoping.Scope(status=scoping.UNSUPPORTED, reasons=(scoping.DESTINATION_UNKNOWN,),
+                             clarify_slot="country")
+    rows = [row for row in resolved if row is not None]
+    return scoping.scope_from_destinations(db, rows, degree_level=body.degree_level,
+                                           subject=body.subject)
+
+
 @router.post("/match/programs")
 def match_programs(body: MatchIn, db: Session = Depends(get_db)):
     student = body.profile.model_dump()
@@ -205,10 +282,10 @@ def match_programs(body: MatchIn, db: Session = Depends(get_db)):
         student["target_discipline"] = body.subject
     if body.intake:
         student["target_intake"] = body.intake
-    country_ids: List[int] = []
-    if body.country_slugs:
-        country_ids = list(db.execute(select(Country.id).where(Country.slug.in_(body.country_slugs))).scalars().all())
-    res = matching.match_programs(db, student, {"country_ids": country_ids} if country_ids else {}, limit=body.limit)
+    scope = _match_scope(db, body)
+    if scope is not None and not scope.ok:
+        return {"stats": _EMPTY_MATCH_STATS, "results": [], "alternatives": []}
+    res = matching.match_programs(db, student, {}, limit=body.limit, scope=scope)
     db.add(SearchQueryLog(query=body.subject, degree_level=body.degree_level, subject=body.subject,
                           intake=body.intake, results_count=res["stats"]["total"], channel="PROFILE_MATCH"))
     db.commit()
@@ -216,6 +293,7 @@ def match_programs(body: MatchIn, db: Session = Depends(get_db)):
         "stats": res["stats"],
         "results": [{
             "program": S.program(r["program"], full=True),
+            "exact_match": True,
             "score": r["score"],
             "eligibility": r["eligibility"],
             "cost": r["cost"],
@@ -224,6 +302,13 @@ def match_programs(body: MatchIn, db: Session = Depends(get_db)):
             "intake": S.intake(r["intake"]) if r["intake"] else None,
             "research_hits": r["research_hits"],
         } for r in res["results"]],
+        # Useful near misses, kept out of the ranking above and labelled for what they are: a
+        # student who asked for public health is never shown nursing as if it matched.
+        "alternatives": [{
+            "program": S.program(p, full=True),
+            "exact_match": False,
+            "label": "Related alternative - not an exact match for the requested subject",
+        } for p in res.get("alternatives") or []],
     }
 
 
@@ -237,7 +322,10 @@ def match_scholarships(body: MatchIn, db: Session = Depends(get_db)):
     # letting an explicit profile value win.
     if body.degree_level and not profile.get("target_degree_level"):
         profile["target_degree_level"] = body.degree_level.upper()
-    rows = matching.match_scholarships(db, profile, limit=body.limit)
+    scope = _match_scope(db, body)
+    if scope is not None and not scope.ok:
+        return []
+    rows = matching.match_scholarships(db, profile, limit=body.limit, scope=scope)
     return [{"scholarship": S.scholarship(r["scholarship"]), "status": r["status"],
              "checks": r["checks"], "statement": r["statement"]} for r in rows]
 
@@ -252,16 +340,31 @@ class FacultyMatchIn(BaseModel):
 
 @router.post("/match/faculty")
 def match_faculty(body: FacultyMatchIn, db: Session = Depends(get_db)):
-    country_id = None
+    uni_ids: Optional[List[int]] = None
     if body.country_slug:
-        row = db.execute(select(Country).where(Country.slug == body.country_slug)).scalars().first()
-        country_id = row.id if row else None
+        target = destinations.resolve_destination(db, body.country_slug)
+        if target is None:
+            # An unknown destination is an empty answer, never a worldwide search.
+            return []
+        # The same destination semantics as every other surface: a region stays inside the
+        # region instead of resolving to its sovereign and returning the whole country.
+        uni_ids = list(scoping.university_ids(db, scoping.resolve_scope(
+            db, context={"country": body.country_slug})))
     uni_id = None
     if body.university_slug:
         uni_row = db.execute(select(University).where(University.slug == body.university_slug)).scalars().first()
         uni_id = uni_row.id if uni_row else None
-    rows = matching.match_faculty(db, body.interests, country_id=country_id, university_id=uni_id,
-                                  field=body.field, limit=body.limit)
+        if uni_ids is not None and uni_id not in uni_ids:
+            # Both filters were given and they disagree: the university is outside the stated
+            # country, so the answer is empty rather than whichever filter was read last.
+            return []
+    if uni_id is not None:
+        # The university is the narrower filter and it is already known to be inside the country.
+        rows = matching.match_faculty(db, body.interests, university_id=uni_id,
+                                      field=body.field, limit=body.limit)
+    else:
+        rows = matching.match_faculty(db, body.interests, university_ids=uni_ids,
+                                      field=body.field, limit=body.limit)
     db.add(SearchQueryLog(query=", ".join(body.interests), country=body.country_slug, degree_level="PHD",
                           subject=body.field, results_count=len(rows), channel="FACULTY_SEARCH"))
     db.commit()
@@ -298,15 +401,22 @@ def create_lead(body: LeadIn, request: Request, db: Session = Depends(get_db)):
     profile_id = None
     if body.profile:
         profile_id = _save_profile(db, body.profile).id
+    # Persistence boundary. ``page_path`` and ``utm`` are client-supplied, and this endpoint is
+    # unauthenticated, so the browser's analytics gate is not a guarantee here. A portal link is
+    # a bearer capability: it must not land in a CRM row or the analytics table. Attribution is
+    # unaffected - only the path is normalised and only portal segments inside ``utm`` are
+    # rewritten, so ``utm_campaign`` still resolves to the same ``campaign_id``.
+    safe_path = safe_source_url(body.page_path)
+    safe_utm = scrub_analytics_value(dict(body.utm or {}), ignore_case=True)
     row = Lead(reference=_next_reference(db, "LEAD"),
                full_name=body.full_name, phone=body.phone, email=body.email, message=body.message,
                interest_country=body.interest_country, interest_degree=body.interest_degree,
                interest_subject=body.interest_subject, intake=body.intake, source=body.source,
-               channel_detail=body.channel_detail, utm=body.utm, page_path=body.page_path,
-               campaign_id=_campaign_from_utm(db, body.utm), student_profile_id=profile_id,
+               channel_detail=body.channel_detail, utm=safe_utm, page_path=safe_path,
+               campaign_id=_campaign_from_utm(db, safe_utm), student_profile_id=profile_id,
                consent_contact=body.consent_contact, stage="NEW")
     db.add(row)
-    db.add(AnalyticsEvent(name="lead_created", path=body.page_path, utm=body.utm,
+    db.add(AnalyticsEvent(name="lead_created", path=safe_path, utm=safe_utm,
                           meta={"source": body.source}))
     db.add(Notification(channel="WHATSAPP", recipient=body.phone, trigger="LEAD_CREATED",
                         title="We received your request",
@@ -372,12 +482,18 @@ def create_appointment(body: AppointmentIn, db: Session = Depends(get_db)):
     row = Appointment(reference=_next_reference(db, "APPT"), full_name=body.full_name, phone=body.phone,
                       email=body.email, service_type=service_type, counselor_name=body.counselor_name,
                       scheduled_date=body.scheduled_date, scheduled_time=body.scheduled_time,
-                      mode=mode, notes=body.notes, status="REQUESTED")
+                      mode=mode, notes=body.notes, status="REQUESTED",
+                      consent_contact=body.consent_contact)
     db.add(row)
+    # Same boundary as /leads: the booking form is public and unauthenticated, so the browser's
+    # ``utm`` cannot be trusted. Campaign attribution reads the scrubbed copy too, so a private
+    # path cannot reach either the stored row or the campaign lookup.
+    safe_utm = scrub_analytics_value(dict(body.utm or {}), ignore_case=True)
     lead = Lead(reference=_next_reference(db, "LEAD"), full_name=body.full_name, phone=body.phone,
                 email=body.email, message=f"Appointment request: {service_type}",
-                source="WEBSITE", channel_detail="appointment", utm=body.utm,
-                campaign_id=_campaign_from_utm(db, body.utm), stage="CONTACTED")
+                source="WEBSITE", channel_detail="appointment", utm=safe_utm,
+                campaign_id=_campaign_from_utm(db, safe_utm), stage="CONTACTED",
+                consent_contact=body.consent_contact)
     db.add(lead)
     db.add(Notification(channel="WHATSAPP", recipient=body.phone, trigger="APPOINTMENT_REQUESTED",
                         title="Appointment requested",
@@ -396,12 +512,13 @@ def register_event(body: EventRegIn, db: Session = Depends(get_db)):
     if not ev:
         raise HTTPException(404, "Event not found")
     row = EventRegistration(event_id=ev.id, full_name=body.full_name, phone=body.phone, email=body.email,
-                            preferred_country=body.preferred_country, degree_level=body.degree_level)
+                            preferred_country=body.preferred_country, degree_level=body.degree_level,
+                            consent_contact=body.consent_contact)
     db.add(row)
     db.add(Lead(reference=_next_reference(db, "LEAD"), full_name=body.full_name, phone=body.phone,
                 email=body.email, message=f"Event registration: {ev.title}", source="EVENT",
                 channel_detail=ev.slug, stage="NEW", interest_country=body.preferred_country,
-                interest_degree=body.degree_level))
+                interest_degree=body.degree_level, consent_contact=body.consent_contact))
     db.add(Notification(channel="WHATSAPP", recipient=body.phone, trigger="EVENT_REGISTERED",
                         title=ev.title, body=f"You are registered for {ev.title} on {ev.start_at:%d %b %Y, %I:%M %p}."))
     db.commit()
@@ -425,9 +542,19 @@ def get_profile(token: str, db: Session = Depends(get_db)):
 
 @router.post("/track")
 def track(body: TrackIn, db: Session = Depends(get_db)):
-    db.add(AnalyticsEvent(name=body.name, path=body.path, entity_type=body.entity_type,
-                          entity_id=body.entity_id, utm=body.utm, meta=body.meta,
-                          campaign_id=_campaign_from_utm(db, body.utm)))
+    # The browser boundary strips these before sending; this is the server-side fail-closed
+    # backstop for a compromised or older client. ``ignore_case=True`` here (it used to be the
+    # frozen W4 default) because a portal capability is only a capability if the router matches it:
+    # ``/MY/<token>`` is a different path from ``/my/<token>`` to a case-sensitive router and the
+    # same credential to anything that echoes it back, and a bearer token in an analytics row is a
+    # token a staff member or an export can read. The lead and appointment paths already passed
+    # True for the same reason; this closes the remaining writer.
+    utm = scrub_analytics_value(dict(body.utm or {}), ignore_case=True)
+    meta = scrub_analytics_value(dict(body.meta or {}), ignore_case=True)
+    db.add(AnalyticsEvent(name=body.name, path=safe_analytics_path(body.path),
+                          entity_type=body.entity_type, entity_id=body.entity_id,
+                          utm=utm, meta=meta,
+                          campaign_id=_campaign_from_utm(db, utm)))
     db.commit()
     return {"ok": True}
 

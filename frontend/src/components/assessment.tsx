@@ -17,7 +17,7 @@ const EMPTY = {
   work_experience_years: "", job_title: "", research_experience: "", publications_count: "",
   research_interests: "", budget_per_year: "", budget_currency: "USD", funding_source: "Family",
   preferred_countries: [] as string[], target_degree_level: "MASTER", target_discipline: "",
-  target_intake: "", career_goal: "", consent_marketing: false, consent_contact: true,
+  target_intake: "", career_goal: "", consent_marketing: false, consent_contact: false,
 };
 
 const num = (v: string) => (v === "" || v === null ? null : Number(v));
@@ -115,7 +115,8 @@ export default function Assessment({ countries, degreeLevels = [], vocab = {}, i
           interest_country: f.preferred_countries[0] ?? null, interest_degree: f.target_degree_level,
           interest_subject: f.target_discipline || null, intake: f.target_intake || null,
           source: "WEBSITE", channel_detail: "profile-assessment", utm: storedUtm(),
-          page_path: "/profile-assessment", consent_contact: true, message: "Submitted the online profile assessment.",
+          page_path: "/profile-assessment", consent_contact: f.consent_contact,
+          message: "Submitted the online profile assessment.",
         }).then(() => setLeadSent(true)).catch(() => {});
       }
     } catch {

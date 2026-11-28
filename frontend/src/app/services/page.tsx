@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { Grid, PageHeader, ServiceCard } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -31,7 +32,7 @@ export default async function ServicesPage() {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
       <PageHeader
         eyebrow="Services"
         title="Everything between your transcript and your first lecture"

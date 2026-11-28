@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { apiOrNull } from "@/lib/api";
 import { LEVEL_LABEL, universityHref } from "@/lib/format";
 import { Empty, FacultyCard, Grid, ProgramCard, Section, SourceNote } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -64,7 +65,7 @@ export default async function FacultyPage({ params }: Props) {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
 
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto max-w-6xl px-4 py-8">

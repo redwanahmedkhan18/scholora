@@ -1,0 +1,779 @@
+# Verification for the recovered Scholara generation.
+#
+# This branch carries the application generation that was previously only present in the local
+# working copy - the scope resolver, catalogue integrity and change review, privacy erasure and the
+# deletion outbox, assistant sessions and context slots, the PostgreSQL concurrency suite, the
+# Celery delivery hardening - plus seven Alembic revisions on top of the published head. The point
+# of this workflow is that the code GitHub can see is the code that is tested, so every job below
+# runs the *checked out* tree and asserts its own preconditions rather than trusting a badge.
+#
+# What the jobs prove, and what they deliberately do not:
+#
+#   * backend-sqlite          ruff, mypy and the whole suite on the zero-setup engine. The suite is
+#                             written for SQLite and its fixtures create a throwaway file database,
+#                             so the 16 PostgreSQL and 9 Redis tests skip here - and the job prints
+#                             every skip with its reason and fails on any skip that is not one of
+#                             those two.
+#   * backend-postgres        a real PostgreSQL 16 + pgvector service. The migration database and
+#                             the test database are separate; the migration one must start empty,
+#                             must have exactly one head, is migrated to the recovered head, is
+#                             downgraded back to the published baseline and upgraded again, and its
+#                             recovered objects are asserted by name. Then the *whole* suite runs
+#                             against PostgreSQL with `SCHOLARA_REQUIRE_PG_TESTS=1`, which turns a
+#                             skipped PostgreSQL test into a failed run, and the concurrency module
+#                             is additionally run on its own with a collected-count guard.
+#   * backend-redis           a real Redis 7 service: the `Cache` facade is proven Redis-backed and
+#                             shared between two clients (not silently in-process), and the whole
+#                             suite runs with `SCHOLARA_REQUIRE_REDIS_TESTS=1`, so a Redis test may
+#                             not skip. The PostgreSQL tests skip here by design; they run
+#                             unconditionally in backend-postgres.
+#
+#                             Why the Redis job does not also start PostgreSQL: the Redis-required
+#                             tests need only Redis, and the 16 PostgreSQL tests already run under a
+#                             hard no-skip guard in backend-postgres. Re-running the combined
+#                             1,062-test profile here would repeat both jobs for no extra coverage.
+#                             The combined profile is one documented command (see README.md).
+#   * frontend                npm ci, tsc --noEmit, and all frontend tests. No production build:
+#                             `npm run build` prerenders pages against a live API (`prebuild` polls
+#                             it), and a runner has no such API - asserting a build there would be a
+#                             false prerequisite, so it is not run and not claimed.
+#   * repository-policy       the publication guard on the tree, the index, the ignore rules and
+#                             every commit of the change, plus a mutation test proving the guard
+#                             fails when a prohibited path is introduced.
+#
+# It does not prove that hosted infrastructure is configured, that a deployed service is reachable,
+# that SMTP/WhatsApp/Meta/live-LLM integrations work against real providers, that Celery delivers
+# broker-backed work across workers, or that the frontend builds for production. A green run is
+# evidence of code quality and integration, not of production readiness. See README.md and
+# ARCHITECTURE.md for the declared boundaries.
+#
+# Supply chain: every action is pinned to the commit SHA of the major tag it was written against,
+# with the readable version in a trailing comment. A tag can be re-pointed; a SHA cannot, so this
+# is what makes a run reproducible months later. Updating is deliberate, not automatic: bump the
+# SHA, keep the comment, and let the next run prove it - `git ls-remote --tags <owner>/<repo> vN`
+# resolves the current revision of a major without trusting a dashboard.
+
+name: CI
+
+on:
+  # Every branch, not just main: a change has to be verifiable before it is merged, and a pull
+  # request does not exist yet while the branch is being prepared. A branch with an open pull
+  # request therefore runs twice (once for the push, once for the pull request) - the cost of a
+  # few minutes on a free runner, against the cost of merging something never built.
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The 3.13 line, resolved to its current patch by the runner, and asserted below: pinning one
+  # patch would break silently once the tool cache retires it. Local verification for this branch
+  # ran on 3.13.1, and requirements.txt carries the lower bounds that make 3.13 work.
+  PYTHON_VERSION: "3.13"
+  NODE_VERSION: "22"
+  # The publication commit. Everything before it predates the docs//.env* policy, so historical
+  # commits are not re-litigated on every run (see README.md: the history is declared, the policy
+  # is enforced from here on). A push event raises the baseline to the commit it replaced.
+  POLICY_BASELINE: 1c0f59f5f62062c82213f6f34bc6852e40a385c2
+  # The Alembic head this release is supposed to be at, and the head published main is at. Both
+  # are asserted, not assumed: a migration added without updating this file fails the PostgreSQL
+  # job, which is the intended reminder to record the new head deliberately. Campaign 3 added
+  # b4c5d6e7f8a9 on top of a3b4c5d6e7f8, so the expected head moved forward with it.
+  EXPECTED_ALEMBIC_HEAD: b4c5d6e7f8a9
+  PUBLISHED_ALEMBIC_BASELINE: a7b8c9d0e1f2
+
+jobs:
+  backend-sqlite:
+    name: Backend (SQLite suite, lint, types)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # requirements-dev.txt already pulls requirements.txt in; both are named so the
+          # dependency is explicit at the call site.
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: The interpreter is the supported minor
+        run: |
+          set -euo pipefail
+          python -V
+          python -c "import sys; assert sys.version_info[:2] == (3, 13), sys.version"
+
+      - name: Ruff
+        working-directory: backend
+        run: python -m ruff check .
+
+      - name: Mypy
+        working-directory: backend
+        run: python -m mypy app scripts
+
+      - name: Test suite (SQLite)
+        working-directory: backend
+        env:
+          # A machine-readable record of every test's outcome and markers. The gate cross-checks
+          # each skip against the marker of the test that skipped, so a reason string alone can
+          # never widen the policy.
+          SCHOLARA_PYTEST_JSON: sqlite.json
+        run: |
+          set -uo pipefail
+          status=0
+          # -rs prints one SKIPPED line per skipped test with its reason; the gate below requires
+          # every one of them to be a live-service test that another job runs for real.
+          python -m pytest -rs > sqlite.log 2>&1 || status=$?
+          tail -n 60 sqlite.log
+          # sqlite requires no service, so a pg or redis_live test may skip - and only those, and
+          # only with the canonical skip prefix. The --min-marked floors prove the two service
+          # suites were collected here rather than filtered out.
+          python ../scripts/ci/pytest_gate.py sqlite.log \
+            --profile sqlite \
+            --report sqlite.json \
+            --min-marked pg=40 \
+            --min-marked redis_live=9 \
+            --min-passed 1000
+          # The gate is the assertion; this keeps pytest's own exit code from being lost.
+          test "$status" -eq 0
+
+  backend-postgres:
+    name: Backend (PostgreSQL 16 + pgvector, migrations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: scholara_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d scholara_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Two databases on one server. The migration chain is proved on one and the suite runs on the
+      # other, so a test that truncates or drops its schema cannot make a migration look correct.
+      ADMIN_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/scholara_ci
+      MIGRATION_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/scholara_migrate
+      SUITE_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/scholara_app
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # The whole suite runs in this job, so the test tooling is a real dependency of it.
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Create the migration database and the suite database
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import psycopg
+
+          admin = os.environ["ADMIN_DATABASE_URL"]
+          with psycopg.connect(admin, autocommit=True) as conn:
+              for name in ("scholara_migrate", "scholara_app"):
+                  exists = conn.execute(
+                      "select 1 from pg_database where datname = %s", (name,)).fetchone()
+                  if not exists:
+                      conn.execute(f'CREATE DATABASE "{name}"')
+                  print("database ready:", name)
+          PY
+
+      - name: Exactly one Alembic head, and it is the recovered head
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          # The graph is read from the revision files, not from a grep of `alembic history`: a
+          # grep can only ask whether an id appears somewhere, which a squashed, duplicated or
+          # disconnected history survives. This asserts the shape - one head, one root, the exact
+          # head, the published baseline reachable from it, and every recovered revision present.
+          # backend/tests/test_ci_gates.py drives the same check against mutated graphs.
+          python scripts/check_migration_graph.py \
+            --versions alembic/versions \
+            --expect-head "${EXPECTED_ALEMBIC_HEAD}" \
+            --baseline "${PUBLISHED_ALEMBIC_BASELINE}" \
+            --require b8c9d0e1f2a3 \
+            --require c9d0e1f2a3b4 \
+            --require d7e8f9a0b1c2 \
+            --require d9e0f1a2b3c4 \
+            --require e1f2a3b4c5d6 \
+            --require f2a3b4c5d6e7 \
+            --require a3b4c5d6e7f8 \
+            --require "${EXPECTED_ALEMBIC_HEAD}"
+          # The script reads files. Alembic's own view must agree, so ask it too: if the files
+          # and the installed metadata ever disagree, this is where that shows up.
+          heads="$(python -m alembic heads)"
+          printf '%s\n' "$heads"
+          test "$(printf '%s\n' "$heads" | grep -c '(head)')" -eq 1 \
+            || { echo "::error::alembic reports more than one head"; exit 1; }
+          test "$(printf '%s\n' "$heads" | awk 'NR==1 {print $1}')" = "${EXPECTED_ALEMBIC_HEAD}" \
+            || { echo "::error::alembic disagrees with EXPECTED_ALEMBIC_HEAD"; exit 1; }
+
+      - name: The migration database really is empty before the migration
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import psycopg
+
+          url = os.environ["DATABASE_URL"].replace("postgresql+psycopg", "postgresql")
+          with psycopg.connect(url) as conn:
+              tables = conn.execute(
+                  "select count(*) from information_schema.tables "
+                  "where table_schema = 'public'").fetchone()[0]
+          # A green "upgrade head" against a half-built database proves nothing.
+          assert tables == 0, f"the migration test must start from an empty database, found {tables} tables"
+          print("database is empty: migration will run from scratch")
+          PY
+
+      - name: Migrate an empty database to the recovered head
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+        run: python -m alembic upgrade head
+
+      - name: Recovered schema, pgvector and the revision row
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+          EXPECTED_HEAD: ${{ env.EXPECTED_ALEMBIC_HEAD }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import psycopg
+
+          url = os.environ["DATABASE_URL"].replace("postgresql+psycopg", "postgresql")
+          expected = os.environ["EXPECTED_HEAD"]
+          with psycopg.connect(url) as conn:
+              ext = conn.execute(
+                  "select count(*) from pg_extension where extname = 'vector'").fetchone()[0]
+              col = conn.execute(
+                  "select udt_name from information_schema.columns "
+                  "where table_name = 'knowledge_chunks' and column_name = 'embedding_vec'"
+              ).fetchone()
+              revisions = conn.execute(
+                  "select count(*), min(version_num) from alembic_version").fetchone()
+              tables = conn.execute(
+                  "select count(*) from information_schema.tables where table_schema = 'public'"
+              ).fetchone()[0]
+
+              # Named objects, not a row count: the count may legitimately change, these may not
+              # disappear. Each one is created by a recovered revision, so this is what proves the
+              # recovered chain ran rather than merely reached a version number.
+              tables_expected = ("catalogue_changes", "assistant_sessions",
+                                 "pending_object_deletions")
+              for table in tables_expected:
+                  assert conn.execute(
+                      "select count(*) from information_schema.tables "
+                      "where table_schema = 'public' and table_name = %s", (table,)
+                  ).fetchone()[0] == 1, f"recovered table {table} is missing"
+              columns_expected = (
+                  ("countries", "iso_code"), ("countries", "kind"),
+                  ("countries", "parent_country_id"), ("universities", "region_id"),
+                  ("knowledge_chunks", "provenance"), ("assistant_sessions", "context_json"),
+                  ("assistant_sessions", "context_revision"),
+                  ("appointments", "consent_contact"), ("event_registrations", "consent_contact"),
+                  ("assistant_conversations", "session_ref_id"),
+              )
+              for table, column in columns_expected:
+                  assert conn.execute(
+                      "select count(*) from information_schema.columns "
+                      "where table_name = %s and column_name = %s", (table, column)
+                  ).fetchone()[0] == 1, f"recovered column {table}.{column} is missing"
+              index = conn.execute(
+                  "select indexdef from pg_indexes "
+                  "where tablename = 'catalogue_changes' and indexname = 'uq_catalogue_changes_version'"
+              ).fetchone()
+              assert index is not None, "the unique catalogue change version index is missing"
+              assert "UNIQUE" in index[0].upper(), index[0]
+              for column in ("entity_type", "entity_id", "field_name", "version"):
+                  assert column in index[0], f"the unique index does not cover {column}: {index[0]}"
+              countries_unique = conn.execute(
+                  "select indexdef from pg_indexes "
+                  "where tablename = 'countries' and indexname = 'ix_countries_iso_code'").fetchone()
+              assert countries_unique is not None, "the unique countries.iso_code index is missing"
+
+          assert ext == 1, "pgvector extension is not installed"
+          assert col is not None and col[0] == "vector", f"embedding_vec is not a vector column: {col}"
+          assert revisions[0] == 1, f"alembic_version must hold exactly one row, found {revisions[0]}"
+          assert revisions[1] == expected, f"revision is {revisions[1]}, expected {expected}"
+          assert tables > 40, f"only {tables} tables after upgrade - the chain did not run"
+          print(f"pgvector ok, embedding_vec={col[0]}, tables={tables}, revision={revisions[1]}")
+          print("all recovered tables, columns and unique indexes are present")
+          PY
+
+      - name: Downgrade to the published baseline and upgrade again
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+          BASELINE: ${{ env.PUBLISHED_ALEMBIC_BASELINE }}
+          EXPECTED_HEAD: ${{ env.EXPECTED_ALEMBIC_HEAD }}
+        run: |
+          set -euo pipefail
+          # Exactly the seven recovered revisions are reversed here, so each one's downgrade() is
+          # exercised. `downgrade base` would not distinguish a broken recovered downgrade from a
+          # broken published one.
+          python -m alembic downgrade "${BASELINE}"
+          python - <<'PY'
+          import os
+          import psycopg
+
+          url = os.environ["DATABASE_URL"].replace("postgresql+psycopg", "postgresql")
+          with psycopg.connect(url) as conn:
+              revision = conn.execute(
+                  "select count(*), min(version_num) from alembic_version").fetchone()
+              tables = conn.execute(
+                  "select count(*) from information_schema.tables where table_schema = 'public'"
+              ).fetchone()[0]
+              for table in ("catalogue_changes", "assistant_sessions", "pending_object_deletions"):
+                  gone = conn.execute(
+                      "select count(*) from information_schema.tables "
+                      "where table_schema = 'public' and table_name = %s", (table,)
+                  ).fetchone()[0] == 0
+                  assert gone, f"{table} survived the downgrade to the published baseline"
+          assert revision[0] == 1, f"alembic_version has {revision[0]} rows after the downgrade"
+          assert revision[1] == os.environ["BASELINE"], f"revision is {revision[1]} after the downgrade"
+          print(f"downgraded cleanly to {revision[1]}, {tables} tables, recovered objects gone")
+          PY
+          python -m alembic upgrade head
+          python - <<'PY'
+          import os
+          import psycopg
+
+          url = os.environ["DATABASE_URL"].replace("postgresql+psycopg", "postgresql")
+          with psycopg.connect(url) as conn:
+              revision = conn.execute(
+                  "select count(*), min(version_num) from alembic_version").fetchone()
+              tables = conn.execute(
+                  "select count(*) from information_schema.tables where table_schema = 'public'"
+              ).fetchone()[0]
+          assert revision[0] == 1, f"alembic_version has {revision[0]} rows after the round trip"
+          assert revision[1] == os.environ["EXPECTED_HEAD"], f"revision is {revision[1]} after the round trip"
+          assert tables > 40, f"{tables} tables after the round trip"
+          print(f"round trip ok, revision={revision[1]}, tables={tables}")
+          PY
+
+      - name: The application serves requests with PostgreSQL as its database
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.MIGRATION_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          # No .env exists on a runner; everything comes from the job environment. Runs against the
+          # migrated database and before the suite, because the suite drops its own schema at
+          # teardown and this step is about the schema the migrations produce.
+          python - <<'PY'
+          import os
+
+          assert os.environ["DATABASE_URL"].startswith("postgresql"), "job must run against PostgreSQL"
+
+          from fastapi.testclient import TestClient
+
+          from app.main import app
+
+          with TestClient(app) as client:
+              live = client.get("/api/health/live")
+              ready = client.get("/api/health/ready")
+          assert live.status_code == 200, live.text
+          assert ready.status_code == 200, ready.text
+          body = ready.json()
+          print("live:", live.json())
+          print("ready:", body)
+          assert body.get("status") == "ready", f"readiness status: {body.get('status')}"
+          assert body.get("ready") is True, f"readiness reported not-ready: {body}"
+          assert body["checks"]["database"]["ok"] is True, f"database check: {body['checks']['database']}"
+          PY
+
+      - name: The whole suite on PostgreSQL cannot pass by skipping PostgreSQL tests
+        working-directory: backend
+        env:
+          SCHOLARA_TEST_DATABASE_URL: ${{ env.SUITE_DATABASE_URL }}
+          # The concurrency module builds its own schema and connects with this URL; the tests are
+          # in the suite run below as well, so this is the same server and the same database.
+          SCHOLARA_PG_URL: ${{ env.SUITE_DATABASE_URL }}
+          SCHOLARA_REQUIRE_PG_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: postgres-suite.json
+        run: |
+          set -uo pipefail
+          status=0
+          python -m pytest -rs > postgres-suite.log 2>&1 || status=$?
+          tail -n 60 postgres-suite.log
+          # This profile REQUIRES pg, so any skipped pg test is a failure here - and only the
+          # Redis-cache tests may skip, because this job has no Redis and backend-redis runs them
+          # under the same no-skip guard. The floor proves the pg tests were collected, not filtered.
+          python ../scripts/ci/pytest_gate.py postgres-suite.log \
+            --profile postgres \
+            --report postgres-suite.json \
+            --min-marked pg=40 \
+            --min-passed 1000
+          test "$status" -eq 0
+
+      - name: The PostgreSQL concurrency suite runs explicitly, and every test passes
+        working-directory: backend
+        env:
+          SCHOLARA_PG_URL: ${{ env.SUITE_DATABASE_URL }}
+          SCHOLARA_REQUIRE_PG_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: pg-concurrency.json
+        run: |
+          set -uo pipefail
+          # A suite that is not discovered is not a green suite: a renamed file, a marker
+          # expression or a path filter must fail here rather than pass silently.
+          #
+          # No `-q` here: pytest.ini already sets `addopts = -q`, and a second one takes pytest to
+          # -qq, which stops printing node ids and prints only a count line - the first hosted run
+          # of this workflow failed on exactly that, counting 0 tests in a suite that had 16.
+          python -m pytest tests/test_pg_concurrency.py --collect-only > collected.log 2>&1
+          head -n 3 collected.log
+          collected="$(grep -cE '^tests/[^ ]*::' collected.log || true)"
+          echo "collected ${collected} concurrency tests"
+          test "${collected}" -ge 16 \
+            || { echo "::error::the concurrency suite collected ${collected} tests, expected at least 16"; exit 1; }
+          status=0
+          python -m pytest tests/test_pg_concurrency.py -rs > pg-concurrency.log 2>&1 || status=$?
+          tail -n 30 pg-concurrency.log
+          # --min-passed is the collected count, so a test that is collected and then skips or
+          # vanishes fails the step instead of shrinking the run.
+          # strict: this step exists to execute these tests, so not one of them may skip.
+          python ../scripts/ci/pytest_gate.py pg-concurrency.log \
+            --profile strict \
+            --report pg-concurrency.json \
+            --min-passed "${collected}"
+          test "$status" -eq 0
+
+  backend-redis:
+    name: Backend (Redis cache, Redis-required suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/0
+      # The live-cache tests read this name; the suite must never inherit a developer's real
+      # Upstash URL, so it is set from the service here and nowhere else.
+      SCHOLARA_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Redis answers before anything is asserted about it
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import redis
+
+          client = redis.Redis.from_url(os.environ["SCHOLARA_REDIS_URL"])
+          assert client.ping() is True, "redis did not answer PING"
+          info = client.info("server")
+          print("redis ok:", info.get("redis_version"), info.get("redis_mode"))
+          PY
+
+      - name: The cache is backed by Redis and shared between processes
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          from app.core import cache as cache_module
+
+          cache_module.settings.redis_url = os.environ["REDIS_URL"]
+          first = cache_module.Cache()
+          second = cache_module.Cache()
+          # A silent fallback would make this pass while proving nothing, so assert the backend.
+          assert first.backend == "redis", f"cache fell back to {first.backend}: {first.last_error}"
+          assert second.backend == "redis", f"second client fell back to {second.backend}"
+
+          # The published Cache facade is the contract: set(key, value, ttl=), incr_with_ttl,
+          # get_json/set_json and invalidate_prefix. Verifying the facade is the point - a test
+          # written against redis-py directly would prove nothing about the application.
+          first.set("ci:probe", "1", ttl=30)
+          assert second.get("ci:probe") == "1", "cache state is not shared between clients"
+          assert first.ping() is True
+
+          live_first, ttl_first = second.incr_with_ttl("ci:counter", 60)
+          live_second, _ = first.incr_with_ttl("ci:counter", 60)
+          assert (live_first, live_second) == (1, 2), f"counters are not shared: {live_first}, {live_second}"
+          assert ttl_first > 0, "the counter TTL was not applied"
+
+          first.set_json("ci:doc", {"job": "ci", "n": 2}, ttl=30)
+          assert second.get_json("ci:doc") == {"job": "ci", "n": 2}, "JSON round trip failed"
+
+          removed = first.invalidate_prefix("ci:")
+          assert removed >= 2, f"invalidate_prefix removed {removed} keys"
+          assert second.get("ci:probe") is None and second.get_json("ci:doc") is None
+
+          print("redis-backed cache ok:", first.backend, first.url_summary)
+          PY
+
+      - name: The whole suite cannot pass by skipping Redis tests
+        working-directory: backend
+        env:
+          SCHOLARA_REQUIRE_REDIS_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: redis-suite.json
+        run: |
+          set -uo pipefail
+          status=0
+          python -m pytest -rs > redis-suite.log 2>&1 || status=$?
+          tail -n 60 redis-suite.log
+          # This profile REQUIRES redis_live, so any skipped Redis test is a failure here - and
+          # only the PostgreSQL tests may skip, because this job has no PostgreSQL and
+          # backend-postgres runs them under the same no-skip guard.
+          python ../scripts/ci/pytest_gate.py redis-suite.log \
+            --profile redis \
+            --report redis-suite.json \
+            --min-marked redis_live=9 \
+            --min-passed 1000
+          test "$status" -eq 0
+
+      - name: The live Redis suite runs explicitly, and every test passes
+        working-directory: backend
+        env:
+          SCHOLARA_REQUIRE_REDIS_TESTS: "1"
+          SCHOLARA_PYTEST_JSON: redis-live.json
+        run: |
+          set -uo pipefail
+          # See the note in backend-postgres: pytest.ini's addopts already carries `-q`, so a
+          # second one hides the node ids this count is built from.
+          python -m pytest tests/test_redis_live.py --collect-only > collected.log 2>&1
+          head -n 3 collected.log
+          collected="$(grep -cE '^tests/[^ ]*::' collected.log || true)"
+          echo "collected ${collected} live Redis tests"
+          test "${collected}" -ge 9 \
+            || { echo "::error::the live Redis suite collected ${collected} tests, expected at least 9"; exit 1; }
+          status=0
+          python -m pytest tests/test_redis_live.py -rs > redis-live.log 2>&1 || status=$?
+          tail -n 30 redis-live.log
+          # strict: this step exists to execute these tests, so not one of them may skip.
+          python ../scripts/ci/pytest_gate.py redis-live.log \
+            --profile strict \
+            --report redis-live.json \
+            --min-passed "${collected}"
+          test "$status" -eq 0
+
+  frontend:
+    name: Frontend (tests, types)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: TypeScript
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Tests
+        working-directory: frontend
+        run: |
+          set -uo pipefail
+          status=0
+          npm test > frontend-tests.log 2>&1 || status=$?
+          tail -n 30 frontend-tests.log
+          # `node --test` reports TAP counts; asserting them is what distinguishes "the tests ran
+          # and passed" from "the command happened to exit 0 with nothing collected".
+          python - <<'PY'
+          import re
+
+          text = open("frontend-tests.log", encoding="utf-8", errors="replace").read()
+          def count(label: str) -> int:
+              found = re.findall(rf"^# {label} (\d+)$", text, re.MULTILINE)
+              assert found, f"the test output has no '# {label}' line"
+              return int(found[-1])
+
+          passed, failed, skipped = count("pass"), count("fail"), count("skipped")
+          print(f"frontend: {passed} passed, {failed} failed, {skipped} skipped")
+          assert failed == 0, f"{failed} frontend tests failed"
+          assert skipped == 0, f"{skipped} frontend tests were skipped"
+          assert passed >= 70, f"only {passed} frontend tests passed, expected at least 70"
+          PY
+          test "$status" -eq 0
+
+  repository-policy:
+    name: Repository policy (docs/ and .env* exclusion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # the guard inspects commits, so the history has to be present
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: No prohibited path in the tree, the index, or the ignore rules
+        run: python3 scripts/policy-check.py
+
+      - name: No prohibited path introduced by the commits in this change
+        env:
+          # Both values come from the event payload, never from a shell expansion: for a pull
+          # request the trusted base is `base.sha` (which also works for a fork, where `before` is
+          # empty), and for a push it is `before`. Either is validated before Git sees it.
+          EVENT_BEFORE: ${{ github.event.before }}
+          PULL_REQUEST_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          base=""
+          for candidate in "${PULL_REQUEST_BASE:-}" "${EVENT_BEFORE:-}"; do
+            case "$candidate" in
+              ''|0000000000000000000000000000000000000000) continue;;
+              *[!0-9a-f]*) echo "ignoring a non-hexadecimal event SHA"; continue;;
+            esac
+            if git cat-file -e "${candidate}^{commit}" 2>/dev/null; then
+              base="$candidate"; break
+            fi
+            echo "event SHA ${candidate} is not in this checkout; falling back"
+          done
+          if [ -z "$base" ]; then
+            # Never turn a missing range into a silent pass: the documented fallback is the
+            # publication commit, which still checks every commit this change adds.
+            echo "no usable event base; using the policy baseline ${POLICY_BASELINE}"
+            base="$POLICY_BASELINE"
+          fi
+          echo "checking ${base}..HEAD"
+          python3 scripts/policy-check.py --range "${base}..HEAD"
+
+      - name: The guard fails when it must (mutation test)
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+          git init -q -b main .
+          git config user.email "ci@example.invalid"
+          git config user.name "CI"
+          printf 'baseline\n' > README.md
+          git add -- README.md
+          git commit -qm base
+          mkdir -p docs
+          printf 'leak\n' > docs/private.md
+          git add -- docs/private.md
+          git commit -qm "introduce a prohibited path"
+          git rm -q -- docs/private.md
+          git commit -qm "delete it again"
+
+          # The net diff of this history is empty, so only a per-commit scan can catch it.
+          set +e
+          out="$(python3 "$GITHUB_WORKSPACE/scripts/policy-check.py" --all-commits 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$out"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the guard passed a history that introduced docs/private.md"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q "no prohibited path in any commit reachable from HEAD" || {
+            echo "::error::the guard failed for an unexpected reason"; exit 1; }
+          printf '%s\n' "$out" | grep -q "docs/private.md" || {
+            echo "::error::the guard did not name the offending path"; exit 1; }
+          echo "mutation test ok: the guard rejected the introduced path"
+
+      - name: The pytest gate fails when it must (mutation test)
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          # A run that skipped a required test for an unrelated reason must not be accepted.
+          printf 'SKIPPED [1] tests/test_x.py:5: not implemented yet\n40 passed, 1 skipped in 1.00s\n' > "$work/bad.log"
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/bad.log" \
+            --profile sqlite --min-passed 10 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the pytest gate accepted a suite that skipped a test for an unexpected reason"
+            exit 1
+          fi
+          # And a collection that silently yields nothing must not pass either.
+          printf '0 passed in 0.01s\n' > "$work/empty.log"
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/empty.log" \
+            --profile strict --min-passed 16 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the pytest gate accepted a run with no passing tests"
+            exit 1
+          fi
+          # A skip line the parser cannot read must not quietly remove itself from the policy.
+          printf 'SKIPPED [1] tests/test_x.py: in the wrong shape\n40 passed, 1 skipped in 1.00s\n' > "$work/unparsed.log"
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/ci/pytest_gate.py" "$work/unparsed.log" \
+            --profile sqlite --min-passed 10 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the pytest gate ignored a skip line it could not parse"
+            exit 1
+          fi
+          echo "mutation test ok: the pytest gate rejects all three failure modes"

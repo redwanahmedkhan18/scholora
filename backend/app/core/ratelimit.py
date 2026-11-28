@@ -6,6 +6,7 @@ appointment booking, the assistant, and admin login.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 import secrets
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.cache import cache
 from app.core.config import settings
+
+#: Methods that only read. These, and only these, can be excused by the internal token: they are
+#: what the site's build and rendering do, and throttling them bakes a 404 page into a real URL.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,9 @@ RULES: list[Rule] = [
     Rule(re.compile(r"/api/v1/appointments$"), 6, 3600, ("POST",), "appointments"),
     Rule(re.compile(r"/api/v1/events/register$"), 10, 3600, ("POST",), "event_register"),
     Rule(re.compile(r"/api/v1/assistant/ask$"), 30, 3600, ("POST",), "assistant"),
+    # Session issuance is anonymous and writes a row; normal questions use the separate
+    # rule above, so this cannot throttle conversation.
+    Rule(re.compile(r"/api/v1/assistant/session$"), 10, 60, ("POST",), "assistant_session"),
     Rule(re.compile(r"/api/v1/brochures/generate$"), 20, 3600, ("POST",), "brochure"),
     Rule(re.compile(r"/api/v1/(match|eligibility)/"), 60, 3600, ("POST",), "engines"),
     Rule(re.compile(r"/api/v1/documents/"), 40, 3600, ("POST", "PUT", "DELETE"), "documents"),
@@ -46,20 +54,61 @@ RULES: list[Rule] = [
     # its own small bucket: a stolen session must not be able to use the mailbox as a weapon.
     Rule(re.compile(r"/api/v1/admin/config/test/"), 10, 300, ("POST",), "config_test"),
     Rule(re.compile(r"/api/v1/track$"), 600, 3600, ("POST",), "track"),
+    # The conversion relay is server-to-server (it requires the internal token), so this is not
+    # the only control on it - but a dedicated bucket keeps any attempt to guess that token, or a
+    # misconfigured caller looping, away from the 300/60s public budget. First match wins, so it
+    # must sit above the catch-all.
+    Rule(re.compile(r"/api/v1/marketing/conversion$"), 60, 3600, ("POST",), "conversion"),
     Rule(re.compile(r"/api/v1/admin/"), 600, 60, name="admin"),
     Rule(re.compile(r"/api/v1/"), 300, 60, name="public"),
 ]
 
 
+def _address(value: str):
+    try:
+        return ipaddress.ip_address((value or "").strip().strip("[]"))
+    except ValueError:
+        return None
+
+
 def client_key(request: Request) -> str:
-    """Prefer the proxy-forwarded client IP; fall back to the socket peer."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    real = request.headers.get("x-real-ip")
-    if real:
-        return real.strip()
-    return request.client.host if request.client else "unknown"
+    """The rate-limit identity: direct peer by default, forwarded only through a trusted proxy.
+
+    ``X-Forwarded-For`` is client-controlled. It is honoured only when the immediate ASGI
+    peer is inside ``TRUSTED_PROXIES``. The chain is walked from the trusted connection side
+    and stops at the first untrusted hop, so a leftmost value cannot be spoofed. ``X-Real-IP``
+    and ``Forwarded`` are ignored: there is no separate trust policy for them.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not (settings.trusted_proxies or "").strip():
+        return peer
+    try:
+        networks = settings.trusted_proxy_networks
+    except Exception:
+        # Startup validation rejects this; at request time fail closed to the direct peer.
+        return peer
+    peer_ip = _address(peer)
+    if peer_ip is None or not any(peer_ip in net for net in networks):
+        return peer
+
+    values = request.headers.getlist("x-forwarded-for")
+    # Duplicate headers make the chain ambiguous; only a single proxy-provided header is trusted.
+    if len(values) != 1 or not values[0].strip():
+        return peer
+    forwarded = values[0]
+    hops = [part.strip() for part in forwarded.split(",")]
+    if not hops or any(not hop for hop in hops):
+        return peer
+    parsed = [_address(hop) for hop in hops]
+    if any(address is None for address in parsed):
+        return peer
+
+    current = peer_ip
+    for candidate in reversed(parsed):
+        if not any(current in net for net in networks):
+            break
+        current = candidate
+    return str(current)
 
 
 def match_rule(path: str, method: str) -> Optional[Rule]:
@@ -83,9 +132,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # a 429 mid-build silently bakes a 404 page for a real university. A shared secret
         # exempts it. Public traffic never carries this header: the browser talks to the
         # Next.js proxy, which does not forward it.
+        #
+        # The exemption is limited to reads (F-3). It used to cover every method, so one secret
+        # meant both "save the build" and "unthrottled everywhere": 65 authenticated conversion
+        # calls produced no 429 at all, while the rule written for that endpoint is 60/hour. The
+        # build only ever reads - every server-side call is a GET - so a write carrying this
+        # header is throttled exactly like any other write. A token holder therefore cannot use
+        # the relay to inflate conversions past the budget the rule sets for it, and the
+        # exemption no longer doubles as a master key for the write endpoints.
         token = (settings.internal_api_token or "").strip()
-        if token and secrets.compare_digest(
-                (request.headers.get("x-internal-token") or "").strip(), token):
+        if (token and request.method in SAFE_METHODS
+                and secrets.compare_digest(
+                    (request.headers.get("x-internal-token") or "").strip(), token)):
             return await call_next(request)
 
         rule = match_rule(path, request.method)

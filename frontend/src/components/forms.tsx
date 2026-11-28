@@ -125,6 +125,51 @@ function Options({ items }: { items: Option[] }) {
   );
 }
 
+/**
+ * The explicit contact-consent control.
+ *
+ * Deliberately uncontrolled by default and never pre-ticked: submitting a form, typing a phone
+ * number or accepting unrelated terms is not permission to be contacted, so the only way this
+ * becomes `true` is the visitor actively ticking it. The message is the product's existing
+ * wording, shared with the Zod schema so the client and the API agree.
+ */
+function ConsentCheckbox({
+  id,
+  label,
+  checked,
+  onChange,
+  error,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  error?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-start gap-2.5">
+        <Checkbox
+          id={id}
+          checked={checked}
+          aria-invalid={!!error}
+          aria-describedby={error ? `${id}-error` : undefined}
+          onCheckedChange={(v) => onChange(v === true)}
+          className="mt-0.5"
+        />
+        <label htmlFor={id} className="text-sm leading-snug text-slate-700">
+          {label}
+        </label>
+      </div>
+      {error && (
+        <p id={`${id}-error`} role="alert" className="text-[11px] font-semibold text-rose-700">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function LeadForm({
   countries,
   settings,
@@ -161,7 +206,7 @@ export function LeadForm({
       interest_subject: "",
       intake: "",
       message: "",
-      consent_contact: true,
+      consent_contact: false,
     },
   });
 
@@ -172,7 +217,6 @@ export function LeadForm({
     try {
       const data = await post("/api/v1/leads", {
         ...compact(values),
-        consent_contact: true,
         source,
         utm: storedUtm(),
         page_path: window.location.pathname,
@@ -264,26 +308,13 @@ export function LeadForm({
         />
       </Field>
 
-      <div className="space-y-1">
-        <div className="flex items-start gap-2.5">
-          <Checkbox
-            id="consent_contact"
-            checked={!!consent}
-            onCheckedChange={(v) =>
-              setValue("consent_contact", (v === true) as true, { shouldValidate: true })
-            }
-            className="mt-0.5"
-          />
-          <label htmlFor="consent_contact" className="text-sm leading-snug text-slate-700">
-            I agree to be contacted about my enquiry on WhatsApp, phone or email.
-          </label>
-        </div>
-        {errors.consent_contact && (
-          <p role="alert" className="text-[11px] font-semibold text-rose-700">
-            {errors.consent_contact.message}
-          </p>
-        )}
-      </div>
+      <ConsentCheckbox
+        id="consent_contact"
+        label="I agree to be contacted about my enquiry on WhatsApp, phone or email."
+        checked={!!consent}
+        onChange={(v) => setValue("consent_contact", v as true, { shouldValidate: true })}
+        error={errors.consent_contact?.message}
+      />
 
       <FormError message={submitError} />
 
@@ -327,6 +358,8 @@ export function AppointmentForm({ settings }: { settings: Dict }) {
   const {
     register,
     handleSubmit,
+    setValue,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<AppointmentValues>({
     resolver: zodResolver(appointmentSchema) as Resolver<AppointmentValues>,
@@ -340,8 +373,11 @@ export function AppointmentForm({ settings }: { settings: Dict }) {
       scheduled_time: slots[0]?.value ?? "",
       mode: modes[0]?.value ?? "",
       notes: "",
+      consent_contact: false,
     },
   });
+
+  const consent = watch("consent_contact");
 
   const onSubmit = handleSubmit(async (values) => {
     setSubmitError("");
@@ -427,6 +463,14 @@ export function AppointmentForm({ settings }: { settings: Dict }) {
         <Textarea {...register("notes")} className="min-h-20" />
       </Field>
 
+      <ConsentCheckbox
+        id="appointment_consent_contact"
+        label="I agree to be contacted about this booking on WhatsApp, phone or email."
+        checked={!!consent}
+        onChange={(v) => setValue("consent_contact", v as true, { shouldValidate: true })}
+        error={errors.consent_contact?.message}
+      />
+
       <FormError message={submitError} />
 
       <Button type="submit" size="lg" disabled={isSubmitting}>
@@ -447,12 +491,23 @@ export function EventRegister({ event, countries, degreeLevels = [] }:
   const {
     register,
     handleSubmit,
+    setValue,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<EventRegistrationValues>({
     resolver: zodResolver(eventRegistrationSchema) as Resolver<EventRegistrationValues>,
     mode: "onBlur",
-    defaultValues: { full_name: "", phone: "", email: "", preferred_country: "", degree_level: "MASTER" },
+    defaultValues: {
+      full_name: "",
+      phone: "",
+      email: "",
+      preferred_country: "",
+      degree_level: "MASTER",
+      consent_contact: false,
+    },
   });
+
+  const consent = watch("consent_contact");
 
   const onSubmit = handleSubmit(async (values) => {
     setSubmitError("");
@@ -524,6 +579,14 @@ export function EventRegister({ event, countries, degreeLevels = [] }:
           </select>
         </Field>
       </div>
+
+      <ConsentCheckbox
+        id="event_consent_contact"
+        label="I agree to be contacted about this event on WhatsApp, phone or email."
+        checked={!!consent}
+        onChange={(v) => setValue("consent_contact", v as true, { shouldValidate: true })}
+        error={errors.consent_contact?.message}
+      />
 
       <FormError message={submitError} />
 

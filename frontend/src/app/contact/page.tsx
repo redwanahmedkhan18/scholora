@@ -5,6 +5,7 @@ import { contactFromSettings, mailtoHref, safeExternalHref, telHref } from "@/li
 import { LeadForm } from "@/components/forms";
 import { FacebookPanel } from "@/components/site-chrome";
 import { PageHeader } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 300;
 type Dict = Record<string, any>;
@@ -57,7 +58,7 @@ export default async function ContactPage() {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
       <PageHeader eyebrow="Contact" title="Talk to a counselor in Uttara"
         description="Pick whichever channel suits you. Whatever you use, your enquiry lands on the same record, so you never have to repeat yourself." />
 

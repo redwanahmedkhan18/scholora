@@ -218,6 +218,8 @@ export function DataWorkbench() {
       </Panel>
 
       <VerificationQueue />
+      <ChangeQueue />
+      <IntegrityPanel />
     </div>
   );
 }
@@ -421,6 +423,157 @@ function VerificationQueue() {
                         </button>
                       </div>
                     </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+/* ================================================ pending catalogue changes */
+const CLASS_TONE: Dict = {
+  MATERIAL: "bg-amber-100 text-amber-900",
+  SUSPICIOUS: "bg-rose-100 text-rose-800",
+};
+
+function ChangeQueue() {
+  const { data, error, loading, reload } = useResource<Dict>("/verification/changes?status=PENDING");
+  const [busy, setBusy] = useState(0);
+  const [note, setNote] = useState<Dict>({});
+  const [msg, setMsg] = useState("");
+
+  const decide = async (id: number, status: "APPROVED" | "REJECTED") => {
+    const reason = (note[id] ?? "").trim();
+    if (status === "REJECTED" && !reason) {
+      setMsg("A rejection needs a reason: say why the new value is not acceptable.");
+      return;
+    }
+    setBusy(id);
+    setMsg("");
+    try {
+      await adminFetch(`/verification/changes/${id}/decide`, {
+        method: "POST", body: JSON.stringify({ status, note: reason }),
+      });
+      await reload();
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : "Could not record that decision.");
+    } finally { setBusy(0); }
+  };
+
+  return (
+    <Panel
+      title="Pending catalogue changes"
+      hint="A new value from a source, waiting for a decision. Approving records the evidence; it does not by itself mark the field verified."
+    >
+      {error && <p className="text-xs text-rose-700">{error}</p>}
+      {loading && <p className="py-6 text-center text-xs text-slate-500">Loading…</p>}
+      {msg && <p className="mb-2 text-xs font-semibold text-rose-700">{msg}</p>}
+      {data && (
+        (data.items ?? []).length === 0 ? (
+          <p className="py-4 text-center text-[11px] text-slate-500">
+            No changes are waiting. A change appears when an import proposes a different value.
+          </p>
+        ) : (
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full text-left text-[11px]">
+              <thead className="sticky top-0 bg-slate-50 text-[10px] uppercase tracking-wide text-slate-500">
+                <tr><th className="p-1.5">Record</th><th>Field</th><th>Was</th><th>Now</th><th>Class</th><th>Source</th><th>Decision</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {(data.items ?? []).map((c: Dict) => (
+                  <tr key={c.id}>
+                    <td className="p-1.5 text-slate-600">{c.entity_type} #{c.entity_id}<span className="ml-1 text-[10px] text-slate-400">v{c.version}</span></td>
+                    <td className="font-semibold text-slate-800">{c.field_name}</td>
+                    <td className="max-w-[10rem] truncate text-slate-500">{c.previous_value ?? "—"}</td>
+                    <td className="max-w-[10rem] truncate text-slate-900">{c.new_value ?? "—"}</td>
+                    <td><span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${CLASS_TONE[c.classification] ?? "bg-slate-100"}`}>{c.classification}</span></td>
+                    <td className="max-w-[14rem] truncate">
+                      {c.source_url
+                        ? <a href={c.source_url} target="_blank" rel="noopener noreferrer nofollow"
+                            className="text-brand-800 hover:underline">{c.source_url}</a>
+                        : <span className="text-rose-600">none</span>}
+                    </td>
+                    <td>
+                      <div className="flex flex-col gap-1">
+                        <input className="w-40 rounded border border-slate-300 px-1 py-0.5 text-[10px]"
+                          placeholder="reason (required to reject)"
+                          value={note[c.id] ?? ""}
+                          onChange={(e) => setNote({ ...note, [c.id]: e.target.value })} />
+                        <div className="flex gap-1">
+                          <button type="button" disabled={busy === c.id} onClick={() => decide(c.id, "APPROVED")}
+                            className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white hover:bg-emerald-500">
+                            approve
+                          </button>
+                          <button type="button" disabled={busy === c.id} onClick={() => decide(c.id, "REJECTED")}
+                            className="rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-bold text-white hover:bg-rose-500">
+                            reject
+                          </button>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+    </Panel>
+  );
+}
+
+/* ================================================== catalogue integrity */
+function IntegrityPanel() {
+  const { data, error, loading } = useResource<Dict>("/catalogue/integrity");
+
+  return (
+    <Panel
+      title="Catalogue integrity"
+      hint="Structural problems only. Passing every check does not make a figure official — that still needs a source and a reviewer."
+    >
+      {error && <p className="text-xs text-rose-700">{error}</p>}
+      {loading && <p className="py-6 text-center text-xs text-slate-500">Checking…</p>}
+      {data && (
+        <>
+          <div className="mb-3 flex flex-wrap gap-1.5">
+            <span className="rounded bg-slate-900 px-2 py-0.5 text-[10px] font-bold text-white">
+              {data.total_findings} finding(s)
+            </span>
+            <span className="rounded bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-800">
+              {data.critical_or_high} high
+            </span>
+            {Object.entries(data.counts ?? {}).filter(([, v]) => (v as number) > 0).map(([k, v]) => (
+              <span key={k} className="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-700">
+                {k} {v as number}
+              </span>
+            ))}
+          </div>
+          {(data.truncated ?? []).length > 0 && (
+            <p className="mb-2 text-[10px] text-amber-800">
+              Bounded sample: {(data.truncated ?? []).join("; ")}
+            </p>
+          )}
+          <div className="max-h-72 overflow-auto">
+            <table className="w-full text-left text-[11px]">
+              <thead className="sticky top-0 bg-slate-50 text-[10px] uppercase tracking-wide text-slate-500">
+                <tr><th className="p-1.5">Severity</th><th>Category</th><th>Record</th><th>Detail</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {(data.findings ?? []).slice(0, 60).map((f: Dict, i: number) => (
+                  <tr key={`${f.category}-${f.entity_type}-${f.entity_id}-${i}`}>
+                    <td className="p-1.5">
+                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                        f.severity === "HIGH" || f.severity === "CRITICAL" ? "bg-rose-100 text-rose-800"
+                          : f.severity === "MEDIUM" ? "bg-amber-100 text-amber-900"
+                            : "bg-slate-100 text-slate-600"}`}>{f.severity}</span>
+                    </td>
+                    <td className="font-semibold text-slate-800">{f.category}</td>
+                    <td className="text-slate-600">{f.entity_type} #{f.entity_id ?? "—"}</td>
+                    <td className="max-w-[24rem] truncate text-slate-700">{f.detail}</td>
                   </tr>
                 ))}
               </tbody>

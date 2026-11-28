@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
@@ -49,11 +49,27 @@ from app.models.education import (
     Scholarship,
     University,
 )
+from app.services import destinations as destinations_service
 from app.services import fx, rotation
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["public"])
+
+
+def _destination_scope(db: Session, country: str):
+    """SQL predicate selecting the institutions a destination query should see.
+
+    Resolved through the destination catalogue, so "UK", "United Kingdom" and "Scotland" all
+    work: a country keeps everything physically inside it (including its regions), while a
+    region returns only its own institutions. An unknown name selects nothing rather than
+    silently falling back to every country.
+    """
+    target = destinations_service.resolve_destination(db, country)
+    if target is None:
+        return false()
+    scope = destinations_service.university_scope(db, target)
+    return scope if scope is not None else false()
 
 
 # ----------------------------------------------------------------- settings
@@ -175,22 +191,50 @@ def get_vocabularies():
 
 # ----------------------------------------------------------------- homepage
 def _country_counts(db: Session) -> Dict[int, Dict[str, int]]:
+    """Record tallies per destination row.
+
+    A region is counted on its own (universities carry ``region_id``) and its totals are added
+    to the parent country, so "United Kingdom" never appears to have lost its Scottish rows. A
+    destination with no records reports zero rather than being hidden.
+    """
     uni = dict(db.execute(select(University.country_id, func.count(University.id))
                           .group_by(University.country_id)).all())
     prog = dict(db.execute(select(University.country_id, func.count(Program.id))
                            .join(Program, Program.university_id == University.id)
                            .group_by(University.country_id)).all())
+    regions = dict(db.execute(select(Country.id, Country.parent_country_id)
+                              .where(Country.parent_country_id.is_not(None))).all())
+    in_region_uni = dict(db.execute(select(University.region_id, func.count(University.id))
+                                    .where(University.region_id.is_not(None))
+                                    .group_by(University.region_id)).all())
+    in_region_prog = dict(db.execute(select(University.region_id, func.count(Program.id))
+                                     .join(Program, Program.university_id == University.id)
+                                     .where(University.region_id.is_not(None))
+                                     .group_by(University.region_id)).all())
+    for region_id, parent_id in regions.items():
+        if parent_id is None:
+            continue
+        uni[region_id] = in_region_uni.get(region_id, 0)
+        prog[region_id] = in_region_prog.get(region_id, 0)
+        uni[parent_id] = uni.get(parent_id, 0) + uni[region_id]
+        prog[parent_id] = prog.get(parent_id, 0) + prog[region_id]
     schol = dict(db.execute(select(Scholarship.country_id, func.count(Scholarship.id))
                             .group_by(Scholarship.country_id)).all())
     story = dict(db.execute(select(SuccessStory.country_id, func.count(SuccessStory.id))
                             .where(SuccessStory.is_published.is_(True))
                             .group_by(SuccessStory.country_id)).all())
     out: Dict[int, Dict[str, int]] = {}
-    for cid in set(list(uni) + list(prog) + list(schol) + list(story)):
+    for cid in set(list(uni) + list(prog) + list(schol) + list(story)) | set(regions):
         if cid is None:
             continue
         out[cid] = {"universities": uni.get(cid, 0), "programs": prog.get(cid, 0),
                     "scholarships": schol.get(cid, 0), "success_stories": story.get(cid, 0)}
+    # A destination with no records still reports zero counts. A missing key would let the UI
+    # render "no data" as if the country were not supported; the approved record exists, and
+    # its empty coverage is a fact to show, not a gap to hide.
+    for cid in db.execute(select(Country.id)).scalars():
+        out.setdefault(cid, {"universities": 0, "programs": 0,
+                             "scholarships": 0, "success_stories": 0})
     return out
 
 
@@ -279,15 +323,36 @@ def site_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 # ----------------------------------------------------------------- countries
 @router.get("/countries")
-def list_countries(status: Optional[str] = None, featured: Optional[bool] = None, db: Session = Depends(get_db)):
+def list_countries(status: Optional[str] = None, featured: Optional[bool] = None,
+                   include_regions: bool = True, db: Session = Depends(get_db)):
+    """Study destinations. Sovereign countries first, with their regions nested inside them.
+
+    A region is never returned as a top-level country: Scotland appears in
+    ``United Kingdom.regions``, which is what keeps the destination list at 17 countries plus
+    the regions inside them.
+    """
     stmt = select(Country)
     if status:
         stmt = stmt.where(Country.status == status.upper())
     if featured is not None:
         stmt = stmt.where(Country.is_featured.is_(featured))
+    stmt = stmt.where(Country.parent_country_id.is_(None))
     rows = db.execute(stmt.order_by(Country.priority, Country.name)).scalars().all()
     counts = _country_counts(db)
-    return [S.country(c, counts.get(c.id)) for c in rows]
+    items = [S.country(c, counts.get(c.id)) for c in rows]
+    if include_regions:
+        regions = db.execute(select(Country).where(Country.parent_country_id.is_not(None))
+                             .order_by(Country.name)).scalars().all()
+        by_parent: Dict[int, List[Dict[str, Any]]] = {}
+        for region in regions:
+            if region.parent_country_id is None:
+                continue
+            by_parent.setdefault(region.parent_country_id, []).append(
+                S.country(region, counts.get(region.id))
+            )
+        for item in items:
+            item["regions"] = by_parent.get(item["id"], [])
+    return items
 
 
 @router.get("/countries/{slug}")
@@ -296,16 +361,24 @@ def country_detail(slug: str, db: Session = Depends(get_db)):
     if not c:
         raise HTTPException(404, "Country not found")
     counts = _country_counts(db).get(c.id, {})
+    # A region (Scotland) has no institutions of its own by country_id: its universities still
+    # belong to the sovereign country, with region_id pointing back. Scope the page through the
+    # destination rules so a Scotland page shows Scottish institutions and nothing else.
+    uni_scope = destinations_service.university_scope(db, c)
+    scoped_uni_ids = destinations_service.universities_in(db, c)
+    family_ids = destinations_service.family_ids(db, c)
     unis = db.execute(select(University).options(selectinload(University.country), selectinload(University.rankings))
-                      .where(University.country_id == c.id, University.is_published.is_(True))
-                      .order_by(University.priority).limit(24)).scalars().unique().all()
+                      .where(uni_scope, University.is_published.is_(True))
+                      .order_by(University.priority).limit(24)).scalars().unique().all() if uni_scope is not None else []
     prog_counts = dict(db.execute(select(Program.university_id, func.count(Program.id))
                                   .group_by(Program.university_id)).all())
     programs = db.execute(select(Program).options(selectinload(Program.university).selectinload(University.country),
                                                   selectinload(Program.intakes), selectinload(Program.requirement))
-                          .join(University).where(University.country_id == c.id).limit(12)).scalars().unique().all()
+                          .join(University, Program.university_id == University.id)
+                          .where(uni_scope).limit(12)).scalars().unique().all() if uni_scope is not None else []
     schols = db.execute(select(Scholarship).options(selectinload(Scholarship.country), selectinload(Scholarship.university))
-                        .where(Scholarship.country_id == c.id).limit(12)).scalars().unique().all()
+                        .where(or_(Scholarship.country_id.in_(family_ids),
+                                   Scholarship.university_id.in_(scoped_uni_ids))).limit(12)).scalars().unique().all()
     stories = db.execute(select(SuccessStory).where(SuccessStory.country_id == c.id,
                                                     SuccessStory.is_published.is_(True)).limit(6)).scalars().all()
     events = db.execute(select(Event).where(Event.country_id == c.id).order_by(Event.start_at).limit(4)).scalars().all()
@@ -333,8 +406,9 @@ def list_universities(q: Optional[str] = None, country: Optional[str] = None, ci
     if q:
         stmt = stmt.where(or_(University.name.ilike(f"%{q}%"), University.city.ilike(f"%{q}%")))
     if country:
-        stmt = stmt.join(Country, University.country_id == Country.id).where(
-            or_(Country.slug == country.lower(), Country.name.ilike(country), Country.iso2 == country.upper()))
+        # Country-wide includes its regions (Scotland stays in a United Kingdom list); a region
+        # excludes the rest of the country. Resolved through the same catalogue as the assistant.
+        stmt = stmt.where(_destination_scope(db, country))
     if city:
         stmt = stmt.where(University.city.ilike(f"%{city}%"))
     if featured is not None:
@@ -442,7 +516,7 @@ def list_faculties(university: Optional[str] = None, country: Optional[str] = No
     if university:
         stmt = stmt.where(University.slug == university)
     if country:
-        stmt = stmt.join(Country, Country.id == University.country_id).where(Country.slug == country)
+        stmt = stmt.where(_destination_scope(db, country))
     if kind:
         stmt = stmt.where(Faculty.kind == kind.upper())
     if q:
@@ -517,8 +591,7 @@ def list_programs(q: Optional[str] = None, country: Optional[str] = None, degree
     if country or university:
         stmt = stmt.join(University, Program.university_id == University.id)
         if country:
-            stmt = stmt.join(Country, University.country_id == Country.id).where(
-                or_(Country.slug == country.lower(), Country.name.ilike(country)))
+            stmt = stmt.where(_destination_scope(db, country))
         if university:
             stmt = stmt.where(or_(University.slug == university, University.name.ilike(f"%{university}%")))
     if intake:
@@ -585,8 +658,16 @@ def list_scholarships(q: Optional[str] = None, country: Optional[str] = None, un
     if q:
         stmt = stmt.where(or_(Scholarship.name.ilike(f"%{q}%"), Scholarship.provider.ilike(f"%{q}%")))
     if country:
-        stmt = stmt.join(Country, Scholarship.country_id == Country.id).where(
-            or_(Country.slug == country.lower(), Country.name.ilike(country)))
+        target = destinations_service.resolve_destination(db, country)
+        if target is None:
+            # An unknown destination is an empty result, not a silent return of every country.
+            return {"total": 0, "page": page, "page_size": page_size, "items": []}
+        family = destinations_service.family_ids(db, target)
+        scoped_universities = destinations_service.universities_in(db, target)
+        conditions = [Scholarship.country_id.in_(family)]
+        if scoped_universities:
+            conditions.append(Scholarship.university_id.in_(scoped_universities))
+        stmt = stmt.where(or_(*conditions))
     if university:
         stmt = stmt.join(University, Scholarship.university_id == University.id).where(University.slug == university)
     rows = list(db.execute(stmt).scalars().unique())
@@ -616,17 +697,19 @@ def list_faculty(q: Optional[str] = None, country: Optional[str] = None, univers
                  db: Session = Depends(get_db)):
     from app.services import matching
     country_id = None
+    uni_ids: Optional[List[int]] = None
     if country:
-        row = db.execute(select(Country).where(or_(Country.slug == country.lower(),
-                                                   Country.name.ilike(country)))).scalars().first()
-        country_id = row.id if row else None
+        target = destinations_service.resolve_destination(db, country)
+        if target is None:
+            return {"total": 0, "page": page, "page_size": page_size, "items": []}
+        uni_ids = destinations_service.universities_in(db, target)
     uni_id = None
     if university:
         uni_row = db.execute(select(University).where(University.slug == university)).scalars().first()
         uni_id = uni_row.id if uni_row else None
     terms = [t.strip() for t in (interests or "").split(",") if t.strip()]
     matches = matching.match_faculty(db, terms, country_id=country_id, university_id=uni_id,
-                                     field=field, limit=500)
+                                     field=field, limit=500, university_ids=uni_ids)
     if q:
         ql = q.lower()
         matches = [m for m in matches if ql in m["professor"].full_name.lower()]

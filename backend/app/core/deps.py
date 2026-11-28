@@ -1,9 +1,11 @@
 """Auth dependencies + RBAC (§91)."""
+import hmac
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.crm import User
@@ -88,3 +90,29 @@ def require_staff(user: User = Depends(current_user)) -> User:
     if user.role == "STUDENT":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Staff access required")
     return user
+
+
+INTERNAL_TOKEN_HEADER = "x-internal-token"
+
+
+def require_internal_caller(request: Request) -> None:
+    """Authorize a server-to-server call with the shared internal token.
+
+    Some endpoints exist for our own Next.js server (or an operator's runner), not for a browser:
+    the rate-limit exemption and the marketing conversion relay are both in this group. A browser
+    never holds the token - it reaches the API through the Next.js proxy, which does not forward
+    the header - so requiring it turns "any client on the internet" into "the deployment".
+
+    Fails closed on every axis: an unset token authorizes nobody (an empty secret must never be
+    the same string as an empty header), a missing header is refused, and the comparison is
+    constant-time so the header cannot be guessed a character at a time. The published development
+    default is refused at startup in production (see ``Settings.check_production``), so this
+    dependency can never be satisfied by a value that is in the repository.
+    """
+    expected = (settings.internal_api_token or "").strip()
+    supplied = (request.headers.get(INTERNAL_TOKEN_HEADER) or "").strip()
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This endpoint is server-to-server only; send the internal token.",
+        )

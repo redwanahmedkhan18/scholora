@@ -22,13 +22,15 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, Optional, cast
 
 from sqlalchemy import func, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core import embeddings as E
 from app.core import local_semantic
+from app.core import verification_policy as policy
 from app.core.config import settings
 from app.models.crm import KnowledgeChunk
 from app.models.education import Country, Professor, Program, Scholarship, University
+from app.services import scoping
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +88,22 @@ def _confidence_weight(confidence: Optional[str]) -> float:
 
 
 # --------------------------------------------------------------------- search
+# ---------------------------------------------------------------------- dialect detection
+def _is_postgres(db) -> bool:
+    """Whether *this session* is PostgreSQL - not whether the process is configured for it.
+
+    The two normally agree. They do not agree in a test that runs the suite against PostgreSQL
+    while pointing one fixture at SQLite, and the old check made that difference a real failure:
+    the rebuild took the pgvector branch against a SQLite database and threw "no such column:
+    embedding_vec". Asking the connection is also the honest question - the SQL that follows is
+    executed there.
+    """
+    try:
+        return db.get_bind().dialect.name == "postgresql"
+    except Exception:            # noqa: BLE001 - a detached session is simply not PostgreSQL
+        return False
+
+
 def search(
     db: Session,
     query: str,
@@ -95,7 +113,18 @@ def search(
     query_embedding: Optional[list[float]] = None,
     dense_weight: Optional[float] = None,
     min_score: Optional[float] = None,
+    apply_policy: bool = True,
+    academic_year: Optional[Any] = None,
+    scope: Optional[scoping.Scope] = None,
 ) -> list[dict[str, Any]]:
+    """Ranked passages for a question.
+
+    ``apply_policy`` is on by default and enforces ``core.verification_policy``: a chunk that
+    cannot be presented as verified and current is removed *before* ranking, so an unverified
+    record can never be cited, quoted or counted as grounding. The admin tools pass
+    ``apply_policy=False`` because staff need to see what is waiting to be verified - that is a
+    curation surface, not an answer.
+    """
     terms = tokenize(query)
     if not terms:
         return []
@@ -109,9 +138,46 @@ def search(
             query_embedding = None
 
     stmt = select(KnowledgeChunk)
+    # W6: the corpus is narrowed in SQL, before any scoring and before ``limit``. A passage from
+    # a destination the student did not ask about can therefore never be ranked, quoted, or
+    # counted as grounding - and an unresolved mandatory scope retrieves nothing at all rather
+    # than everything.
+    if scope is not None:
+        if not scope.ok:
+            return []
+        scope_predicate = scoping.chunk_clause(db, scope)
+        if scope_predicate is not None:
+            stmt = stmt.where(scope_predicate)
     if entity_types:
         stmt = stmt.where(KnowledgeChunk.entity_type.in_(list(entity_types)))
     chunks = list(db.scalars(stmt))
+    if apply_policy:
+        # One conflict query for the whole candidate set, not one per passage. A chunk whose
+        # entity has an unresolved verification conflict is withheld, so a disputed figure is
+        # never quoted through retrieval.
+        conflicts = policy.conflicts_in(db)
+        programs: Dict[int, Program] = {}
+        if academic_year:
+            # A chunk carries no year of its own; its programme's intakes do. Load them once
+            # and evaluate the programme, rather than reporting every chunk as YEAR_UNKNOWN.
+            program_ids = {c.entity_id for c in chunks if c.entity_type == "program"}
+            if program_ids:
+                rows = db.execute(
+                    select(Program).options(selectinload(Program.intakes))
+                    .where(Program.id.in_(program_ids))
+                ).scalars().unique()
+                programs = {p.id: p for p in rows}
+        kept: list[KnowledgeChunk] = []
+        for chunk in chunks:
+            if academic_year and chunk.entity_type == "program" and chunk.entity_id in programs:
+                decision = policy.evaluate_record(db, programs[chunk.entity_id], conflicts=conflicts,
+                                                  academic_year=academic_year)
+            else:
+                decision = policy.evaluate_record(db, chunk, entity_type=chunk.entity_type,
+                                                  conflicts=conflicts, academic_year=academic_year)
+            if decision.usable:
+                kept.append(chunk)
+        chunks = kept
     if not chunks:
         return []
 
@@ -132,17 +198,24 @@ def search(
     # ---- dense scores: pgvector first, stored-JSON cosine as the portable fallback ----
     dense: dict[int, float] = {}
     if query_embedding:
-        if settings.is_postgres:
+        if _is_postgres(db):
+            # The savepoint is load-bearing. On PostgreSQL a failed statement aborts the whole
+            # transaction: catching the exception is not enough, and the *next* query in the
+            # request then fails with "current transaction is aborted". A missing pgvector
+            # extension, a column from an unrun migration or a row whose vector has a different
+            # dimension would therefore take down every following query in the turn. Inside a
+            # nested transaction the failure costs only the dense scores.
             try:
-                rows = db.execute(
-                    text(
-                        "SELECT id, 1 - (embedding_vec <=> CAST(:q AS vector)) AS score "
-                        "FROM knowledge_chunks WHERE embedding_vec IS NOT NULL "
-                        "ORDER BY embedding_vec <=> CAST(:q AS vector) LIMIT :k"
-                    ),
-                    {"q": str(query_embedding), "k": max(limit * 5, 25)},
-                ).all()
-                dense = {int(r[0]): float(r[1]) for r in rows}
+                with db.begin_nested():
+                    vector_rows = db.execute(
+                        text(
+                            "SELECT id, 1 - (embedding_vec <=> CAST(:q AS vector)) AS score "
+                            "FROM knowledge_chunks WHERE embedding_vec IS NOT NULL "
+                            "ORDER BY embedding_vec <=> CAST(:q AS vector) LIMIT :k"
+                        ),
+                        {"q": str(query_embedding), "k": max(limit * 5, 25)},
+                    ).all()
+                dense = {int(r[0]): float(r[1]) for r in vector_rows}
             except Exception:
                 dense = {}  # extension or column missing -> lexical only
         if not dense:
@@ -208,11 +281,25 @@ def _as_hit(chunk: KnowledgeChunk, score: float) -> dict[str, Any]:
         "source_type": chunk.source_type,
         "verified_at": chunk.verified_at.isoformat() if chunk.verified_at else None,
         "confidence": chunk.confidence,
+        "provenance": getattr(chunk, "provenance", None),
+        "verified": True,       # surviving the policy filter is what makes this true
+        "policy_version": policy.POLICY_VERSION,
         "score": round(float(score), 4),
     }
 
 
 # ------------------------------------------------------------------- indexing
+def _provenance_of(obj: Any) -> Optional[str]:
+    """DEMO for seed/placeholder records, otherwise None.
+
+    Carried onto the chunk so the verification policy can reject demonstration data even after
+    the values have been flattened into a passage: a demo paragraph must never look like an
+    official statement just because it reads well.
+    """
+    haystack = " ".join(str(getattr(obj, f, "") or "") for f in ("verified_by", "source_type")).lower()
+    return "DEMO" if any(m in haystack for m in policy.DEMO_MARKERS) else None
+
+
 def _chunk_for(entity_type: str, obj: Any) -> Optional[dict[str, Any]]:
     """Flatten one record into a retrievable passage. Only published facts go in."""
     if entity_type == "program":
@@ -225,7 +312,7 @@ def _chunk_for(entity_type: str, obj: Any) -> Optional[dict[str, Any]]:
             f"Overview: {obj.overview}" if obj.overview else "",
             f"Career outcomes: {obj.career_outcomes}" if getattr(obj, "career_outcomes", None) else "",
         ]
-        if req:
+        if req and policy.is_answerable(req):
             parts += [
                 f"Minimum CGPA {req.min_cgpa} on a {req.cgpa_scale} scale." if req.min_cgpa else "",
                 f"IELTS overall {req.ielts_overall}, minimum band {req.ielts_band_min}." if req.ielts_overall else "",
@@ -358,6 +445,7 @@ def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
             payload = _chunk_for(entity_type, obj)
             if not payload or not payload["content"].strip():
                 continue
+            payload["provenance"] = _provenance_of(obj)
             vector = lexical_vector(f"{payload['title']} {payload['content']}")
             chunk = KnowledgeChunk(
                 entity_type=entity_type,
@@ -370,6 +458,7 @@ def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
                 source_type=payload["source_type"],
                 verified_at=payload["verified_at"],
                 confidence=payload["confidence"],
+                provenance=payload.get("provenance"),
                 token_count=sum(vector.values()),
                 lexical_vector=vector,
                 embedding=[],
@@ -414,7 +503,7 @@ def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
                 chunk_row.embedding_dim = vector_width
                 written += 1
         db.flush()
-        if settings.is_postgres and written:
+        if _is_postgres(db) and written:
             # Mirror into the pgvector column the HNSW index is built on.
             for chunk_row in pending:
                 if not chunk_row.embedding:
@@ -428,7 +517,7 @@ def rebuild_index(db: Session, embed: bool = True) -> dict[str, Any]:
     counts["embedded"] = written
     counts["embedding_backend"] = E.active_backend()
     counts["embedding_model"] = E.active_model_name()
-    counts["vector_store"] = "pgvector" if settings.is_postgres else "json+python-cosine"
+    counts["vector_store"] = "pgvector" if _is_postgres(db) else "json+python-cosine"
     counts["total"] = sum(v for v in counts.values() if isinstance(v, int)) - written
     counts["indexed_at"] = int(datetime.utcnow().timestamp())
     return counts

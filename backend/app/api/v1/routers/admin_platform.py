@@ -14,7 +14,6 @@ Everything here is ADMIN-only and audit logged. Secrets are never echoed back.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -314,8 +313,12 @@ def retrieval_preview(body: TuneIn, db: Session = Depends(get_db),
             raise HTTPException(400, f"{name} weights must be between 0 and 1")
 
     def run(cfg: Dict[str, float]) -> List[Dict[str, Any]]:
+        # Curation surface: a retrieval tuner must see every indexed passage, including ones the
+        # verification policy withholds from students. Otherwise the sample is empty on a corpus
+        # that is still being verified and the weights cannot be tuned at all.
         hits = retrieval.search(db, body.query, limit=max(1, min(body.limit, 20)),
-                                dense_weight=cfg["dense_weight"], min_score=cfg["min_score"])
+                                dense_weight=cfg["dense_weight"], min_score=cfg["min_score"],
+                                apply_policy=False)
         return [{
             "rank": i + 1, "title": h.get("title"), "entity_type": h.get("entity_type"),
             "url_path": h.get("url_path"), "score": round(float(h.get("score") or 0), 4),
@@ -362,8 +365,11 @@ def retrieval_sweep(queries: List[str] = Body(..., embed=True),
     for weight in grid:
         covered, tops = 0, []
         for probe in probes:
+            # Same curation rule as the comparison above: sweep the raw index, not the
+            # student-facing subset.
             hits = retrieval.search(db, probe, limit=5, dense_weight=weight,
-                                    min_score=float(settings.retrieval_min_score))
+                                    min_score=float(settings.retrieval_min_score),
+                                    apply_policy=False)
             if hits:
                 covered += 1
                 tops.append(float(hits[0].get("score") or 0))
@@ -572,49 +578,166 @@ def verification_queue(status: Optional[str] = None, entity_type: Optional[str] 
 class ResolveIn(BaseModel):
     status: str
     note: str = ""
+    #: The state the reviewer was shown. When present and stale, the decision is refused (409)
+    #: instead of overwriting a decision that arrived in between.
+    expected_status: Optional[str] = None
+
+
+class WithdrawIn(BaseModel):
+    """Taking a claim out of the register (F-2). A reason is required; nothing is deleted."""
+
+    reason: str = ""
+    expected_status: Optional[str] = None
 
 
 @router.post("/verification/{verification_id}/resolve")
 def verification_resolve(verification_id: int, body: ResolveIn,
                          db: Session = Depends(get_db),
                          user: User = Depends(require_role("DATA_MANAGER"))):
-    from app.models.base import CONFIDENCE_STATES
+    """Record one field decision, and derive the entity's state from its whole register.
+
+    Replaces a handler that accepted any confidence state, stamped the *entity* VERIFIED from a
+    single field, and let the uploader approve its own import. The rules live in
+    ``services.review`` so every caller inherits them.
+    """
+    from app.services import review
+
     record = db.get(DataVerification, verification_id)
     if not record:
         raise HTTPException(404, "verification record not found")
-    new_status = body.status.upper()
-    if new_status not in CONFIDENCE_STATES:
-        raise HTTPException(400, f"status must be one of {', '.join(CONFIDENCE_STATES)}")
 
-    record.status = new_status
-    if new_status == "VERIFIED":
-        record.verified_at = datetime.now(timezone.utc)
-        record.verified_by = user.email
-
-    # Keep the entity's own confidence column honest when a field is confirmed.
-    target_model = {"country": "Country", "university": "University",
-                    "program": "Program", "scholarship": "Scholarship"}.get(record.entity_type)
-    if target_model:
-        from app.models import education as edu
-        model = getattr(edu, target_model, None)
-        if model is not None:
-            entity = db.get(model, record.entity_id)
-            if entity is not None and hasattr(entity, "confidence"):
-                entity.confidence = new_status
-                if new_status == "VERIFIED":
-                    entity.verified_at = datetime.now(timezone.utc)
-                    entity.verified_by = user.email
+    try:
+        if (body.status or "").upper() == "VERIFIED":
+            review.assert_review_authority(db, record, user.email)
+        result = review.resolve_field(db, record, status=body.status,
+                                      actor_email=user.email, note=body.note,
+                                      expected_status=body.expected_status)
+    except review.ReviewError as exc:
+        db.rollback()
+        raise HTTPException(exc.code, str(exc)) from None
 
     _audit(db, user, "RESOLVE_VERIFICATION", entity_type=record.entity_type,
-           entity_id=record.entity_id, field=record.field_name, status=new_status,
+           entity_id=record.entity_id, field=record.field_name,
+           status=result["field_status"], note=body.note or None)
+    db.commit()
+    return result
+
+
+@router.post("/verification/{verification_id}/withdraw")
+def verification_withdraw(verification_id: int, body: WithdrawIn,
+                         db: Session = Depends(get_db),
+                         user: User = Depends(require_role("DATA_MANAGER"))):
+    """Withdraw a field's evidence without deleting its history (F-2).
+
+    This is the replacement for the generic ``DELETE /admin/verifications/{id}``, which no longer
+    exists. The row keeps its recorded value and source; its status becomes ``WITHDRAWN``; the
+    entity is recomputed in the same transaction and can only be withheld, never promoted. The
+    actor and the reason are recorded twice: on the row's audit entry, and in this response.
+    """
+    from app.services import review
+
+    record = db.get(DataVerification, verification_id)
+    if not record:
+        raise HTTPException(404, "verification record not found")
+
+    try:
+        result = review.withdraw_field(db, record, actor_email=user.email,
+                                       note=body.reason, expected_status=body.expected_status)
+    except review.ReviewError as exc:
+        db.rollback()
+        raise HTTPException(exc.code, str(exc)) from None
+
+    _audit(db, user, "WITHDRAW_VERIFICATION", entity_type=record.entity_type,
+           entity_id=record.entity_id, field=record.field_name,
+           status=result["field_status"], note=body.reason.strip() or None)
+    db.commit()
+    return result
+
+
+@router.get("/verification/changes")
+def verification_changes(status: str = "PENDING", classification: Optional[str] = None,
+                         limit: int = 50, offset: int = 0,
+                         db: Session = Depends(get_db),
+                         user: User = Depends(require_role("DATA_MANAGER"))):
+    """Material catalogue changes waiting for a decision, newest first and bounded."""
+    from app.services import catalogue_changes
+
+    page = catalogue_changes.queue(db, status=status, limit=limit, offset=offset,
+                                   classification=classification)
+    return {"total": page["total"], "limit": page["limit"], "offset": page["offset"],
+            "items": [{
+                "id": c.id, "entity_type": c.entity_type, "entity_id": c.entity_id,
+                "field_name": c.field_name, "previous_value": c.previous_value,
+                "new_value": c.new_value, "classification": c.classification,
+                "status": c.status, "version": c.version, "actor": c.actor,
+                "source_url": c.source_url, "source_type": c.source_type,
+                "retrieved_at": c.retrieved_at.isoformat() if c.retrieved_at else None,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            } for c in page["items"]]}
+
+
+class ChangeDecisionIn(BaseModel):
+    status: str
+    note: Optional[str] = None
+
+
+@router.post("/verification/changes/{change_id}/decide")
+def verification_change_decide(change_id: int, body: ChangeDecisionIn,
+                               db: Session = Depends(get_db),
+                               user: User = Depends(require_role("DATA_MANAGER"))):
+    from app.services import catalogue_changes
+
+    change = db.get(catalogue_changes.CatalogueChange, change_id)
+    if not change:
+        raise HTTPException(404, "change not found")
+    status = (body.status or "").upper()
+    if status not in ("APPROVED", "REJECTED"):
+        raise HTTPException(400, "status must be APPROVED or REJECTED")
+    if status == "REJECTED" and not (body.note or "").strip():
+        raise HTTPException(400, "a note is required when a change is rejected")
+    try:
+        catalogue_changes.decide(db, change, status=status, actor=user.email, note=body.note)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from None
+
+    # An approved change is a statement about the evidence, not about the value: the stored
+    # record keeps NEEDS_REVIEW until a reviewer confirms the field itself, so this action can
+    # never promote a figure straight to "official".
+    _audit(db, user, "DECIDE_CATALOGUE_CHANGE", entity_type=change.entity_type,
+           entity_id=change.entity_id, field=change.field_name, status=status,
            note=body.note or None)
     db.commit()
-    return {"id": record.id, "status": record.status, "verified_by": record.verified_by}
+    return {"id": change.id, "status": change.status, "decided_by": change.decided_by}
+
+
+@router.get("/verification/entity/{entity_type}/{entity_id}")
+def verification_entity(entity_type: str, entity_id: int,
+                        db: Session = Depends(get_db),
+                        user: User = Depends(require_role("DATA_MANAGER"))):
+    """Review detail: stored values, field evidence, pending changes and history."""
+    from app.services import review
+
+    try:
+        return review.entity_review_detail(db, entity_type, entity_id)
+    except review.ReviewError as exc:
+        raise HTTPException(exc.code, str(exc)) from None
+
+
+@router.get("/catalogue/integrity")
+def catalogue_integrity(sample: int = 5, db: Session = Depends(get_db),
+                        user: User = Depends(require_role("DATA_MANAGER"))):
+    """Where the catalogue is not yet trustworthy. A report; it repairs nothing."""
+    from app.services import catalogue_integrity as integrity
+
+    return integrity.audit(db, sample=sample)
 
 
 # ----------------------------------------------------------- source-level verification
 class VerifySourceIn(BaseModel):
     source_url: str
+    #: The reviewer's own name. Required, and it must match the signed-in account: the decision is
+    #: recorded against that account, not against whatever text arrives here (F-2).
     verifier: str
     field_ids: Optional[List[int]] = None
     note: str = ""
@@ -660,18 +783,19 @@ def verification_sources_check(limit: int = 50, only_unchecked: bool = False,
 def verification_sources_verify(body: VerifySourceIn, db: Session = Depends(get_db),
                                 actor: User = Depends(require_role("DATA_MANAGER"))):
     """
-    Mark every claim citing one page as VERIFIED, under a named person.
+    Mark every claim citing one page as VERIFIED, under the signed-in reviewer.
 
-    The verifier is recorded verbatim and defaults to nobody: the entire provenance model
-    depends on a human being answerable for that word, so this cannot be reached from a
-    scheduled job.
+    The verifier is recorded against the acting account and defaults to nobody: the entire
+    provenance model depends on a human being answerable for that word, so this cannot be reached
+    from a scheduled job - and a caller cannot name somebody else as the person who decided (F-2).
     """
     try:
         result = source_verification.verify_source(
-            db, source_url=body.source_url,
-            verifier=body.verifier or actor.full_name or actor.email,
+            db, source_url=body.source_url, verifier=body.verifier,
+            actor_email=actor.email, actor_name=actor.full_name,
             fields=body.field_ids, note=body.note)
     except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _audit(db, actor, "VERIFY_SOURCE", entity_type="data_verification",

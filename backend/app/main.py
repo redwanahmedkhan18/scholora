@@ -1,5 +1,7 @@
 """Scholara API - International Education Consultancy Intelligence & Application Platform."""
 import logging
+import re
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -31,6 +33,9 @@ if not logging.getLogger().handlers:
 
 log = logging.getLogger(__name__)
 
+#: Anything a proxy might legitimately use as a correlation id; deliberately narrow.
+_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
 DESCRIPTION = """
 Source-backed education intelligence API powering the public website, the student platform,
 the counselor CRM and the WhatsApp assistant from a single education database.
@@ -43,6 +48,9 @@ the counselor CRM and the WhatsApp assistant from a single education database.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Refuse a deployment that only looks like production. This must run before the app
+    # serves a cookie, a CORS preflight or a seeded account.
+    settings.validate_deployment()
     db = summarize_database_url(settings.database_url)
     log.info(
         "database configured driver=%s host=%s port=%s sslmode=%s pooler=%s "
@@ -88,6 +96,18 @@ async def lifespan(app: FastAPI):
         log.warning("email disabled: %s Notifications stay in the inbox until it is set.",
                     mail["reason"])
 
+    # Assistant readiness: a schema that is behind the code (an un-migrated demo database, or a
+    # production deployment where `alembic upgrade head` was skipped) must be reported once, in
+    # plain language, instead of surfacing later as a 500 from /assistant/ask.
+    try:
+        from app.core import diagnostics
+        from app.core.database import SessionLocal
+
+        with SessionLocal() as _check:
+            diagnostics.log_schema_drift(_check)
+    except Exception as exc:  # never block startup on a diagnostic
+        log.warning("assistant schema diagnostic unavailable: %s", type(exc).__name__)
+
     from app.services import tasks
 
     tasks.start_scheduler()
@@ -103,6 +123,24 @@ app = FastAPI(title=f"{settings.app_name} API", version="1.0.0", description=DES
               lifespan=lifespan)
 
 app.add_middleware(RateLimitMiddleware)
+
+@app.middleware("http")
+async def request_id_header(request: Request, call_next):
+    """Give every response a correlation id, so a log line and a user report can be matched.
+
+    An inbound ``X-Request-ID`` is accepted only if it looks like an id - a proxy or a client can
+    otherwise put arbitrary text into a header and into the log. Anything else is replaced with a
+    generated one; either way the value that was actually used comes back in the response header,
+    which is what makes "please quote the reference" possible.
+    """
+    supplied = (request.headers.get("x-request-id") or "").strip()
+    request_id = (supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) and len(supplied) <= 64
+                  else uuid.uuid4().hex)
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,6 +167,17 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.url.path.startswith(f"{settings.api_v1_prefix}/documents/"):
         response.headers["Cache-Control"] = "private, no-store"
+    # The token-addressed portal returns private student data (and its errors can reveal
+    # whether a capability exists). Never let a browser or intermediary cache any of it.
+    if request.url.path.startswith(f"{settings.api_v1_prefix}/portal"):
+        response.headers["Cache-Control"] = "private, no-store"
+    # Session ownership, CSRF material and profile-tailored answers must never be stored by
+    # a shared cache. POST is not normally cached, but a proxy that ignores the method must
+    # still be told explicitly.
+    assistant = f"{settings.api_v1_prefix}/assistant"
+    if (request.url.path.startswith(f"{assistant}/session")
+            or request.url.path == f"{assistant}/ask"):
+        response.headers["Cache-Control"] = "private, no-store"
     return response
 
 
@@ -141,10 +190,31 @@ def health():
 
 @app.get("/api/health/ready", tags=["system"])
 def readiness(response: Response):
-    """Readiness: required dependencies must answer, or this returns 503."""
+    """Readiness: required dependencies must answer, or this returns 503.
+
+    This endpoint is unauthenticated and reachable from the internet, so it answers the question
+    a load balancer asks - "can this instance serve traffic?" - and nothing else. The detailed
+    report includes hostnames, ports, driver names and pooler flags, which is infrastructure
+    reconnaissance for anyone who can reach the URL; operators get that detail from
+    ``connectivity.readiness_report()`` / the CLI diagnostics, not from a public response.
+    """
     report = connectivity.readiness_report()
     response.status_code = 200 if report["ready"] else 503
-    return report
+    return {
+        "status": report["status"],
+        "ready": report["ready"],
+        "environment": report["environment"],
+        "checks": {
+            name: {
+                "ok": bool(check.get("ok")),
+                "required": bool(check.get("required", True)),
+                "latency_ms": check.get("latency_ms"),
+                # Already sanitized: an exception class name, never a message or a URL.
+                "error": check.get("error"),
+            }
+            for name, check in report["checks"].items()
+        },
+    }
 
 
 app.include_router(public.router, prefix=f"{settings.api_v1_prefix}")
@@ -170,14 +240,24 @@ async def database_unavailable(request: Request,
     ``ProgrammingError`` are bugs or bad input, not a temporary outage, and must reach the
     generic 500 handler rather than telling a client to retry.
     """
-    log_database_error(log, f"database failure on {request.url.path}", exc)
+    request_id = getattr(request.state, "request_id", "")
+    log_database_error(log, f"database failure on {request.url.path} request_id={request_id}", exc)
     return JSONResponse(
         status_code=503,
-        content={"detail": "Database temporarily unavailable", "path": str(request.url.path)},
+        content={"detail": "Database temporarily unavailable", "path": str(request.url.path),
+                 "request_id": request_id},
         headers={"Retry-After": "30"},
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": "Internal server error", "path": str(request.url.path)})
+    request_id = getattr(request.state, "request_id", "")
+    # The id, not the traceback: the client is told where to point, not what broke internally.
+    log.exception("unhandled error on %s request_id=%s", request.url.path, request_id)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "path": str(request.url.path),
+                 "request_id": request_id},
+        headers={"X-Request-ID": request_id} if request_id else None,
+    )

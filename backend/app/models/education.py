@@ -1,12 +1,58 @@
 """Education intelligence graph: Country -> University -> Faculty -> Department -> Program -> Requirements."""
-from datetime import date, datetime
-from typing import Any, List, Optional
+import re
+from datetime import date
+from typing import List, Optional
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Date,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+    select,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-from app.models.base import SeoMixin, TimestampMixin, VerificationMixin, JSONType
+from app.models.base import JSONType, SeoMixin, TimestampMixin, VerificationMixin
+
+#: A destination is either a sovereign country (ISO 3166-1 alpha-2 code, ``iso_code='GB'``)
+#: or a study region inside one (ISO 3166-2 subdivision code, ``iso_code='GB-SCT'``). Regions
+#: exist so Scotland can be listed and filtered on its own without pretending to be a country
+#: with its own visa regime, currency and ISO 3166-1 code.
+DESTINATION_KINDS = ["COUNTRY", "REGION"]
+
+#: ISO 3166-1 alpha-2 for a sovereign country; ISO 3166-2 subdivision for a region.
+_COUNTRY_CODE_RE = re.compile(r"^[A-Z]{2}$")
+_REGION_CODE_RE = re.compile(r"^[A-Z]{2}-[A-Z0-9]{1,3}$")
+
+
+def destination_code_error(kind: str, code: str) -> Optional[str]:
+    """Return why an ISO code is invalid for this destination kind, or ``None``.
+
+    The shape matters: ``GB`` is a sovereign ISO 3166-1 code, ``GB-SCT`` is an ISO 3166-2
+    subdivision and must never be treated as a country. Validation lives here so the model,
+    the admin form and the importer all apply exactly the same rule.
+    """
+    kind = (kind or "COUNTRY").upper()
+    value = (code or "").strip().upper()
+    if not value:
+        return None
+    if kind == "REGION":
+        if not _REGION_CODE_RE.match(value):
+            return (f"region iso_code {code!r} must be an ISO 3166-2 subdivision such as "
+                    f"'GB-SCT' (two letters, a hyphen, then up to three letters/digits)")
+    elif not _COUNTRY_CODE_RE.match(value):
+        if _REGION_CODE_RE.match(value):
+            return (f"country iso_code {code!r} looks like an ISO 3166-2 subdivision code; a "
+                    f"sovereign destination needs an ISO 3166-1 alpha-2 code such as 'GB' "
+                    f"(make the row kind='REGION' if it really is a subdivision)")
+        return (f"country iso_code {code!r} must be an ISO 3166-1 alpha-2 code such as 'GB' "
+                f"or 'JP', not a subdivision or name")
+    return None
 
 
 class Country(Base, TimestampMixin, SeoMixin):
@@ -15,6 +61,15 @@ class Country(Base, TimestampMixin, SeoMixin):
     name: Mapped[str] = mapped_column(String(120), unique=True)
     slug: Mapped[str] = mapped_column(String(140), unique=True, index=True)
     iso2: Mapped[Optional[str]] = mapped_column(String(2))
+    # Sovereign code for a COUNTRY (`GB`), subdivision code for a REGION (`GB-SCT`). Unique,
+    # so a destination can never be inserted twice; that is what keeps the approved list
+    # duplicate-free (South Korea and Germany each appear exactly once).
+    iso_code: Mapped[Optional[str]] = mapped_column(String(8), unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="COUNTRY", index=True)
+    parent_country_id: Mapped[Optional[int]] = mapped_column(ForeignKey("countries.id"), index=True)
+    #: False marks a row that exists for grouping/SEO only and must not be offered as a place
+    #: to study. Defaults to True, which is the meaning every existing row already had.
+    is_study_destination: Mapped[bool] = mapped_column(default=True)
     flag_emoji: Mapped[Optional[str]] = mapped_column(String(16))
     region: Mapped[Optional[str]] = mapped_column(String(80))
     tagline: Mapped[Optional[str]] = mapped_column(String(255))
@@ -41,7 +96,74 @@ class Country(Base, TimestampMixin, SeoMixin):
     priority: Mapped[int] = mapped_column(Integer, default=100)
     application_available: Mapped[bool] = mapped_column(default=True)
 
-    universities: Mapped[List["University"]] = relationship(back_populates="country")
+    universities: Mapped[List["University"]] = relationship(
+        back_populates="country", foreign_keys="University.country_id",
+    )
+    #: Regions (e.g. Scotland) inside this country. A sovereign country has none of its own
+    #: universities in a region - the region row holds them, and country-wide queries include
+    #: its children's institutions.
+    regions: Mapped[List["Country"]] = relationship(
+        back_populates="parent", cascade="save-update, merge",
+    )
+    parent: Mapped[Optional["Country"]] = relationship(
+        back_populates="regions", remote_side=[id],
+    )
+
+
+def validate_country_hierarchy(country: "Country") -> None:
+    """Reject a destination row that would misrepresent geography.
+
+    Called before every insert and update, so it covers the seed, the admin CRUD endpoints,
+    the importer and the tests alike. A region must name its sovereign parent and carry a
+    subdivision code; a sovereign country must not claim a parent.
+    """
+    kind = (country.kind or "COUNTRY").upper()
+    if kind not in DESTINATION_KINDS:
+        raise ValueError(f"country.kind must be one of {DESTINATION_KINDS}, not {country.kind!r}")
+    code = (country.iso_code or "").upper().strip() or None
+    if country.iso2 is not None and not _COUNTRY_CODE_RE.match((country.iso2 or "").upper()):
+        raise ValueError(f"iso2 must be a two-letter ISO 3166-1 code, not {country.iso2!r}")
+    if kind == "REGION" and country.iso2:
+        raise ValueError(
+            f"region {country.name!r} must not carry iso2; use the subdivision iso_code only"
+        )
+    if code:
+        code_error = destination_code_error(kind, code)
+        if code_error:
+            raise ValueError(code_error)
+    if kind == "REGION":
+        if not country.parent_country_id:
+            raise ValueError(
+                f"region {country.name!r} needs parent_country_id (a region is inside a country)"
+            )
+        if not code:
+            raise ValueError(
+                f"region {country.name!r} needs a subdivision iso_code such as 'GB-SCT', not {country.iso_code!r}"
+            )
+    else:
+        if country.parent_country_id:
+            raise ValueError(
+                f"sovereign country {country.name!r} cannot have parent_country_id; "
+                "model it as kind='REGION' instead"
+            )
+    if code is None and country.iso2:
+        country.iso_code = country.iso2.upper()
+
+
+@event.listens_for(Country, "before_insert")
+@event.listens_for(Country, "before_update")
+def _validate_country(mapper, connection, target: Country) -> None:  # noqa: ARG001
+    validate_country_hierarchy(target)
+    if (target.kind or "COUNTRY") == "REGION" and target.parent_country_id:
+        parent = connection.execute(
+            select(Country.kind).where(Country.id == target.parent_country_id)
+        ).first()
+        if parent is None:
+            raise ValueError(f"region {target.name!r} names an unknown parent country")
+        if (parent[0] or "COUNTRY") != "COUNTRY":
+            raise ValueError(
+                f"region {target.name!r} must belong to a sovereign COUNTRY, not another region"
+            )
 
 
 class City(Base, TimestampMixin):
@@ -58,6 +180,10 @@ class University(Base, TimestampMixin, SeoMixin, VerificationMixin):
     name: Mapped[str] = mapped_column(String(255), index=True)
     slug: Mapped[str] = mapped_column(String(280), unique=True, index=True)
     country_id: Mapped[int] = mapped_column(ForeignKey("countries.id"), index=True)
+    #: Optional study region *inside* the sovereign country (e.g. Scotland inside the United
+    #: Kingdom). Ownership stays with ``country_id`` so a country-wide query keeps returning
+    #: these institutions; the region link is what lets a region page filter to its own.
+    region_id: Mapped[Optional[int]] = mapped_column(ForeignKey("countries.id"), index=True)
     city: Mapped[Optional[str]] = mapped_column(String(120))
     campus: Mapped[Optional[str]] = mapped_column(String(255))
     logo_url: Mapped[Optional[str]] = mapped_column(String(600))
@@ -79,7 +205,8 @@ class University(Base, TimestampMixin, SeoMixin, VerificationMixin):
     is_published: Mapped[bool] = mapped_column(default=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
 
-    country: Mapped[Country] = relationship(back_populates="universities")
+    country: Mapped[Country] = relationship(back_populates="universities", foreign_keys=[country_id])
+    region: Mapped[Optional[Country]] = relationship(foreign_keys=[region_id])
     rankings: Mapped[List["UniversityRanking"]] = relationship(back_populates="university", cascade="all, delete-orphan")
     programs: Mapped[List["Program"]] = relationship(back_populates="university", cascade="all, delete-orphan")
     departments: Mapped[List["Department"]] = relationship(back_populates="university", cascade="all, delete-orphan")
@@ -89,6 +216,33 @@ class University(Base, TimestampMixin, SeoMixin, VerificationMixin):
     professors: Mapped[List["Professor"]] = relationship(back_populates="university", cascade="all, delete-orphan")
     partnership: Mapped[Optional["UniversityPartnership"]] = relationship(
         back_populates="university", uselist=False, cascade="all, delete-orphan")
+
+
+@event.listens_for(University, "before_insert")
+@event.listens_for(University, "before_update")
+def _validate_university_region(mapper, connection, target: University) -> None:  # noqa: ARG001
+    """A region must actually sit inside the university's country.
+
+    Without this a Glasgow record could be tagged as a region of Germany and a "Scotland"
+    filter would return a German institution - the exact false fact this model exists to stop.
+    """
+    if not target.region_id:
+        return
+    region = connection.execute(
+        select(Country.kind, Country.parent_country_id).where(Country.id == target.region_id)
+    ).first()
+    if region is None:
+        raise ValueError(f"unknown region_id {target.region_id}")
+    kind, parent_id = region
+    if (kind or "COUNTRY") != "REGION":
+        raise ValueError(
+            "universities.region_id must reference a REGION row, not a sovereign country"
+        )
+    if parent_id != target.country_id:
+        raise ValueError(
+            "universities.region_id must be a region of universities.country_id "
+            f"(region parent {parent_id}, country {target.country_id})"
+        )
 
 
 class UniversityRanking(Base, TimestampMixin, VerificationMixin):

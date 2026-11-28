@@ -3,6 +3,7 @@ import { api, getOptions, getSettings } from "@/lib/api";
 import { dateTimeLabel } from "@/lib/format";
 import { EventRegister } from "@/components/forms";
 import { Empty, PageHeader } from "@/components/ui";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const revalidate = 120;
 type Dict = Record<string, any>;
@@ -41,7 +42,7 @@ export default async function EventsPage() {
 
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonLdScript(ld) }} />
       <PageHeader
         eyebrow="Events"
         title="Meet us — and meet the universities"

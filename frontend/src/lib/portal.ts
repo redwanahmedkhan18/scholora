@@ -2,15 +2,46 @@
 
 /** Student-portal client helpers: token storage, API access and shortlist sync. */
 
+import { invalidateAssistantSession } from "./assistant-session.ts";
+
 type Dict = Record<string, any>;
 
 const TOKEN_KEY = "scholara.profile.token";
+export const PROFILE_STORAGE_KEY = TOKEN_KEY;
+export const IDENTITY_REVISION_KEY = "scholara.profile.revision";
 const NAME_KEY = "scholara.profile.name";
-const SHORTLIST_KEY = "scholara.shortlist";
+const LEGACY_SHORTLIST_KEY = "scholara.shortlist";
+const SHORTLIST_PREFIX = "scholara.shortlist.v2.";
+const ANONYMOUS_ID = "anonymous";
+const SHORTLIST_CONTEXT = "scholara.shortlist.identity.v2:";
+
+// Cross-tab profile changes are visible through the storage event; a custom event alone is
+// invisible to other tabs. Revoke this tab's old assistant session before it is reused. The
+// legacy unscoped shortlist cannot be attributed to a student, so it is discarded rather than
+// migrated into whichever profile happens to open next.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key === TOKEN_KEY) void invalidateAssistantSession();
+  });
+  try { window.localStorage.removeItem(LEGACY_SHORTLIST_KEY); } catch { /* storage unavailable */ }
+}
 
 export function getProfileToken(): string | null {
   if (typeof window === "undefined") return null;
   return window.localStorage.getItem(TOKEN_KEY);
+}
+
+/** Monotonic browser-local identity revision, used to invalidate pending portal entry work. */
+export function getIdentityRevision(): number {
+  if (typeof window === "undefined") return 0;
+  const value = Number(window.localStorage.getItem(IDENTITY_REVISION_KEY) ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function bumpIdentityRevision() {
+  try {
+    window.localStorage.setItem(IDENTITY_REVISION_KEY, String(getIdentityRevision() + 1));
+  } catch { /* storage unavailable; response-time token checks still apply */ }
 }
 
 export function getProfileName(): string | null {
@@ -20,15 +51,29 @@ export function getProfileName(): string | null {
 
 export function setProfileToken(token: string, name?: string) {
   if (typeof window === "undefined") return;
+  const replaced = window.localStorage.getItem(TOKEN_KEY) !== token;
   window.localStorage.setItem(TOKEN_KEY, token);
   if (name) window.localStorage.setItem(NAME_KEY, name);
+  // Ownership transition: never let the previous student's assistant session or a pending
+  // token-entry request survive it.
+  if (replaced) {
+    bumpIdentityRevision();
+    void invalidateAssistantSession();
+  }
   window.dispatchEvent(new Event("scholara:profile"));
 }
 
 export function clearProfileToken() {
   if (typeof window === "undefined") return;
+  const signingOut = window.localStorage.getItem(TOKEN_KEY);
   window.localStorage.removeItem(TOKEN_KEY);
   window.localStorage.removeItem(NAME_KEY);
+  bumpIdentityRevision();
+  if (signingOut) void clearLocalShortlist(signingOut);
+  // Anonymous items may be the same person's pre-login shortlist; do not leave them for the
+  // next anonymous visitor on a shared device.
+  void clearLocalShortlist(null);
+  void invalidateAssistantSession();
   window.dispatchEvent(new Event("scholara:profile"));
 }
 
@@ -49,9 +94,49 @@ export async function portalFetch<T = Dict>(path: string, init: RequestInit = {}
 
 /* --------------------------------------------------------------- shortlist */
 
-export function readLocalShortlist(): Dict[] {
+/**
+ * A non-reversible, domain-separated bucket name for one identity. The raw portal token is
+ * never used as a storage key or written into shortlist metadata.
+ */
+export async function shortlistBucket(token: string | null): Promise<string | null> {
+  try {
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) return null;
+    const payload = new TextEncoder().encode(SHORTLIST_CONTEXT + (token ?? ANONYMOUS_ID));
+    const digest = await subtle.digest("SHA-256", payload);
+    const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+    return SHORTLIST_PREFIX + hex;
+  } catch {
+    return null;
+  }
+}
+
+/** Read only the active identity's bucket. Legacy global data is never considered. */
+export async function readLocalShortlist(token?: string | null): Promise<Dict[]> {
   if (typeof window === "undefined") return [];
-  try { return JSON.parse(window.localStorage.getItem(SHORTLIST_KEY) ?? "[]"); } catch { return []; }
+  const identity = token === undefined ? getProfileToken() : token;
+  const key = await shortlistBucket(identity);
+  if (!key) return [];
+  if (token === undefined && getProfileToken() !== identity) return [];
+  try { return JSON.parse(window.localStorage.getItem(key) ?? "[]"); } catch { return []; }
+}
+
+export async function writeLocalShortlist(items: Dict[], token?: string | null): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  const identity = token === undefined ? getProfileToken() : token;
+  if (token === undefined && getProfileToken() !== identity) return false;
+  const key = await shortlistBucket(identity);
+  if (!key) return false;
+  if (token === undefined && getProfileToken() !== identity) return false;
+  try { window.localStorage.setItem(key, JSON.stringify(items)); return true; } catch { return false; }
+}
+
+export async function clearLocalShortlist(token?: string | null): Promise<void> {
+  if (typeof window === "undefined") return;
+  const identity = token === undefined ? getProfileToken() : token;
+  const key = await shortlistBucket(identity);
+  if (!key) return;
+  try { window.localStorage.removeItem(key); } catch { /* storage unavailable */ }
 }
 
 /** Map the browser-local shortlist shape onto the server's payload. */
@@ -75,14 +160,15 @@ function toServerItems(items: Dict[]) {
  */
 export async function syncShortlist(token?: string | null): Promise<number> {
   const t = token ?? getProfileToken();
-  if (!t) return 0;
-  const items = toServerItems(readLocalShortlist());
-  if (!items.length) return 0;
+  if (!t || getProfileToken() !== t) return 0;
+  const items = toServerItems(await readLocalShortlist(t));
+  if (!items.length || getProfileToken() !== t) return 0;
   try {
     const res = await portalFetch<{ added: number }>(`/portal/${t}/shortlist/sync`, {
       method: "POST", body: JSON.stringify(items),
     });
-    return res.added ?? 0;
+    // A response for a superseded identity must not be applied by any caller.
+    return getProfileToken() === t ? (res.added ?? 0) : 0;
   } catch {
     return 0;
   }

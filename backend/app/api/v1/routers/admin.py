@@ -1,14 +1,28 @@
 """Admin / counselor API: auth, dashboards, generic CMS CRUD, verification queue, analytics."""
 from __future__ import annotations
 
+import logging
+import math
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from slugify import slugify
-from sqlalchemy import func, select, text
+from sqlalchemy import (
+    ARRAY,
+    JSON,
+    BigInteger,
+    Float,
+    Integer,
+    Numeric,
+    SmallInteger,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.exc import DataError, ProgrammingError, StatementError
 from sqlalchemy.orm import Session
 
 from app.api import serializers as S
@@ -18,6 +32,7 @@ from app.core.database import get_db
 from app.core.deps import (
     MFA_CHALLENGE_SCOPE,
     MFA_ENROLMENT_SCOPE,
+    ROLE_HIERARCHY,
     current_user,
     require_role,
     require_staff,
@@ -47,6 +62,7 @@ from app.models.crm import (
     Document,
     Lead,
     Notification,
+    PendingObjectDeletion,
     SearchQueryLog,
     ShortlistItem,
     StudentProfile,
@@ -68,8 +84,13 @@ from app.models.education import (
     UniversityPartnership,
     UniversityRanking,
 )
+from app.services import catalogue_writes, erasure, read_audit, review
 
 router = APIRouter(tags=["admin"])
+
+log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # key -> (model, slug source field or None, searchable fields)
 RESOURCES: Dict[str, Any] = {
@@ -110,13 +131,50 @@ RESOURCES: Dict[str, Any] = {
     "brochures": (Brochure, None, ["student_name", "token"]),
     "research-areas": (ResearchArea, "name", ["name"]),
     "analytics-events": (AnalyticsEvent, None, ["name", "path"]),
+    "pending-object-deletions": (PendingObjectDeletion, None, ["storage_key"]),
 }
+
+#: Columns that only the review path may set (W9/W12).
+#:
+#: ``confidence`` and its dates are decisions, not fields: they say a named person checked stated
+#: evidence. The generic CRUD form takes any model attribute from the payload, so without this a
+#: COUNSELOR could PUT ``{"confidence": "VERIFIED"}`` on a programme and the read-time policy would
+#: present it to students as official - the entire verification workflow bypassed in one request.
+#: Evidence columns (``source_url``, ``source_type``, ``retrieved_at``) stay writable: they support
+#: a decision without making one.
+TRUST_COLUMNS = frozenset({"confidence", "verified_at", "verified_by", "review_due_at"})
+
+#: Resources whose *state* columns are review decisions and may not be set through CRUD.
+REVIEW_STATE_COLUMNS = {"verifications": frozenset({"status"})}
 
 # Resources that are records of what happened, not content. They must never be edited.
 READ_ONLY_RESOURCES = {
     "audit-logs", "analytics-events", "search-queries", "assistant-conversations",
     "application-history",
+    # A queued object deletion is outstanding privacy work, not editable content: staff can see
+    # that it is pending, and cannot edit or delete the task out from under the retry job.
+    "pending-object-deletions",
 }
+
+#: Resources whose *rows* are not editable through generic CRUD at all, because editing one is a
+#: review decision and deleting one is a trust change (F-2, F-4).
+#:
+#: The verification register is an entity's entire evidence base, and the entity's own state is
+#: derived from it. Three things followed from that and are closed here:
+#:
+#: * **Deleting a row restored trust.** A record holding a ``NEEDS_REVIEW`` fee and a VERIFIED
+#:   duration could be promoted by deleting the fee row and then deciding the duration: the
+#:   derivation saw only VERIFIED rows, so it said VERIFIED, and an unreviewed fee went public
+#:   naming a reviewer who never saw it. Withdrawal is now an explicit transition with an actor
+#:   and a reason (``POST /admin/verification/{id}/withdraw``), and it can only lower trust.
+#: * **Evidence was rewritable.** ``field_value`` / ``source_url`` / ``source_type`` could be
+#:   edited on a VERIFIED row by any review-rank role, so the value a reviewer actually approved
+#:   was not the value the register recorded. The audit row kept field *names*, not values.
+#: * **A refusal looked like success.** A blocked column returned 200 with no effect (F-8).
+#:
+#: Rows are still created here deliberately: a create can only ever add an unverified claim (the
+#: status column is refused), which withholds trust rather than granting it.
+REVIEW_ONLY_RESOURCES = frozenset({"verifications"})
 
 
 class LoginIn(BaseModel):
@@ -232,6 +290,9 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_staff)
     campaigns = db.execute(select(AdCampaign)).scalars().all()
     lead_by_campaign = dict(db.execute(select(Lead.campaign_id, func.count(Lead.id))
                                        .group_by(Lead.campaign_id)).all())
+    # ``recent_leads`` below is serialised with each lead's name, phone and email, so this
+    # dashboard is a student-data read and is audited as one.
+    _audit_read(db, user, "dashboard", "dashboard")
     return {
         "counters": {
             "new_leads": count(Lead, Lead.stage == "NEW"),
@@ -574,6 +635,10 @@ def list_rows(resource: str, q: Optional[str] = None, page: int = 1, page_size: 
     rows = db.execute(stmt).scalars().all()
     total = len(rows)
     start = (page - 1) * page_size
+    if read_audit.is_student_resource(resource):
+        # One event per request. The query string, the page number and the result count are
+        # deliberately not recorded: they are caller input and can carry a student's name.
+        _audit_read(db, user, resource, "list")
     return {"total": total, "page": page, "page_size": page_size,
             "items": [_row_to_dict(r) for r in rows[start:start + page_size]]}
 
@@ -584,12 +649,85 @@ def get_row(resource: str, row_id: int, db: Session = Depends(get_db), user: Use
     row = db.get(model, row_id)
     if not row:
         raise HTTPException(404, "Not found")
+    if read_audit.is_student_resource(resource):
+        _audit_read(db, user, resource, "detail", subject_id=row_id)
     return _row_to_dict(row)
+
+
+def _audit_read(db: Session, user: User, resource: str, operation: str, *,
+                subject_id: Optional[int] = None) -> None:
+    """Record a staff read of student data, or refuse to serve it.
+
+    Wrapped so every call site behaves identically: one event per request, and a 503 rather
+    than an unaudited response if the record cannot be written.
+    """
+    try:
+        read_audit.audit_student_read(db, user, resource=resource, operation=operation,
+                                      subject_id=subject_id)
+    except read_audit.AuditUnavailable:
+        raise HTTPException(
+            503, "This view is unavailable because the access could not be recorded."
+        ) from None
+
+
+def _assert_trust_authority(resource: str, user: User) -> None:
+    """Writing the verification register is a review action, not data entry."""
+    if resource not in REVIEW_STATE_COLUMNS:
+        return
+    if ROLE_HIERARCHY.get(user.role, 0) < ROLE_HIERARCHY.get("DATA_MANAGER", 100):
+        raise HTTPException(
+            403, "verification records are written through the review workflow, not by this role")
 
 
 def _assert_writable(resource: str) -> None:
     if resource in READ_ONLY_RESOURCES:
         raise HTTPException(405, f"'{resource}' is an immutable audit record and cannot be modified.")
+
+
+def _assert_review_writable(resource: str) -> None:
+    """Refuse generic edits and deletes of the verification register (F-2, F-4).
+
+    Enforced in the service layer's only entry point for generic writes, so hiding a button in the
+    back office is not the control - the API refuses the request whatever sent it.
+    """
+    if resource not in REVIEW_ONLY_RESOURCES:
+        return
+    raise HTTPException(
+        405,
+        f"'{resource}' is the verification register and is written through the review workflow: "
+        "decide a field with POST /admin/verification/{id}/resolve, withdraw one with "
+        "POST /admin/verification/{id}/withdraw, and record changes with "
+        "POST /admin/verification/changes/{id}/decide. Rows are never deleted.",
+    )
+
+
+def _echoes_stored_value(row: Any, field: str, value: Any) -> bool:
+    """Whether a payload value is simply the value already stored (a form echoing its fields)."""
+    if not hasattr(row, field):
+        return False
+    stored = getattr(row, field)
+    if stored is None and (value is None or str(value).strip() == ""):
+        return True
+    if stored is None or value is None:
+        return False
+    if not isinstance(stored, bool) and not isinstance(value, bool):
+        try:
+            return abs(float(stored) - float(value)) <= 1e-9
+        except (TypeError, ValueError):
+            pass
+    return "".join(ch for ch in str(stored).lower() if ch.isalnum()) == \
+        "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _refused_trust_writes(row: Any, payload: Dict[str, Any], blocked: frozenset) -> list[str]:
+    """Blocked columns the caller is trying to *change*, rather than echo back (F-8).
+
+    A back-office form submits every column it displays, including the trust columns, so refusing
+    their mere presence would break every ordinary catalogue edit. Refusing a different value is
+    the honest reading of "this is a review decision, not data entry": an echo changes nothing and
+    an attempt is answered with 403 instead of a 200 that quietly did nothing.
+    """
+    return [f for f in payload if f in blocked and not _echoes_stored_value(row, f, payload[f])]
 
 
 def _checked_password(password: Any) -> str:
@@ -607,11 +745,162 @@ def _checked_password(password: Any) -> str:
     return str(password)
 
 
+def _client_value_error(exc: Exception) -> bool:
+    """Whether a database error is the client's value rather than our fault (F-6, C2-11).
+
+    ``DataError`` is PostgreSQL rejecting a parameter it cannot read as the column's type
+    (``'not-a-number'`` for a numeric column, ``'twelve'`` for an integer): SQLSTATE class ``22``,
+    "data exception". ``StatementError`` is SQLAlchemy refusing to *bind* a Python value that a
+    column cannot hold at all (a mapping, a list): also the caller's data.
+
+    ``ProgrammingError`` covers two different things and they are told apart by SQLSTATE. Raised
+    client-side when the driver cannot *adapt* the Python object it was handed (``{"a": 1}`` for
+    a numeric column) it carries no SQLSTATE at all. Raised by the server as ``42804`` it means the
+    parameter's type does not match the column (``true`` for a numeric column), which is again the
+    caller's value. Anything else in ``ProgrammingError`` — a bad statement, a missing relation —
+    is our bug and keeps propagating.
+
+    Deliberately not a catch-all. An operational error (the database went away) and an integrity
+    error (duplicate key, dangling reference) are defects or conflicts, not mistyped input, and
+    answering 422 for them would hide exactly the failures worth seeing.
+    """
+    if isinstance(exc, (DataError, OverflowError)):
+        # ``OverflowError`` is the driver refusing a number that does not fit the column it was
+        # aimed at (``10 ** 400`` into ``bigint``): the value, not the statement.
+        return True
+    if isinstance(exc, ProgrammingError):
+        orig = getattr(exc, "orig", None)
+        sqlstate = getattr(orig, "sqlstate", "missing")
+        return sqlstate is None or str(sqlstate).startswith("42804")
+    if isinstance(exc, StatementError):
+        orig = getattr(exc, "orig", None)
+        # A bind failure carries the offending Python value; there is no other class of statement
+        # error that means "this input cannot be stored".
+        if orig is None:
+            return True
+        if isinstance(orig, (DataError, ValueError, TypeError, OverflowError)):
+            return True
+        return (isinstance(orig, ProgrammingError)
+                and str(getattr(orig, "sqlstate", "missing")).startswith("42804"))
+    return False
+
+
+def _reject_unrepresentable(payload: Dict[str, Any], model: Any = None) -> None:
+    """Refuse values that could be stored but never served (C2-11).
+
+    ``NaN`` and ``Infinity`` are not JSON: a client can send them (Python's ``json`` accepts the
+    literals, and a string like ``"NaN"`` is read by the numeric column just as happily),
+    PostgreSQL's ``double precision`` accepts them, and the value is then stored — after which
+    *every* response that serialises the row fails, because the writer refuses to emit them. One
+    request would leave a record the API can never return. Refusing them before the write is the
+    only outcome that neither stores nonsense nor hides it.
+
+    Checked in three places because there are three ways to arrive: a native float in the payload,
+    a non-finite *string* aimed at a numeric column, and either of those nested inside a JSON
+    column, where it breaks serialisation just the same.
+    """
+
+    def _walk(value: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, float) and not math.isfinite(value):
+            raise HTTPException(
+                422,
+                "one or more values are not valid for their field (JSON has no NaN or Infinity); "
+                "nothing was saved.",
+            )
+        if isinstance(value, dict):
+            for item in value.values():
+                _walk(item, depth + 1)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                _walk(item, depth + 1)
+
+    _walk(payload or {})
+
+    if model is None or not isinstance(payload, dict):
+        return
+    columns = getattr(getattr(model, "__table__", None), "columns", None)
+    if columns is None:
+        return
+    for field, value in payload.items():
+        if field not in columns:
+            continue
+        column_type = columns[field].type
+        if not isinstance(column_type, (JSON, ARRAY)) and isinstance(value, (dict, list, tuple, set)):
+            # A mapping or a sequence aimed at a scalar column is not a value the field can hold;
+            # the driver would otherwise turn it into its own literal (``["USD"]`` was stored as
+            # the text ``{USD}``), silently writing something nobody asked for.
+            raise HTTPException(
+                422,
+                f"'{field}' takes a single value, not a list or object; nothing was saved.",
+            )
+        if isinstance(value, str):
+            if not isinstance(column_type, (Float, Numeric, Integer, BigInteger, SmallInteger)):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(number):
+                raise HTTPException(
+                    422,
+                    "one or more values are not valid for their field (not a finite number); "
+                    "nothing was saved.",
+                )
+        if isinstance(value, bool):
+            if isinstance(column_type, (Integer, BigInteger, SmallInteger, Float, Numeric)):
+                raise HTTPException(
+                    422,
+                    f"'{field}' takes a number, not true/false; nothing was saved.",
+                )
+            continue
+        if isinstance(value, float) and isinstance(column_type, (Integer, BigInteger, SmallInteger)):
+            if not value.is_integer():
+                # PostgreSQL rounds when it casts, so 1.5 would be stored as 2 - a value the
+                # caller never sent.
+                raise HTTPException(
+                    422,
+                    f"'{field}' takes a whole number; nothing was saved.",
+                )
+
+
+def _refuse_client_values(db: Session, resource: str, operation: Callable[[], _T]) -> _T:
+    """Run a write, answering 422 when the database refuses a value's type (C2-11).
+
+    The generic CRUD form is not a validation boundary and never was, so a wrong-typed value gets
+    as far as the column. What matters is the answer: PostgreSQL's ``DataError`` means "this value
+    cannot be stored in this field", which is a client error, and it used to surface as a 500
+    whenever the refusal happened at a ``flush()`` inside the write rather than at the commit that
+    followed it. Nothing was persisted either way - the transaction rolls back - so only the
+    answer was wrong.
+
+    Everything else propagates unchanged (see :func:`_client_value_error`).
+    """
+    try:
+        return operation()
+    except (DataError, ProgrammingError, StatementError, OverflowError) as exc:
+        if not _client_value_error(exc):
+            raise
+        db.rollback()
+        log.info("generic CRUD refused a value the column type cannot hold (%s, resource=%s)",
+                 type(exc).__name__, resource)
+        raise HTTPException(
+            422,
+            "one or more values are not valid for their field (wrong type or out of range); "
+            "nothing was saved.",
+        ) from None
+
+
 @router.post("/{resource}")
 def create_row(resource: str, payload: Dict[str, Any], db: Session = Depends(get_db),
                user: User = Depends(require_staff)):
     model, slug_field, _ = _model(resource)
-    data = {k: v for k, v in payload.items() if hasattr(model, k) and k != "id"}
+    _assert_trust_authority(resource, user)
+    _reject_unrepresentable(payload, model)
+    blocked = TRUST_COLUMNS | REVIEW_STATE_COLUMNS.get(resource, frozenset())
+    data = {k: v for k, v in payload.items()
+            if hasattr(model, k) and k != "id" and k not in blocked}
     if slug_field and not data.get("slug") and data.get(slug_field):
         data["slug"] = slugify(str(data[slug_field]))
     if model is User and payload.get("password"):
@@ -621,7 +910,21 @@ def create_row(resource: str, payload: Dict[str, Any], db: Session = Depends(get
     row = model(**data)
     db.add(row)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="CREATE", entity_type=resource))
-    db.commit()
+    if resource in REVIEW_ONLY_RESOURCES and getattr(row, "entity_type", None) \
+            and getattr(row, "entity_id", None):
+        # C2-12: a new claim is a register mutation, so the entity is re-derived from the register
+        # in this same transaction rather than left describing the register as it was before the
+        # insert. A row created here is always NEEDS_REVIEW (status is a trust column and cannot be
+        # set through this form), so the only possible effect is to *lower* trust: this can never
+        # certify a record, and it never stamps the creating account as the verifier.
+        #
+        # The flush is not optional. Sessions are created with ``autoflush=False``, so without it
+        # the derivation would read the register as it was *before* this row - decide VERIFIED -
+        # and write that stale answer onto the entity. Flushed through the same guard as every other
+        # write here, so a wrong-typed value in the payload is still answered with 422.
+        _refuse_client_values(db, resource, db.flush)
+        review.refresh_entity_state(db, row.entity_type, row.entity_id, user.email)
+    _commit_or_refuse(db, resource)
     db.refresh(row)
     return _row_to_dict(row)
 
@@ -637,14 +940,75 @@ def update_row(resource: str, row_id: int, payload: Dict[str, Any], db: Session 
     if model is User and payload.get("password"):
         from app.core.security import hash_password
         row.password_hash = hash_password(_checked_password(payload.pop("password")))
-    for k, v in payload.items():
-        if hasattr(row, k) and k not in ("id", "created_at"):
-            setattr(row, k, v)
+    _assert_trust_authority(resource, user)
+    _assert_review_writable(resource)
+    blocked = TRUST_COLUMNS | REVIEW_STATE_COLUMNS.get(resource, frozenset())
+    refused = _refused_trust_writes(row, payload, blocked)
+    if refused:
+        raise HTTPException(
+            403,
+            "these columns are recorded by the review workflow, not by this form: "
+            + ", ".join(sorted(refused)),
+        )
+    # Shape validation after the authority checks: a write refused for who may make it is still
+    # reported as 403/405, not re-labelled as a bad value.
+    _reject_unrepresentable(payload, model)
+    detail: Dict[str, Any] = {"fields": list(payload)}
+    if catalogue_writes.governs(model):
+        # A catalogue record carries a verification claim, and this generic form is not the review
+        # workflow. One function applies the values *and* invalidates a verification the edit no
+        # longer supports, in this request's single transaction: confidence becomes NEEDS_REVIEW,
+        # the reviewer and dates are cleared, the edited field is re-registered as a claim
+        # awaiting review, and a CatalogueChange keeps the previous value beside the new one.
+        # See app/services/catalogue_writes.py for why that is the importer's rule, not a new one.
+        #
+        # C2-11: this path flushes inside the service (the value, then the trust columns), so a
+        # value PostgreSQL cannot store is refused there and used to escape as a 500. The flush is
+        # part of this one write, so the refusal is mapped here, before the commit.
+        edit = _refuse_client_values(db, resource, lambda: catalogue_writes.apply_direct_edit(
+            db, model=model, row=row, payload=payload, actor=user.email, blocked=blocked))
+        detail["invalidated_verification"] = edit["invalidated"]
+        if edit["invalidated"]:
+            # Field names and the previous state only - never the values, which may be student-
+            # facing content and do not belong in an audit line.
+            detail["material_fields"] = edit["material_fields"]
+            detail["previous_confidence"] = edit["previous_confidence"]
+    else:
+        for k, v in payload.items():
+            if hasattr(row, k) and k not in ("id", "created_at") and k not in blocked:
+                setattr(row, k, v)
     db.add(AuditLog(actor_id=user.id, actor_email=user.email, action="UPDATE",
-                    entity_type=resource, entity_id=row_id, detail={"fields": list(payload)}))
-    db.commit()
+                    entity_type=resource, entity_id=row_id, detail=detail))
+    _commit_or_refuse(db, resource)
     db.refresh(row)
     return _row_to_dict(row)
+
+
+def _commit_or_refuse(db: Session, resource: str) -> None:
+    """Commit a generic write, or answer 422 when the database refuses a value's type (F-6).
+
+    This form is not a validation boundary and never was: ``{"tuition_annual": "not-a-number"}``
+    reached the column and PostgreSQL raised, which surfaced as a 500. Nothing was ever persisted -
+    the transaction rolls back - so the state was already safe and only the answer was wrong: a
+    client error reported as a server fault, which hides real faults among mistyped ones.
+
+    Deliberately narrow. Only the two type/parameter errors are translated; a constraint failure
+    (duplicate key, dangling reference) keeps its own behaviour, because calling that "invalid
+    input" would hide a defect we actually want to see.
+    """
+    try:
+        db.commit()
+    except (DataError, ProgrammingError, StatementError, OverflowError) as exc:
+        if not _client_value_error(exc):
+            raise
+        db.rollback()
+        log.info("generic CRUD refused a value the column type cannot hold (%s, resource=%s)",
+                 type(exc).__name__, resource)
+        raise HTTPException(
+            422,
+            "one or more values are not valid for their field (wrong type or out of range); "
+            "nothing was saved.",
+        ) from None
 
 
 # Columns that point at a staff user. When that user is deleted the row they are attached to
@@ -687,10 +1051,54 @@ def _detach_user_references(db: Session, user_id: int) -> dict[str, int]:
 def delete_row(resource: str, row_id: int, db: Session = Depends(get_db),
                user: User = Depends(require_role("SENIOR_COUNSELOR"))):
     _assert_writable(resource)
+    _assert_review_writable(resource)
     model, _, _ = _model(resource)
     row = db.get(model, row_id)
     if not row:
         raise HTTPException(404, "Not found")
+
+    # A student profile is the root of an ownership tree with eight dependent tables, uploaded
+    # documents in object storage and server-owned assistant sessions. A bare row delete can only
+    # fail, so it is routed through the transactional eraser, which revokes sessions first and
+    # removes the dependents leaf-first in one transaction.
+    if model is StudentProfile:
+        try:
+            counts = erasure.erase_student_profile(
+                db, row_id, actor_id=user.id, actor_email=user.email)
+        except erasure.ProfileNotFound:
+            raise HTTPException(404, "Not found") from None
+        except erasure.ErasureConflict:
+            # An expected data conflict: the eraser rolled back, nothing changed, and the client
+            # can act on it. Distinct from a defect in our own code.
+            raise HTTPException(
+                409, "This profile still has records that block erasure; nothing was changed."
+            ) from None
+        except Exception:
+            # Unexpected, and by construction pre-commit: the eraser no longer lets a failure in
+            # the post-commit object deletion escape (it reports that as unconfirmed work below).
+            # So the transaction is genuinely rolled back when we reach here.
+            log.exception("student-profile erasure failed unexpectedly for id=%s", row_id)
+            raise HTTPException(
+                500, "The profile could not be erased and nothing was changed."
+            ) from None
+        body = {"ok": True, "erased": counts}
+        if counts.get("storage_unconfirmed"):
+            # The database erasure committed but file deletion could not be confirmed. Never
+            # dress this up as a rollback: the records are gone and the caller must know that.
+            body["complete"] = False
+            body["objects_pending"] = counts.get("objects_pending", 0)
+            body["detail"] = (
+                "Student records were erased; some file deletions remain pending and will be "
+                "retried."
+            )
+        elif counts.get("objects_pending"):
+            # Be explicit rather than claiming a complete erasure: the database records are gone,
+            # but some stored files are still queued and will be retried.
+            body["complete"] = False
+            body["objects_pending"] = counts["objects_pending"]
+        else:
+            body["complete"] = True
+        return body
 
     detail: dict = {}
     if model is User:
