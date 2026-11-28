@@ -28,7 +28,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.base import CONFIDENCE_STATES, SOURCE_TIERS
@@ -716,6 +716,25 @@ def commit_batch(db: Session, batch: ImportBatch, actor: str = "system") -> Dict
                             target.verified_at = None
                         if hasattr(target, "verified_by"):
                             target.verified_by = None
+                    if not is_new:
+                        # The assignment above is an ORM delta: when this session already holds
+                        # NEEDS_REVIEW for the row - the normal case for a record that is still
+                        # awaiting review - it emits no column at all, so a concurrent approval
+                        # that committed in the meantime survives and the record goes on claiming
+                        # VERIFIED over a register that derives NEEDS_REVIEW. That is the same
+                        # trust divergence as the direct-edit path (Campaign 10), so the lowering
+                        # is written unconditionally as a statement. It can only ever withhold.
+                        withholding: Dict[str, Any] = {"confidence": "NEEDS_REVIEW"}
+                        if hasattr(target, "verified_at"):
+                            withholding["verified_at"] = None
+                        if hasattr(target, "verified_by"):
+                            withholding["verified_by"] = None
+                        db.execute(
+                            update(model)
+                            .where(model.id == target.id)
+                            .values(**withholding)
+                            .execution_options(synchronize_session=False)
+                        )
 
                 db.flush()
                 written = _record_provenance(db, batch, row, target, actor)

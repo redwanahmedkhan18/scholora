@@ -20,8 +20,10 @@ Concurrency is produced two ways, both deterministic:
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
 import threading
+import time
 from typing import Any, Callable, List
 
 import pytest
@@ -1098,5 +1100,540 @@ def test_creating_a_claim_while_a_decision_lands_keeps_the_entity_consistent(fac
         assert programme.confidence == derived
         # The new claim is NEEDS_REVIEW and is current for its field, so the record is withheld.
         assert derived == "NEEDS_REVIEW"
+    finally:
+        check.close()
+
+
+# =====================================================================
+# C2-10 - the entity/register invariant under every competing order
+#
+# The failing case was not "who wins". It was that the record could end up claiming VERIFIED over
+# a register that derived NEEDS_REVIEW, because (a) a direct edit lowered trust by assigning an
+# ORM attribute that was already equal to the target, so no UPDATE was emitted at all, and (b) the
+# conditional promotion was evaluated with the statement's own snapshot, which PostgreSQL does not
+# re-check after it waits on a row lock. These tests fix the *order* of each interleaving rather
+# than hoping for it, and every one of them asserts the invariant on both sides.
+# =====================================================================
+_RACE_COUNTER = itertools.count(1)
+
+
+def _race_program(db: Session, *, overview: str):
+    """A programme whose entity and register already agree, awaiting one decision.
+
+    Entity NEEDS_REVIEW and one current register row for ``overview``, also NEEDS_REVIEW, so the
+    derivation says NEEDS_REVIEW before anything races. Each call gets its own slug, so these tests
+    never share a row with each other or with the tests above.
+    """
+    from app.models.crm import DataVerification
+    from app.models.education import Country, Program, University
+
+    tag = next(_RACE_COUNTER)
+    country = db.execute(select(Country).where(Country.slug == "pgcamp-land")).scalars().first()
+    if country is None:
+        country = Country(name="PGCamp Land", slug="pgcamp-land", iso2="PQ", kind="COUNTRY")
+        db.add(country)
+        db.flush()
+    university = db.execute(select(University).where(
+        University.slug == "pgcamp-university")).scalars().first()
+    if university is None:
+        university = University(name="PGCamp University", slug="pgcamp-university",
+                                country_id=country.id, city="Testville",
+                                confidence="NEEDS_REVIEW")
+        db.add(university)
+        db.flush()
+    programme = Program(university_id=university.id, name=f"Race {tag}",
+                        slug=f"pgcamp-race-{tag}", degree_level="MASTER", currency="USD",
+                        tuition_annual=20000.0, overview=overview, confidence="NEEDS_REVIEW")
+    db.add(programme)
+    db.flush()
+    db.add(DataVerification(
+        entity_type="program", entity_id=programme.id, field_name="overview",
+        field_value=overview, status="NEEDS_REVIEW",
+        source_url="https://pgcamp.test/overview",
+        source_type="TIER_1_OFFICIAL_UNIVERSITY"))
+    db.flush()
+    claim_id = db.execute(select(DataVerification.id).where(
+        DataVerification.entity_id == programme.id,
+        DataVerification.field_name == "overview")).scalar_one()
+    db.commit()
+    return programme.id, claim_id
+
+
+def _assert_entity_agrees_with_register(db: Session, entity_id: int, where: str):
+    """The invariant, asserted the same way everywhere: the record never outclaims its register.
+
+    Also holds the rest of the contract that a race could quietly break - a record that is not
+    VERIFIED carries no verification stamp, and a record that *is* VERIFIED is described by its own
+    evidence and attributed to the reviewer who decided it.
+    """
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import review
+
+    derived = review.recompute_entity_confidence(db, "program", entity_id)
+    entity = db.get(Program, entity_id, populate_existing=True)
+    assert entity.confidence == derived, (
+        f"{where}: entity says {entity.confidence} while the register derives {derived}")
+    if entity.confidence == "VERIFIED":
+        assert entity.verified_by is not None, f"{where}: VERIFIED with no verifier"
+        assert entity.verified_at is not None, f"{where}: VERIFIED with no timestamp"
+        verdict = review._evidence_verdict(db, "program", entity_id, list(db.execute(
+            select(DataVerification).where(
+                DataVerification.entity_type == "program",
+                DataVerification.entity_id == entity_id)).scalars()))
+        assert verdict["ok"], f"{where}: a certified record is not described by its evidence: {verdict}"
+    else:
+        assert entity.verified_at is None, (
+            f"{where}: {entity.confidence} kept a verification timestamp")
+        assert entity.verified_by is None, (
+            f"{where}: {entity.confidence} kept a verifier, which attributes it to someone who "
+            f"did not approve the stored value")
+    return entity, derived
+
+
+def _wait_for_lock_waiter(engine, *, timeout: float = 15.0) -> bool:
+    """Wait until some backend is queued on a row lock in this module's schema.
+
+    A condition wait, not a fixed delay: it returns as soon as the wait appears, and fails the
+    test rather than silently continuing if it never does.
+    """
+    # A row-lock wait is reported as an ungranted *transactionid* lock, not a relation lock, so
+    # ask the activity view rather than pg_locks: any other backend stuck on a Lock event is the
+    # queue we are waiting for.
+    query = text(
+        "select count(*) from pg_stat_activity "
+        "where datname = current_database() and state = 'active' "
+        "and wait_event_type = 'Lock' and pid <> pg_backend_pid()")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with engine.connect() as conn:
+            if conn.execute(query).scalar_one() > 0:
+                return True
+        time.sleep(0.02)
+    return False
+
+
+def test_an_edit_built_from_a_stale_row_still_withholds_the_record(factory):
+    """The original defect: the invalidation was an ORM assignment that emitted no SQL.
+
+    A record awaiting review already holds NEEDS_REVIEW, which is precisely the target an edit
+    assigns, so SQLAlchemy saw no change and wrote no column. An approval that committed in that
+    window stayed VERIFIED over unreviewed text. Deterministic: no threads, only a stale row.
+    """
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Replacement overview nobody reviewed. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    editor = _session(factory)
+    try:
+        stale = editor.get(Program, program_id)
+        assert stale.confidence == "NEEDS_REVIEW"
+
+        approver = _session(factory)
+        try:
+            claim = approver.get(DataVerification, claim_id)
+            review.resolve_field(approver, claim, status="VERIFIED",
+                                 actor_email="reviewer@pgcamp.test")
+            approver.commit()
+        finally:
+            approver.close()
+
+        result = catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=stale, payload={"overview": second},
+            actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+        editor.commit()
+        assert result["invalidated"] is True, "the edit must report that it invalidated the record"
+    finally:
+        editor.close()
+
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "stale-row edit after approval")
+        assert entity.overview == second
+        assert derived == "NEEDS_REVIEW", (
+            "the unseen replacement text must not be certified")
+    finally:
+        check.close()
+
+
+def test_an_edit_committed_before_the_approval_writes_withholds_the_record(factory):
+    """Order reversed: the edit wins completely, then the stale approval tries to write."""
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Replacement overview nobody reviewed. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    editor = _session(factory)
+    try:
+        row = editor.get(Program, program_id)
+        catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=row, payload={"overview": second},
+            actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+        editor.commit()
+    finally:
+        editor.close()
+
+    approver = _session(factory)
+    try:
+        claim = approver.get(DataVerification, claim_id)
+        review.resolve_field(approver, claim, status="VERIFIED",
+                             actor_email="reviewer@pgcamp.test")
+        approver.commit()
+    finally:
+        approver.close()
+
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "approval after a committed edit")
+        assert entity.overview == second
+        assert derived == "NEEDS_REVIEW"
+    finally:
+        check.close()
+
+
+def test_an_approval_that_waits_on_the_entity_lock_derives_from_the_committed_register(
+        factory, engine):
+    """The interleaving PostgreSQL's snapshot rule used to hide.
+
+    The edit holds the entity row lock with a NEEDS_REVIEW register row *uncommitted*, and the
+    approval queues behind it. When the edit commits, the approval must derive from the register it
+    just waited for - not from the snapshot it held when it started.
+    """
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Replacement overview nobody reviewed. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    approval: dict[str, Any] = {}
+    started = threading.Event()
+
+    def approve() -> None:
+        db = _session(factory)
+        try:
+            started.set()
+            claim = db.get(DataVerification, claim_id)
+            review.resolve_field(db, claim, status="VERIFIED",
+                                 actor_email="reviewer@pgcamp.test")
+            db.commit()
+            approval["result"] = "approved"
+        except BaseException as exc:              # noqa: BLE001 - reported to the test
+            approval["error"] = exc
+        finally:
+            db.close()
+
+    editor = _session(factory)
+    try:
+        live = editor.get(Program, program_id)
+        catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=live, payload={"overview": second},
+            actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+        # The edit's write holds the entity row lock and is deliberately not committed yet.
+        thread = threading.Thread(target=approve)
+        thread.start()
+        assert started.wait(timeout=10), "the approval thread never started"
+        assert _wait_for_lock_waiter(engine), (
+            "the approval never queued on the entity row lock, so this test proved nothing")
+        editor.commit()
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "the approval never finished"
+    finally:
+        editor.close()
+
+    assert "error" not in approval, f"the approval failed: {approval.get('error')!r}"
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "approval queued behind an uncommitted edit")
+        assert entity.overview == second
+        assert derived == "NEEDS_REVIEW"
+    finally:
+        check.close()
+
+
+def test_competing_approvals_and_an_edit_never_leave_the_record_between_states(factory):
+    """Three writers at a barrier: two approvals and one edit, and the invariant still holds."""
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Replacement overview nobody reviewed. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    def approve(email: str):
+        def run():
+            db = _session(factory)
+            try:
+                claim = db.get(DataVerification, claim_id)
+                review.resolve_field(db, claim, status="VERIFIED", actor_email=email)
+                db.commit()
+                return f"approved:{email}"
+            finally:
+                db.close()
+        return run
+
+    def edit():
+        db = _session(factory)
+        try:
+            row = db.get(Program, program_id)
+            catalogue_writes.apply_direct_edit(
+                db, model=Program, row=row, payload={"overview": second},
+                actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+            db.commit()
+            return "edited"
+        finally:
+            db.close()
+
+    results = run_parallel([approve("one@pgcamp.test"), approve("two@pgcamp.test"), edit])
+    # Exactly one approval may win; the other is *told* it lost, which is the contract. Anything
+    # other than that 409 - or an edit that did not complete - is a real failure.
+    losers = [r for r in results
+              if isinstance(r, BaseException)
+              and not (isinstance(r, review.ReviewError) and getattr(r, "code", None) == 409)]
+    assert not losers, f"a writer failed unexpectedly: {losers!r}"
+    assert "edited" in results, f"the edit did not complete: {results!r}"
+
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "two approvals and an edit")
+        assert entity.overview in (first, second)
+        assert derived in ("VERIFIED", "NEEDS_REVIEW")
+    finally:
+        check.close()
+
+
+def test_repeated_approval_edit_races_hold_the_invariant(factory):
+    """The same race many times over independent sessions, which is what CI actually exercises."""
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 60
+    second = "Replacement overview nobody reviewed. " * 60
+
+    for attempt in range(8):
+        setup = _session(factory)
+        try:
+            program_id, claim_id = _race_program(setup, overview=first)
+        finally:
+            setup.close()
+
+        def approve(claim_id=claim_id):
+            db = _session(factory)
+            try:
+                claim = db.get(DataVerification, claim_id)
+                review.resolve_field(db, claim, status="VERIFIED",
+                                     actor_email="reviewer@pgcamp.test")
+                db.commit()
+                return "approved"
+            finally:
+                db.close()
+
+        def edit(program_id=program_id):
+            db = _session(factory)
+            try:
+                row = db.get(Program, program_id)
+                catalogue_writes.apply_direct_edit(
+                    db, model=Program, row=row, payload={"overview": second},
+                    actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+                db.commit()
+                return "edited"
+            finally:
+                db.close()
+
+        results = run_parallel([approve, edit])
+        assert sorted(r for r in results if isinstance(r, str)) == ["approved", "edited"], (
+            f"attempt {attempt}: a writer did not complete: {results!r}")
+
+        check = _session(factory)
+        try:
+            entity, derived = _assert_entity_agrees_with_register(
+                check, program_id, f"repeated race, attempt {attempt}")
+            assert entity.overview in (first, second)
+        finally:
+            check.close()
+
+
+def test_a_rolled_back_edit_leaves_the_register_and_entity_agreeing(factory):
+    """An edit that never commits must not change what the register says or what the record claims."""
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Abandoned replacement overview. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    # The edit writes and then rolls back - the row lock is released without any of it landing.
+    editor = _session(factory)
+    try:
+        row = editor.get(Program, program_id)
+        catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=row, payload={"overview": second},
+            actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+        editor.flush()
+        editor.rollback()
+    finally:
+        editor.close()
+
+    approver = _session(factory)
+    try:
+        claim = approver.get(DataVerification, claim_id)
+        review.resolve_field(approver, claim, status="VERIFIED",
+                             actor_email="reviewer@pgcamp.test")
+        approver.commit()
+    finally:
+        approver.close()
+
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "rolled-back edit then approval")
+        assert entity.overview == first, "a rolled-back edit must not leave its value behind"
+        assert derived == "VERIFIED", "the only surviving claim was approved"
+        assert entity.verified_by == "reviewer@pgcamp.test"
+    finally:
+        check.close()
+
+
+def test_the_race_keeps_the_register_and_the_audit_trail_consistent(factory):
+    """No privileged rows appear, and the withdrawn record points at no verifier."""
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import catalogue_writes, review
+
+    first = "Original published overview. " * 40
+    second = "Replacement overview nobody reviewed. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+    finally:
+        setup.close()
+
+    editor = _session(factory)
+    try:
+        stale = editor.get(Program, program_id)
+        approver = _session(factory)
+        try:
+            claim = approver.get(DataVerification, claim_id)
+            review.resolve_field(approver, claim, status="VERIFIED",
+                                 actor_email="reviewer@pgcamp.test")
+            approver.commit()
+        finally:
+            approver.close()
+        catalogue_writes.apply_direct_edit(
+            editor, model=Program, row=stale, payload={"overview": second},
+            actor="editor@pgcamp.test", blocked=catalogue_writes.TRUST_FIELDS)
+        editor.commit()
+    finally:
+        editor.close()
+
+    check = _session(factory)
+    try:
+        entity, _derived = _assert_entity_agrees_with_register(
+            check, program_id, "audit trail after the race")
+        rows = list(check.execute(select(DataVerification).where(
+            DataVerification.entity_type == "program",
+            DataVerification.entity_id == program_id).order_by(
+            DataVerification.id.asc())).scalars())
+        # Exactly the two decisions that were taken: the approval and the edit's new claim.
+        assert len(rows) == 2, f"expected 2 register rows, found {len(rows)}"
+        assert rows[0].status == "VERIFIED"
+        assert rows[0].verified_by == "reviewer@pgcamp.test"
+        assert rows[1].status == "NEEDS_REVIEW"
+        assert rows[1].verified_at is None and rows[1].verified_by is None
+        assert entity.verified_by is None, (
+            "the record must not be attributed to a reviewer after its value was withdrawn")
+    finally:
+        check.close()
+
+
+def test_an_upload_applied_over_a_concurrent_approval_cannot_keep_the_record_verified(factory):
+    """The importer had the same defect as the direct edit, in the same shape.
+
+    Its confidence-lowering block was guarded by ``previous_confidence == "VERIFIED"``, evaluated
+    from the row this session had loaded. A record that is awaiting review is not VERIFIED, so the
+    block was skipped entirely and emitted no SQL; an approval committing in that window left the
+    record certifying an imported value nobody reviewed.
+    """
+    from app.models.crm import DataVerification
+    from app.models.education import Program
+    from app.services import importer, review
+
+    first = "Original published overview. " * 40
+    setup = _session(factory)
+    try:
+        program_id, claim_id = _race_program(setup, overview=first)
+        name = setup.get(Program, program_id).name
+        slug = setup.get(Program, program_id).slug
+    finally:
+        setup.close()
+
+    uploader = _session(factory)
+    try:
+        stale = uploader.get(Program, program_id)
+        assert stale.confidence == "NEEDS_REVIEW"
+
+        approver = _session(factory)
+        try:
+            claim = approver.get(DataVerification, claim_id)
+            review.resolve_field(approver, claim, status="VERIFIED",
+                                 actor_email="reviewer@pgcamp.test")
+            approver.commit()
+        finally:
+            approver.close()
+
+        batch = importer.stage(uploader, entity_type="program", rows=[{
+            "university": "pgcamp-university", "name": name, "slug": slug,
+            "degree_level": "MASTER", "currency": "USD", "tuition_annual": 21000.0,
+            "is_published": True, "source_url": "https://pgcamp.test/upload",
+            "source_type": "TIER_1_OFFICIAL_UNIVERSITY",
+        }], source_url="https://pgcamp.test/upload", actor="uploader@pgcamp.test")
+        result = importer.commit_batch(uploader, batch, actor="uploader@pgcamp.test")
+        assert not result["failures"], result
+        assert result["updated"] == 1, f"the upload did not update the existing row: {result}"
+    finally:
+        uploader.close()
+
+    check = _session(factory)
+    try:
+        entity, derived = _assert_entity_agrees_with_register(
+            check, program_id, "upload applied over a concurrent approval")
+        assert entity.tuition_annual == 21000.0
+        assert derived == "NEEDS_REVIEW", (
+            "an imported value nobody reviewed must not stay certified")
     finally:
         check.close()

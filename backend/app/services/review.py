@@ -161,11 +161,15 @@ def explain_entity_state(db: Session, entity_type: str, entity_id: int) -> Dict[
     value; it is a statement about the register, readable by the reviewers who already see the
     register itself.
     """
+    # populate_existing: a row already in the identity map would otherwise be returned with the
+    # status it had when this session first read it, and the derivation would be computed from a
+    # decision that has since moved. The derivation has to describe the register as it is now.
     rows = list(db.execute(
         select(DataVerification).where(
             DataVerification.entity_type == entity_type,
             DataVerification.entity_id == entity_id,
         ).order_by(DataVerification.id.asc())
+        .execution_options(populate_existing=True)
     ).scalars())
     if not rows:
         return _derivation("NEEDS_REVIEW", "no_register")
@@ -300,7 +304,9 @@ def _evidence_verdict(db: Session, entity_type: str, entity_id: int,
     model = ENTITY_MODELS.get((entity_type or "").lower())
     if model is None:
         return verdict
-    entity = db.get(model, entity_id)
+    # As in explain_entity_state: compare the values that are stored now, not the ones this
+    # session happened to load earlier.
+    entity = db.get(model, entity_id, populate_existing=True)
     if entity is None:
         return {"ok": False, "reason": "record_missing", "fields": []}
     columns = set(entity.__table__.columns.keys())
@@ -331,10 +337,25 @@ def refresh_entity_state(db: Session, entity_type: str, entity_id: int,
 
     The one entry point for "a register row just changed". Every mutation path calls it - a field
     decision, a withdrawal, and a page-level source confirmation - so the entity can never be left
-    describing a register that has moved. The write itself stays guarded: promotion is conditional
-    in SQL (see :func:`_apply_entity_state`), so a stale derivation cannot certify a value that a
-    concurrent writer has already withdrawn.
+    describing a register that has moved.
+
+    **The entity row is locked before the derivation, and that ordering is the whole guarantee.**
+    Both writers of this entity's trust - this function and a direct catalogue edit that
+    invalidates the record - touch the entity row, so a row lock serializes them. Locking first
+    matters because the derivation must see the *other* transaction's register rows: a
+    ``SELECT ... FOR UPDATE`` that has to wait returns only after the competitor commits, so the
+    ``SELECT`` issued next runs on a fresh snapshot and sees them.
+
+    Doing it the other way round - derive, then try to guard the write with a conditional
+    ``UPDATE ... WHERE NOT EXISTS (subquery)`` - is not sufficient under READ COMMITTED. PostgreSQL
+    evaluates such subqueries with the statement's own snapshot and does not re-check them after
+    the EvalPlanQual re-read: measured directly on PostgreSQL 16, the promotion still applied with
+    ``rowcount = 1`` while a ``NEEDS_REVIEW`` register row committed during the wait. That stale
+    snapshot is exactly how a record came to say VERIFIED while its register derived NEEDS_REVIEW.
     """
+    model = ENTITY_MODELS.get(entity_type)
+    if model is not None:
+        db.execute(select(model.id).where(model.id == entity_id).with_for_update())
     derived = recompute_entity_confidence(db, entity_type, entity_id)
     _apply_entity_state(db, entity_type, entity_id, derived, actor_email)
     return derived
@@ -486,14 +507,28 @@ def _apply_entity_state(db: Session, entity_type: str, entity_id: int, state: st
         db.expire(entity)
         return
 
-    # Lowering trust: unconditional, because it can only ever withhold a record.
-    entity.confidence = state
+    # Lowering trust is unconditional, because it can only ever withhold a record - and it is
+    # written as a statement, not as an ORM delta. An attribute assignment only reaches the
+    # database when the session observes a *change*; if the identity map already holds the target
+    # state (a record that was NEEDS_REVIEW and is still NEEDS_REVIEW because another transaction
+    # promoted it behind this session's back) no UPDATE is emitted at all, the stale promotion
+    # survives, and the record goes on claiming VERIFIED over a register that derives NEEDS_REVIEW.
+    # That divergence is C2-10. Keying the statement on the primary key makes the withholding
+    # happen whatever the cached object happens to hold.
+    withholding: Dict[str, Any] = {"confidence": state}
     # Not verified means not verified: leaving a timestamp behind would satisfy the policy's date
     # check for a value nobody stands behind.
-    if hasattr(entity, "verified_at"):
-        entity.verified_at = None
-    if hasattr(entity, "verified_by"):
-        entity.verified_by = None
+    if hasattr(model, "verified_at"):
+        withholding["verified_at"] = None
+    if hasattr(model, "verified_by"):
+        withholding["verified_by"] = None
+    db.execute(
+        update(model)
+        .where(model.id == entity_id)
+        .values(**withholding)
+        .execution_options(synchronize_session=False)
+    )
+    db.expire(entity)
 
 
 def withdraw_field(db: Session, record: DataVerification, *, actor_email: str, note: str,

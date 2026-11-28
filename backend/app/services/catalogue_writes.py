@@ -43,6 +43,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core import verification_policy as policy
@@ -210,14 +211,30 @@ def apply_direct_edit(db: Session, *, model: Any, row: Any, payload: Dict[str, A
     # 2. The previous verification does not cover the new value. This is a statement of fact, not
     #    a decision to be recomputed: the register still describes the old figure, so deriving the
     #    state from it would keep saying VERIFIED.
-    row.confidence = "NEEDS_REVIEW"
-    if hasattr(row, "verified_at"):
-        row.verified_at = None
-    if hasattr(row, "verified_by"):
-        row.verified_by = None
-    if hasattr(row, "review_due_at"):
-        row.review_due_at = None
+    #
+    #    Written as SQL, not as ``row.confidence = "NEEDS_REVIEW"``. An ORM assignment only emits
+    #    a column when the session sees a change, and the loaded value here is *already*
+    #    NEEDS_REVIEW whenever the record still has an open claim - which is exactly the row an
+    #    approval targets. In that case no UPDATE was emitted at all, the invalidation never
+    #    reached the database, and a concurrent approval's VERIFIED survived over an unreviewed
+    #    value: "entity says VERIFIED while the register derives NEEDS_REVIEW" (C2-10).
+    withholding: Dict[str, Any] = {"confidence": "NEEDS_REVIEW"}
+    if hasattr(model, "verified_at"):
+        withholding["verified_at"] = None
+    if hasattr(model, "verified_by"):
+        withholding["verified_by"] = None
+    if hasattr(model, "review_due_at"):
+        withholding["review_due_at"] = None
+    db.execute(
+        update(model)
+        .where(model.id == row.id)
+        .values(**withholding)
+        .execution_options(synchronize_session=False)
+    )
     db.flush()
+    # Drop the stale identity-map copy so anything that reads the row next in this transaction
+    # sees what the database now holds, not what was true when the edit was built.
+    db.expire(row)
 
     # 3. Register the edited values as claims awaiting review, and record the change so a human
     #    can decide it and the history keeps both values.
